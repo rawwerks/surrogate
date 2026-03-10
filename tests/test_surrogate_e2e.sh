@@ -48,8 +48,7 @@ if ! command -v zmx &>/dev/null; then
 fi
 
 # Create a test zmx session running bash
-zmx attach "$TEST_SESSION" bash &
-ZMX_PID=$!
+zmx run "$TEST_SESSION" bash &
 sleep 2
 
 if ! zmx list 2>/dev/null | grep -q "$TEST_SESSION"; then
@@ -57,7 +56,7 @@ if ! zmx list 2>/dev/null | grep -q "$TEST_SESSION"; then
   exit 1
 fi
 
-echo "test zmx session ready (pid $ZMX_PID)"
+echo "test zmx session ready"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -225,7 +224,7 @@ test_cleanup_dead() {
   TESTS_RUN=$((TESTS_RUN + 1))
 
   local tmp_session="surr-dead-test-$$"
-  zmx attach "$tmp_session" bash &
+  zmx run "$tmp_session" bash &
   local tmp_pid=$!
   sleep 2
 

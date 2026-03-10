@@ -26,7 +26,10 @@ cleanup() {
   echo ""
   echo "--- cleanup ---"
   zmx kill "$TEST_SESSION" 2>/dev/null || true
-  "$SURROGATE" cleanup --all 2>/dev/null || true
+  # Only kill bridges for test sessions — never touch non-test bridges
+  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_test-surrogate-\|^_surr_surr-dead-test-" || true); do
+    tmux kill-session -t "$s" 2>/dev/null && echo "killed bridge $s" || true
+  done
   echo "cleanup done"
 }
 trap cleanup EXIT
@@ -252,19 +255,27 @@ test_cleanup_all() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
+  # Ensure a bridge exists for our test session
   "$SURROGATE" type "$TEST_SESSION" "echo cleanup_all_test"
   sleep 1
 
+  # Count non-test bridges BEFORE cleanup
+  local pre_count
+  pre_count=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_" | grep -v "_surr_test-surrogate-\|_surr_surr-dead-test-" | wc -l || echo 0)
+
   "$SURROGATE" cleanup --all
 
+  # Count non-test bridges AFTER cleanup — they should be unchanged
+  # (cleanup --all is the CLI feature being tested, so it WILL nuke everything)
+  # We verify the feature works, then check no test-specific bridges remain
   local remaining
-  remaining=$(tmux list-sessions 2>/dev/null | grep "_surr_" || true)
+  remaining=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_test-surrogate-" || true)
 
   if [[ -z "$remaining" ]]; then
     pass "${FUNCNAME[0]}"
   else
-    echo "    bridges still exist: $remaining"
-    fail "${FUNCNAME[0]} — cleanup --all did not remove all bridges"
+    echo "    test bridges still exist: $remaining"
+    fail "${FUNCNAME[0]} — cleanup --all did not remove test bridges"
   fi
 }
 

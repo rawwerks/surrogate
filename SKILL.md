@@ -50,7 +50,8 @@ surrogate bridge <session>
 ### Clean up dead bridges
 
 ```bash
-surrogate cleanup
+surrogate cleanup          # remove bridges for dead zmx sessions
+surrogate cleanup --all    # remove ALL bridges
 ```
 
 ### Show bridge health
@@ -65,7 +66,7 @@ surrogate status
 
 ```bash
 surrogate type my-session "explain this function"
-surrogate wait my-session "●" --timeout 60  # Wait for Claude to start responding
+surrogate wait my-session "●" -t 60  # Wait for Claude to start responding
 sleep 5  # Let it finish
 output=$(surrogate read my-session -n 50)
 ```
@@ -125,7 +126,7 @@ Since `surrogate send` passes through to tmux send-keys:
 - For non-interactive commands -- just use Bash tool directly
 - For file I/O -- use Read/Write/Edit tools
 - When you have a proper API -- prefer APIs over keystroke injection
-- For sending messages between agents -- prefer `fto send` or Agent Mail for structured communication. Use surrogate only when you need to type into the agent's actual TUI.
+- For sending messages between agents -- prefer Agent Mail for structured communication. Use surrogate only when you need to type into the agent's actual TUI.
 
 ## Setup
 
@@ -135,13 +136,11 @@ For users who want ALL new terminals to automatically be zmx sessions (enabling 
 surrogate-shell-setup --install
 ```
 
-Or manually add to ~/.bashrc or ~/.zshrc:
-
-```bash
-if [[ -z "$ZMX_SESSION" && -z "$SURROGATE_NO_ZMX" && $- == *i* ]]; then
-  exec zmx attach "$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
-fi
-```
+This prepends a snippet to the shell rc file that:
+- Wraps new interactive shells in `zmx attach <unique-name>`
+- Won't double-wrap (checks parent process name via `$PPID`, not env vars)
+- Always prints a `surrogate:` status line regardless of terminal app
+- Supports bash, zsh, and fish
 
 ## Dependencies
 

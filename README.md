@@ -4,6 +4,18 @@ Programmatic keystroke injection for any terminal application, via [zmx](https:/
 
 Type into Claude Code, vim, python REPL, htop — anything running in a terminal — from scripts, AI agents, or other programs.
 
+![Surrogate](surrogate.webp)
+
+## Warning
+
+This tool is really dangerous. This is the YOLO mode of all YOLO modes. You could really get pwned.
+
+## Motivation
+
+1. tmux is powerful and amazing and my agents love it. I hate using tmux.
+2. I want to be able to walk away from my computer, and have a surrogate inject messages into my terminal sessions (specifically coding agent TUIs).
+3. zmx is very slick but doesn't have a way to inject keys.
+
 ## How it works
 
 ```
@@ -41,11 +53,12 @@ surrogate-shell-setup --install
 
 This prepends a small snippet to your shell rc file (`.bashrc`, `.zshrc`, or `config.fish`). It:
 - Wraps each new interactive shell in `zmx attach <unique-name>`
-- Won't double-wrap (checks `$ZMX_SESSION`)
+- Won't double-wrap (checks parent process name via `$PPID`, not env vars which leak through window managers)
+- Always prints a `surrogate:` status line, regardless of terminal app
 - Can be opted out per-session with `SURROGATE_NO_ZMX=1`
 - Can be removed cleanly with `surrogate-shell-setup --uninstall`
 
-If your terminal already launches zmx (e.g., Ghostty with a custom command), the snippet is a safe no-op.
+If your terminal already launches zmx (e.g., Ghostty with a custom command), the snippet detects the zmx parent process and prints the status line without double-wrapping.
 
 **Preview before installing:**
 ```bash
@@ -170,13 +183,25 @@ else
 fi
 ```
 
+## Design Invariants
+
+These are enforced by automated tests and must hold for every change:
+
+| Invariant | Description |
+|-----------|-------------|
+| **Always prints status** | Every terminal session prints `surrogate:` on startup, whether zmx was wrapped by the snippet or inherited from the terminal emulator |
+| **All shells supported** | bash, zsh, and fish snippets all have both wrap and inherit code paths |
+| **Terminal-agnostic** | Zero references to specific terminal emulators in snippets or CLI |
+| **Full path to zmx** | Snippet uses `$HOME/.local/bin/zmx`, not `command -v zmx` (PATH isn't set when rc files run) |
+| **Parent process check** | Double-wrap prevention checks parent process name (`ps -o comm= -p $PPID`), not `$ZMX_SESSION` env var (which leaks through window managers to all children) |
+
 ## Tests
 
 ```bash
 bash tests/test_surrogate_e2e.sh
 ```
 
-13 end-to-end tests covering list, type, send, read, wait, bridge creation/reuse, cleanup, status, concurrent serialization, and error handling.
+19 end-to-end tests: 13 functional tests (list, type, send, read, wait, bridge creation/reuse, cleanup, status, concurrent serialization, error handling) + 6 design invariant tests.
 
 ## Uninstall
 

@@ -44,8 +44,22 @@ snippet_for() {
       cat <<'SNIPPET'
 # surrogate:zmx:begin
 # surrogate: auto-zmx for all interactive terminals
-if [[ -z "${ZMX_SESSION:-}" && -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]] && command -v zmx >/dev/null 2>&1; then
-  exec zmx attach "$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
+# Uses full path to zmx — this runs before PATH is configured in .bashrc.
+# Checks parent process to avoid double-wrapping (env var leaks to children).
+# INVARIANT: Always prints "surrogate:" status line, regardless of terminal app.
+if [[ -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]]; then
+  _surr_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
+  if [[ -x "$_surr_zmx" ]]; then
+    _surr_parent="$(ps -o comm= -p $PPID 2>/dev/null)"
+    if [[ "$_surr_parent" != "zmx" ]]; then
+      _surr_name="$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
+      echo "surrogate: wrapping in zmx session $_surr_name"
+      exec "$_surr_zmx" attach "$_surr_name"
+    else
+      echo "surrogate: zmx session ${ZMX_SESSION:-inherited}"
+    fi
+    unset _surr_parent _surr_zmx
+  fi
 fi
 # surrogate:zmx:end
 SNIPPET
@@ -54,8 +68,19 @@ SNIPPET
       cat <<'SNIPPET'
 # surrogate:zmx:begin
 # surrogate: auto-zmx for all interactive terminals
-if not set -q ZMX_SESSION; and not set -q SURROGATE_NO_ZMX; and status is-interactive; and command -v zmx >/dev/null 2>&1
-  exec zmx attach (date +'%Y-%m-%d_%H-%M-%S_%Z')"-$fish_pid"
+# INVARIANT: Always prints "surrogate:" status line, regardless of terminal app.
+if not set -q SURROGATE_NO_ZMX; and status is-interactive
+  set -l _surr_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
+  if test -x "$_surr_zmx"
+    set -l _surr_parent (ps -o comm= -p %self 2>/dev/null)
+    if test "$_surr_parent" != "zmx"
+      set -l _surr_name (date +'%Y-%m-%d_%H-%M-%S_%Z')"-$fish_pid"
+      echo "surrogate: wrapping in zmx session $_surr_name"
+      exec $_surr_zmx attach $_surr_name
+    else
+      echo "surrogate: zmx session "(set -q ZMX_SESSION; and echo $ZMX_SESSION; or echo "inherited")
+    end
+  end
 end
 # surrogate:zmx:end
 SNIPPET

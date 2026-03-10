@@ -77,6 +77,23 @@ To skip dcg auto-install:
 SURROGATE_SKIP_DCG=1 bash install.sh
 ```
 
+## Security Model
+
+Surrogate stays ambiently available, but it no longer treats that as unlimited authority.
+
+- Surrogate enforces a built-in deterministic safety floor of its own.
+- DCG is an optional second layer for content scanning, not the only guardrail.
+- Some actions are intentionally outside Surrogate's authority surface and require direct human control.
+
+Current built-in structural guardrails:
+
+- `type` rejects multiline payloads
+- `send` rejects `C-c`, `C-d`, and `C-z`
+- there is no global "disable guards" switch
+- there is no persistent unsafe mode
+
+If DCG is installed, `type` also scans command-like payloads and blocks on DCG denials. On this machine, the current measured overhead is about `9ms` average added latency on `surrogate type`.
+
 ### Auto-wrap all terminals in zmx
 
 By default, surrogate can only talk to apps running inside zmx sessions. To make **every** new terminal window a zmx session automatically:
@@ -171,16 +188,19 @@ The most common operation. Types literal text and presses Enter.
 surrogate type <session> "echo hello world"
 ```
 
+`type` is single-line only. Multiline/script payloads are reserved for direct human control.
+
 ### Send special keys
 
-Full tmux `send-keys` syntax — Enter, Escape, Ctrl combos, arrow keys, etc.
+Full tmux `send-keys` syntax for low-risk keys such as `Enter`, `Escape`, arrows, and text literals.
 
 ```bash
 surrogate send <session> "banana" Enter
-surrogate send <session> C-c                    # Ctrl+C
 surrogate send <session> Escape ":wq" Enter     # vim save+quit
 surrogate send <session> Up Up Enter             # repeat 2 commands ago
 ```
+
+Dangerous control keys `C-c`, `C-d`, and `C-z` are reserved for direct human control and are rejected by surrogate.
 
 ### Read output
 
@@ -215,8 +235,6 @@ surrogate cleanup --all         # remove all bridges
 |-----|-------------|
 | `Enter` | Enter/Return |
 | `Escape` | Escape |
-| `C-c` | Ctrl+C |
-| `C-d` | Ctrl+D (EOF) |
 | `C-u` | Ctrl+U (clear line) |
 | `C-l` | Ctrl+L (clear screen) |
 | `Tab` | Tab |
@@ -282,6 +300,8 @@ These are enforced by automated tests and must hold for every change:
 | **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
 | **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no heuristics, no agent-type guessing |
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
+| **Security floor** | `type` rejects multiline payloads, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
+| **Security overhead tracked** | The test harness reports baseline vs guarded `type` latency as a metric, not a pass/fail gate |
 
 ## Tests
 

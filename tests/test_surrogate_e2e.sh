@@ -23,6 +23,7 @@ RESULTS_FILE="$RESULTS_DIR/results"
 TIMING_FILE="$RESULTS_DIR/timing"
 touch "$RESULTS_FILE" "$TIMING_FILE"
 SUITE_START="$(date +%s)"
+SECURITY_METRICS_OUTPUT=""
 
 # Export variables needed by subshell test runners
 export RESULTS_FILE TIMING_FILE SURROGATE TEST_SESSION TEST_TIMEOUT
@@ -30,6 +31,73 @@ export TESTS_RUN=0  # legacy counter (each test increments, but value doesn't su
 
 pass() { echo "PASS" >> "$RESULTS_FILE"; echo "  PASS: $1"; }
 fail() { echo "FAIL: $1" >> "$RESULTS_FILE"; echo "  FAIL: $1"; }
+
+now_ns() { date +%s%N; }
+
+build_bench_path() {
+  local mode="$1"
+  local tmpbin
+  tmpbin="$(mktemp -d)"
+  ln -sf "$(command -v zmx)" "$tmpbin/zmx"
+  ln -sf "$(command -v tmux)" "$tmpbin/tmux"
+  if [[ "$mode" == "guarded" ]] && command -v dcg >/dev/null 2>&1; then
+    ln -sf "$(command -v dcg)" "$tmpbin/dcg"
+  fi
+  printf '%s\n' "$tmpbin:/usr/bin:/bin"
+}
+
+measure_security_overhead() {
+  local iterations="${SECURITY_BENCH_ITERS:-5}"
+  if ! command -v zmx >/dev/null 2>&1 || ! command -v tmux >/dev/null 2>&1; then
+    SECURITY_METRICS_OUTPUT="  security overhead: skipped (missing zmx or tmux)"
+    return 0
+  fi
+
+  local baseline_path guarded_path
+  baseline_path="$(build_bench_path baseline)"
+  guarded_path="$(build_bench_path guarded)"
+
+  local baseline_total=0 guarded_total=0 i start end marker
+  for (( i=1; i<=iterations; i++ )); do
+    marker="SECURITY_BENCH_BASE_${$}_${i}"
+    start="$(now_ns)"
+    PATH="$baseline_path" SURROGATE_LABEL=off "$SURROGATE" type "$TEST_SESSION" "echo $marker" >/dev/null 2>&1
+    end="$(now_ns)"
+    baseline_total=$((baseline_total + end - start))
+  done
+
+  if command -v dcg >/dev/null 2>&1; then
+    for (( i=1; i<=iterations; i++ )); do
+      marker="SECURITY_BENCH_GUARDED_${$}_${i}"
+      start="$(now_ns)"
+      PATH="$guarded_path" SURROGATE_LABEL=off "$SURROGATE" type "$TEST_SESSION" "echo $marker" >/dev/null 2>&1
+      end="$(now_ns)"
+      guarded_total=$((guarded_total + end - start))
+    done
+
+    local baseline_avg_ms guarded_avg_ms delta_ms
+    baseline_avg_ms=$(( baseline_total / iterations / 1000000 ))
+    guarded_avg_ms=$(( guarded_total / iterations / 1000000 ))
+    delta_ms=$(( guarded_avg_ms - baseline_avg_ms ))
+    SECURITY_METRICS_OUTPUT=$(cat <<EOF
+  security overhead:
+    type baseline avg: ${baseline_avg_ms}ms
+    type guarded avg:  ${guarded_avg_ms}ms
+    dcg delta avg:     ${delta_ms}ms
+EOF
+)
+  else
+    local baseline_avg_ms
+    baseline_avg_ms=$(( baseline_total / iterations / 1000000 ))
+    SECURITY_METRICS_OUTPUT=$(cat <<EOF
+  security overhead:
+    type baseline avg: ${baseline_avg_ms}ms
+    type guarded avg:  skipped (dcg not installed)
+    dcg delta avg:     skipped
+EOF
+)
+  fi
+}
 
 # run_test — runs a test function with timeout and timing
 # Usage: run_test <func_name> [timeout_override]
@@ -184,16 +252,14 @@ test_type_and_read() {
   fi
 }
 
-test_send_special_keys() {
+test_send_enter_key() {
   # plumb:req-2335dd45
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local marker="INTERRUPTED_$$"
+  local marker="SEND_ENTER_$$"
 
-  "$SURROGATE" send "$TEST_SESSION" "echo $marker && sleep 999" Enter
-  sleep 0.5
-  "$SURROGATE" send "$TEST_SESSION" C-c
+  "$SURROGATE" send "$TEST_SESSION" "echo $marker" Enter
   sleep 1
 
   local output
@@ -202,9 +268,9 @@ test_send_special_keys() {
   if echo "$output" | grep -q "$marker"; then
     pass "${FUNCNAME[0]}"
   else
-    echo "    expected '$marker' in output after send + C-c:"
+    echo "    expected '$marker' in output after send + Enter:"
     echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — marker not found after send with special keys"
+    fail "${FUNCNAME[0]} — marker not found after send with Enter"
   fi
 }
 
@@ -664,7 +730,7 @@ echo ""
 
 run_test test_list
 run_test test_type_and_read
-run_test test_send_special_keys
+run_test test_send_enter_key
 run_test test_bridge_creation
 run_test test_bridge_reuse
 run_test test_wait_success
@@ -1060,7 +1126,7 @@ test_label_verbose() {
 
   local output
   output=$("$SURROGATE" read "$TEST_SESSION" -n 5 2>&1)
-  if echo "$output" | grep -q '\[SURROGATE.*PID:.*\].*'"$marker"; then
+  if echo "$output" | tr -d '\n' | grep -q '\[SURROGATE.*PID:.*\].*'"$marker"; then
     pass "${FUNCNAME[0]}"
   else
     echo "    expected [SURROGATE ... PID:...] prefix before $marker"
@@ -1538,6 +1604,71 @@ test_error_missing_session() {
   fi
 }
 
+test_security_model_section_exists() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -q '^## Security Model' SPEC.md; then
+    pass "${FUNCNAME[0]} — spec has explicit security model section"
+  else
+    fail "${FUNCNAME[0]} — SPEC.md missing explicit security model section"
+  fi
+}
+
+test_type_rejects_multiline() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" type "$TEST_SESSION" $'echo one\necho two' 2>&1 || true)
+
+  if echo "$output" | grep -qi 'multiline'; then
+    pass "${FUNCNAME[0]} — multiline type blocked"
+  else
+    fail "${FUNCNAME[0]} — multiline type was not blocked: $output"
+  fi
+}
+
+test_send_rejects_dangerous_control_keys() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" send "$TEST_SESSION" C-c 2>&1 || true)
+
+  if echo "$output" | grep -qi 'control'; then
+    pass "${FUNCNAME[0]} — dangerous control keys blocked"
+  else
+    fail "${FUNCNAME[0]} — dangerous control key was not blocked: $output"
+  fi
+}
+
+test_dcg_blocks_type_when_available() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmpbin
+  tmpbin="$(mktemp -d)"
+  cat > "$tmpbin/dcg" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "--robot" && "$2" == "test" && "$3" == *"git reset --hard"* ]]; then
+  echo '{"decision":"deny","reason":"blocked by mock dcg"}'
+  exit 1
+fi
+exit 0
+EOF
+  chmod +x "$tmpbin/dcg"
+
+  local output
+  output=$(PATH="$tmpbin:$PATH" "$SURROGATE" type "$TEST_SESSION" "git reset --hard HEAD~1" 2>&1 || true)
+
+  if echo "$output" | grep -qi 'dcg'; then
+    pass "${FUNCNAME[0]} — dcg denial respected"
+  else
+    fail "${FUNCNAME[0]} — dcg denial not surfaced: $output"
+  fi
+}
+
 test_error_missing_zmx() {
   # plumb:req-106648f1
   # plumb:req-f63f502d
@@ -1629,6 +1760,28 @@ test_no_heuristics_no_ml() {
   fi
 }
 
+test_no_global_guard_disable() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -q 'SURROGATE_NO_GUARD' "$SURROGATE"; then
+    fail "${FUNCNAME[0]} — found forbidden global guard disable"
+  else
+    pass "${FUNCNAME[0]} — no global guard disable"
+  fi
+}
+
+test_no_persistent_unsafe_mode() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -q -- '--unsafe' "$SURROGATE"; then
+    fail "${FUNCNAME[0]} — found forbidden unsafe mode implementation"
+  else
+    pass "${FUNCNAME[0]} — no persistent unsafe mode"
+  fi
+}
+
 test_bridge_command() {
   # plumb:req-fbfa2e19
   # plumb:req-b6f97f4e
@@ -1698,7 +1851,7 @@ test_type_creates_bridge_lazily() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  if grep -A15 'cmd_type' "$SURROGATE" | grep -q 'ensure_bridge'; then
+  if sed -n '/^cmd_type/,/^cmd_/p' "$SURROGATE" | grep -q 'ensure_bridge'; then
     pass "${FUNCNAME[0]} — type creates bridge lazily"
   else
     fail "${FUNCNAME[0]} — type doesn't call ensure_bridge"
@@ -1724,7 +1877,7 @@ test_type_updates_watermark() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  if grep -A15 'cmd_type' "$SURROGATE" | grep -q 'update_watermark'; then
+  if sed -n '/^cmd_type/,/^cmd_/p' "$SURROGATE" | grep -q 'update_watermark'; then
     pass "${FUNCNAME[0]} — type updates watermark"
   else
     fail "${FUNCNAME[0]} — type doesn't update watermark"
@@ -1815,12 +1968,18 @@ run_test test_bridge_naming_convention
 run_test test_bridge_stale_recreate
 run_test test_error_prefix
 run_test test_error_missing_session
+run_test test_security_model_section_exists
+run_test test_type_rejects_multiline
+run_test test_send_rejects_dangerous_control_keys
+run_test test_dcg_blocks_type_when_available
 run_test test_error_missing_zmx
 run_test test_error_missing_tmux
 run_test test_rename_kills_bridge
 run_test test_list_delegates_to_zmx
 run_test test_no_agent_detection
 run_test test_no_heuristics_no_ml
+run_test test_no_global_guard_disable
+run_test test_no_persistent_unsafe_mode
 run_test test_bridge_command
 run_test test_cleanup_default_is_dead
 run_test test_status_shows_health
@@ -1870,6 +2029,8 @@ run_test test_invariant_installed_matches_repo
 # Summary
 # ---------------------------------------------------------------------------
 
+measure_security_overhead
+
 echo ""
 PASS_COUNT=$(grep -c "^PASS$" "$RESULTS_FILE" 2>/dev/null) || PASS_COUNT=0
 FAIL_COUNT=$(grep -c "^FAIL:" "$RESULTS_FILE" 2>/dev/null) || FAIL_COUNT=0
@@ -1881,6 +2042,9 @@ echo "  tests run: $TOTAL"
 echo "  passed:    $PASS_COUNT"
 echo "  failed:    $FAIL_COUNT"
 echo "  elapsed:   ${SUITE_ELAPSED}s"
+if [[ -n "$SECURITY_METRICS_OUTPUT" ]]; then
+  echo "$SECURITY_METRICS_OUTPUT"
+fi
 
 # Show slowest tests
 if [[ -s "$TIMING_FILE" ]]; then

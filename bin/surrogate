@@ -37,6 +37,51 @@ _search() {
     fi
 }
 
+contains_multiline() {
+    [[ "$1" == *$'\n'* ]]
+}
+
+guard_type_text() {
+    local text="$1"
+    contains_multiline "$text" || return 0
+    die "multiline payloads are reserved for direct human control"
+}
+
+guard_send_keys() {
+    local key
+    for key in "$@"; do
+        case "$key" in
+            C-c|C-d|C-z)
+                die "dangerous control key '$key' is reserved for direct human control"
+                ;;
+        esac
+    done
+}
+
+scan_with_dcg() {
+    local text="$1"
+    command -v dcg >/dev/null 2>&1 || return 0
+
+    local dcg_output="" dcg_rc=0 reason=""
+    set +e
+    dcg_output="$(dcg --robot test "$text" 2>/dev/null)"
+    dcg_rc=$?
+    set -e
+
+    case "$dcg_rc" in
+        0) return 0 ;;
+        1)
+            reason="$(printf '%s\n' "$dcg_output" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"
+            [[ -n "$reason" ]] || reason="blocked by dcg"
+            die "dcg denied payload: $reason"
+            ;;
+        *)
+            # DCG is an optional layer; surrogate's built-in guardrails remain authoritative.
+            return 0
+            ;;
+    esac
+}
+
 # --- alias wordlists (100 adjectives × 100 nouns = 10,000 combinations) ---
 
 ADJECTIVES=(
@@ -188,14 +233,14 @@ Environment:
 
 Special keys (for send):
   Enter Escape Tab Space BSpace
-  C-c C-d C-u C-l (Ctrl combos)
+  C-u C-l (Ctrl combos)
   Up Down Left Right
 
 Examples:
   surrogate list
   surrogate type lazy-sheep "echo hello"
   surrogate type 2026-03-08_15-07-15_EDT-132628 "echo hello"
-  surrogate send my-session C-c
+  surrogate send my-session Escape ":wq" Enter
   surrogate read bold-crane -n 50
   surrogate alias 2026-03-08_15-07-15_EDT-132628
 
@@ -264,6 +309,7 @@ cmd_send() {
     local session
     session="$(resolve_session "$1")"
     shift
+    guard_send_keys "$@"
 
     ensure_bridge "$session"
     update_watermark "$session"
@@ -314,6 +360,8 @@ cmd_type() {
     local session
     session="$(resolve_session "$1")"
     local text="$2"
+    guard_type_text "$text"
+    scan_with_dcg "$text"
 
     # Prepend surrogate label
     local prefix

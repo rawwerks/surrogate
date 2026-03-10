@@ -14,8 +14,77 @@ All search and filter commands must be fully deterministic — same inputs produ
 
 - **zmx is source of truth.** All session state comes from zmx. tmux bridges are disposable.
 - **Deterministic over smart.** Agents are non-deterministic; the tools they use must be the opposite. Every command produces predictable, reproducible output from the same inputs.
+- **Deterministic safety floor.** Surrogate must provide a built-in, deterministic safety floor of its own. Safety must not depend entirely on optional external tooling or agent judgment.
 - **Zero agent-specific dependencies.** Surrogate must never parse or depend on the UI format of any specific agent (Claude Code, Codex, Gemini, Pi). Agent detection would create fragile coupling.
 - **Minimal dependencies.** Only zmx, tmux, and standard Unix tools (grep, sed, tail, stat). rg is preferred but optional.
+- **Ambient convenience, narrow authority.** Surrogate is ambiently available across sessions, but some actions are intentionally outside its authority surface. If an operation falls outside that surface, the human must take over directly.
+
+## Security Model
+
+This section defines the surrogate v0 security model. It is intentionally narrow, deterministic, and easy to review. Tests must cover every rule in this section.
+
+### Goal
+
+Surrogate is the deterministic counterweight to non-deterministic agents. It must stay small, explicit, and mechanically predictable. The security model must reduce the risk of agent misuse without turning surrogate into a general authorization framework.
+
+### Layers
+
+Surrogate safety has two layers:
+
+1. **Structural guardrails owned by surrogate.** These are deterministic capability boundaries enforced by surrogate itself and they apply whether or not optional safety tools are installed.
+2. **Content scanning from optional tools.** External tools such as DCG may add deeper command scanning, but surrogate must not treat them as its only safety boundary.
+
+### Built-In Structural Guardrails
+
+The following rules are part of surrogate itself and must apply even when DCG is absent:
+
+1. The `type` command must reject multiline payloads.
+2. The `send` command must reject dangerous control keys: `C-c`, `C-d`, and `C-z`.
+3. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
+4. Surrogate must not implement a persistent unsafe mode.
+
+These rules define the minimum safety floor. Opting out of optional tools must never disable them.
+
+### Optional DCG Integration
+
+DCG is a highly recommended but technically optional dependency.
+
+If DCG is installed:
+
+1. Surrogate may scan command-like payloads before injection.
+2. A DCG denial must block the surrogate action.
+3. Surrogate must not expose an in-band self-bypass path for a DCG denial.
+
+If DCG is absent:
+
+1. Surrogate must continue to function.
+2. The built-in structural guardrails remain in force.
+
+Opting out of DCG means "less protection," not "no protection."
+
+### Security Overhead Metric
+
+Security hardening must be tracked with a latency metric, not only pass/fail behavior.
+
+The test harness must report a non-blocking security-overhead metric for the hot path by measuring:
+
+1. baseline `type` latency without DCG in `PATH`
+2. guarded `type` latency with DCG available and allowing the payload
+3. the delta between those two measurements
+
+This metric is for observability and regression tracking. It is not a release-blocking threshold in v0.
+
+### Authority Boundary
+
+Surrogate may support routine remote-hands actions such as reading session output, searching session history, typing plain text, and other low-risk deterministic helpers.
+
+The following categories are reserved for direct human control rather than surrogate automation:
+
+- self-bypass or global guard disable mechanisms
+- persistent unsafe mode or inherited unsafe state
+- high-risk actions whose only approval path is the same agent-controlled terminal channel
+
+If an action is outside surrogate's authority surface, the correct path is direct human control, not a more elaborate in-band override.
 
 ---
 

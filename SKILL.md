@@ -9,6 +9,23 @@ Surrogate enables programmatic keystroke injection into any terminal application
 
 An AI agent uses surrogate to act as a "surrogate user" -- typing into TUI apps like Claude Code, vim, python REPL, htop, etc.
 
+## Security Model
+
+Surrogate is intentionally deterministic and does not offer unlimited authority just because it is ambiently available.
+
+- Built-in structural guardrails apply even if DCG is not installed.
+- DCG is an optional second layer for content scanning.
+- Some actions are reserved for direct human control rather than surrogate automation.
+
+Current built-in guardrails:
+
+- `surrogate type` rejects multiline payloads
+- `surrogate send` rejects `C-c`, `C-d`, and `C-z`
+- there is no global guard-disable mode
+- there is no persistent unsafe mode
+
+If DCG is installed, `surrogate type` may also be blocked by DCG for destructive command-like payloads.
+
 ## Session Aliases
 
 Every session gets a deterministic adjective-noun alias (e.g. `shiny-dolphin`, `robo-quokka`). Aliases are derived from the session name via hash — no state, no config. They never collide.
@@ -86,11 +103,15 @@ surrogate type <session> "some text"
 # <session> can be an alias: surrogate type robo-quokka "some text"
 ```
 
+Keep `type` payloads single-line. Multiline/script payloads are reserved for direct human control.
+
 ### Send special keys (tmux send-keys syntax)
 
 ```bash
 surrogate send <session> <keys...>
 ```
+
+Use `send` for low-risk key events like `Enter`, `Escape`, arrows, and text literals. Do not rely on surrogate for `C-c`, `C-d`, or `C-z` — those are intentionally blocked.
 
 ### Read recent output
 
@@ -169,8 +190,6 @@ Since `surrogate send` passes through to tmux send-keys:
 |-----|-------------|
 | `Enter` | Enter key |
 | `Escape` | Escape key |
-| `C-c` | Ctrl+C |
-| `C-d` | Ctrl+D (EOF) |
 | `C-u` | Ctrl+U (clear line) |
 | `C-l` | Ctrl+L (clear screen) |
 | `Tab` | Tab key |

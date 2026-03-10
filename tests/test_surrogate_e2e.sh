@@ -552,6 +552,277 @@ test_status
 test_concurrent_serialization
 
 echo ""
+echo "--- new command tests ---"
+echo ""
+
+test_find() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="FIND_ME_$$"
+  "$SURROGATE" type "$TEST_SESSION" "echo $marker"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" find "$marker" -n 50 2>&1)
+
+  if echo "$output" | grep -q "$marker"; then
+    pass "${FUNCNAME[0]}"
+  else
+    echo "    expected '$marker' in find output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — marker not found in find output"
+  fi
+}
+
+test_find_empty_query() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if "$SURROGATE" find "" 2>/dev/null; then
+    fail "${FUNCNAME[0]} — empty query should be rejected"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
+test_find_no_match() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" find "XYZZY_NEVER_MATCH_$$" 2>&1)
+
+  if echo "$output" | grep -q "no matches"; then
+    pass "${FUNCNAME[0]}"
+  else
+    echo "    expected 'no matches' message:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — should report no matches"
+  fi
+}
+
+test_find_with_context() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="CONTEXT_TEST_$$"
+  "$SURROGATE" type "$TEST_SESSION" "echo BEFORE_$marker"
+  "$SURROGATE" type "$TEST_SESSION" "echo $marker"
+  "$SURROGATE" type "$TEST_SESSION" "echo AFTER_$marker"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" find "$marker" -n 50 -C 1 2>&1)
+
+  if echo "$output" | grep -q "$marker"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — context search failed"
+  fi
+}
+
+test_who() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" who 2>&1)
+
+  if echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]}"
+  else
+    echo "    expected test session in who output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — test session not in who output"
+  fi
+}
+
+test_who_n_zero() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" who -n 0 2>&1)
+
+  # Should list sessions but with empty snippets
+  if echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — who -n 0 should still list sessions"
+  fi
+}
+
+test_active() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" active --all 2>&1)
+
+  if echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]}"
+  else
+    echo "    expected test session in active output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — test session not in active --all output"
+  fi
+}
+
+test_peek() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="PEEK_ME_$$"
+  "$SURROGATE" type "$TEST_SESSION" "echo $marker"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" peek --filter "$marker" 2>&1)
+
+  if echo "$output" | grep -q "$marker"; then
+    pass "${FUNCNAME[0]}"
+  else
+    echo "    expected '$marker' in peek output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — marker not found in peek output"
+  fi
+}
+
+test_peek_no_filter_match() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" peek --filter "XYZZY_NEVER_$$" 2>&1)
+
+  if echo "$output" | grep -q "peeked 0 session"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — should report 0 sessions peeked"
+  fi
+}
+
+test_rename() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local rename_session="surr-rename-test-$$"
+  zmx run "$rename_session" bash &
+  local rename_pid=$!
+  sleep 2
+
+  local new_name="surr-renamed-$$"
+  local output
+  output=$("$SURROGATE" rename "$rename_session" "$new_name" 2>&1)
+
+  if echo "$output" | grep -q "renamed"; then
+    # Verify new name exists and old doesn't
+    if "$SURROGATE" read "$new_name" -n 1 2>/dev/null; then
+      pass "${FUNCNAME[0]}"
+    else
+      fail "${FUNCNAME[0]} — renamed session not accessible"
+    fi
+  else
+    fail "${FUNCNAME[0]} — rename command failed"
+  fi
+
+  # Cleanup
+  zmx kill "$new_name" 2>/dev/null || true
+  wait "$rename_pid" 2>/dev/null || true
+}
+
+test_rename_nonexistent() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if "$SURROGATE" rename "nonexistent-$$" "newname-$$" 2>/dev/null; then
+    fail "${FUNCNAME[0]} — should fail for nonexistent session"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
+test_rename_collision() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Create two sessions, try to rename one to the other's name
+  local coll_a="surr-coll-a-$$"
+  local coll_b="surr-coll-b-$$"
+  zmx run "$coll_a" bash &
+  local pid_a=$!
+  zmx run "$coll_b" bash &
+  local pid_b=$!
+  sleep 2
+
+  if "$SURROGATE" rename "$coll_a" "$coll_b" 2>/dev/null; then
+    fail "${FUNCNAME[0]} — should fail when target exists"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+
+  # Cleanup
+  zmx kill "$coll_a" 2>/dev/null || true
+  zmx kill "$coll_b" 2>/dev/null || true
+  wait "$pid_a" 2>/dev/null || true
+  wait "$pid_b" 2>/dev/null || true
+}
+
+test_require_int() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local all_ok=true
+
+  # Non-numeric -n should fail
+  if "$SURROGATE" find "test" -n abc 2>/dev/null; then
+    echo "    find -n abc should have failed"
+    all_ok=false
+  fi
+
+  if "$SURROGATE" read "$TEST_SESSION" -n xyz 2>/dev/null; then
+    echo "    read -n xyz should have failed"
+    all_ok=false
+  fi
+
+  if "$SURROGATE" who -n foo 2>/dev/null; then
+    echo "    who -n foo should have failed"
+    all_ok=false
+  fi
+
+  if "$SURROGATE" peek -n bar 2>/dev/null; then
+    echo "    peek -n bar should have failed"
+    all_ok=false
+  fi
+
+  if "$SURROGATE" find "test" -C baz 2>/dev/null; then
+    echo "    find -C baz should have failed"
+    all_ok=false
+  fi
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — some non-numeric args were not rejected"
+  fi
+}
+
+test_find
+test_find_empty_query
+test_find_no_match
+test_find_with_context
+test_who
+test_who_n_zero
+test_active
+test_peek
+test_peek_no_filter_match
+test_rename
+test_rename_nonexistent
+test_rename_collision
+test_require_int
+
+echo ""
 echo "--- design invariant tests ---"
 echo ""
 

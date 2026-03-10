@@ -8,6 +8,11 @@ BRIDGE_PREFIX="_surr_"
 
 die() { echo "surrogate: error: $*" >&2; exit 1; }
 
+require_int() {
+    # Validate that $1 is a non-negative integer
+    [[ "$1" =~ ^[0-9]+$ ]] || die "'$1' is not a valid number"
+}
+
 usage() {
     cat <<'EOF'
 surrogate - programmatic keystroke injection into zmx sessions
@@ -21,6 +26,12 @@ Commands:
   read  <session> [-n LINES]    Read recent output (default: 20 lines)
   wait  <session> <pattern> [-t TIMEOUT]
                                 Wait for regex pattern in new output (default: 30s)
+  find  <query> [-n LINES]      Search all sessions for text (grep, default: last 200 lines)
+  who                           Show sessions with detected agent type and cwd
+  active [--all]                Show attached sessions (--all includes non-empty detached)
+  peek  [-n LINES] [--filter PATTERN]
+                                Batch read last N lines from all sessions (default: 5)
+  rename <session> <new-name>   Rename a zmx session
   bridge <session>              Pre-create tmux bridge for a zmx session
   cleanup [--all|--dead]        Remove stale or all bridge sessions
   status                        Show bridge health
@@ -37,6 +48,7 @@ Examples:
   surrogate send my-session Escape ":wq" Enter
   surrogate read my-session -n 50
   surrogate wait my-session "PASS|FAIL" -t 60
+  surrogate rename 2026-03-08_15-07-15_EDT-132628 my-session
 
 EOF
     exit 0
@@ -153,7 +165,7 @@ cmd_read() {
     local lines=20
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -n) [[ $# -ge 2 ]] || die "-n requires a number"; lines="$2"; shift 2 ;;
+            -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
             *)  die "unknown flag: $1" ;;
         esac
     done
@@ -172,7 +184,7 @@ cmd_wait() {
     local timeout=30
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -t) [[ $# -ge 2 ]] || die "-t requires seconds"; timeout="$2"; shift 2 ;;
+            -t) [[ $# -ge 2 ]] || die "-t requires seconds"; require_int "$2"; timeout="$2"; shift 2 ;;
             *)  die "unknown flag: $1" ;;
         esac
     done
@@ -196,6 +208,217 @@ cmd_wait() {
     done
 
     die "timeout after ${timeout}s waiting for pattern: $pattern"
+}
+
+_search() {
+    # Use rg if available, fall back to grep -E
+    if command -v rg >/dev/null 2>&1; then
+        rg "$@"
+    else
+        grep -E "$@"
+    fi
+}
+
+_session_names() {
+    zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p'
+}
+
+cmd_find() {
+    check_deps
+    [[ $# -ge 1 ]] || die "usage: surrogate find <query> [-n LINES] [-C CONTEXT]"
+    local query="$1"
+    [[ -z "$query" ]] && die "query must not be empty"
+    shift
+
+    local lines=200
+    local context=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
+            -C) [[ $# -ge 2 ]] || die "-C requires a number"; require_int "$2"; context="$2"; shift 2 ;;
+            *)  die "unknown flag: $1" ;;
+        esac
+    done
+
+    local found=0
+    while IFS= read -r session; do
+        local output
+        output="$(zmx history "$session" 2>/dev/null | tail -n "$lines" | _search -i -C "$context" -- "$query" 2>/dev/null || true)"
+        if [[ -n "$output" ]]; then
+            local count
+            count="$(echo "$output" | _search -c -i -- "$query" 2>/dev/null || echo 0)"
+            echo "═══ $session ($count matches) ═══"
+            echo "$output"
+            echo ""
+            found=$((found + 1))
+        fi
+    done < <(_session_names)
+
+    if [[ $found -eq 0 ]]; then
+        echo "no matches for '$query' across $(zmx list 2>/dev/null | wc -l) sessions"
+    else
+        echo "--- $found session(s) matched ---"
+    fi
+}
+
+cmd_who() {
+    check_deps
+
+    local lines=10
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
+            *)  die "unknown flag: $1" ;;
+        esac
+    done
+
+    local total=0
+    while IFS= read -r line; do
+        local session clients
+        session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
+        clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
+        [[ -z "$session" ]] && continue
+
+        # Socket age
+        local zmx_dir="/run/user/$(id -u)/zmx"
+        local ago="?"
+        if [[ -e "$zmx_dir/$session" ]]; then
+            local now mtime age
+            now="$(date +%s)"
+            mtime="$(stat -c %Y "$zmx_dir/$session" 2>/dev/null || echo 0)"
+            age=$(( now - mtime ))
+            if [[ $age -lt 60 ]]; then ago="${age}s"
+            elif [[ $age -lt 3600 ]]; then ago="$((age / 60))m"
+            elif [[ $age -lt 86400 ]]; then ago="$((age / 3600))h"
+            else ago="$((age / 86400))d"; fi
+        fi
+
+        local attached=""
+        [[ "$clients" -gt 0 ]] && attached="*"
+
+        # Last N non-blank lines as snippet
+        local snippet
+        snippet="$(zmx history "$session" 2>/dev/null | tail -n "$lines" | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-80)"
+
+        printf "%-4s %-42s %s\n" "${ago}${attached}" "$session" "$snippet"
+        total=$((total + 1))
+    done < <(zmx list 2>/dev/null)
+
+    echo "── $total sessions (* = attached) ──"
+}
+
+cmd_active() {
+    check_deps
+
+    local mode="attached"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)  mode="all"; shift ;;
+            *)      die "unknown flag: $1 (use --all to include detached)" ;;
+        esac
+    done
+
+    printf "%-45s %-8s %s\n" "SESSION" "CLIENTS" "SNIPPET"
+    printf "%-45s %-8s %s\n" "-------" "-------" "-------"
+
+    local found=0
+    while IFS= read -r line; do
+        local session clients
+        session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
+        clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
+        [[ -z "$session" ]] && continue
+
+        # Default: only show attached sessions (clients > 0)
+        if [[ "$mode" == "attached" && "$clients" -eq 0 ]]; then
+            continue
+        fi
+
+        # For --all mode, check if session has any history (non-empty)
+        if [[ "$mode" == "all" ]]; then
+            local lc
+            lc="$(zmx history "$session" 2>/dev/null | wc -l)"
+            [[ "$lc" -eq 0 ]] && continue
+        fi
+
+        local snippet
+        snippet="$(zmx history "$session" 2>/dev/null | tail -n 5 | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-60)"
+        printf "%-45s %-8s %s\n" "$session" "$clients" "$snippet"
+        found=$((found + 1))
+    done < <(zmx list 2>/dev/null)
+
+    echo "--- $found active session(s) ---"
+}
+
+cmd_peek() {
+    check_deps
+
+    local lines=5
+    local filter=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
+            --filter) [[ $# -ge 2 ]] || die "--filter requires a pattern"; filter="$2"; shift 2 ;;
+            *)  die "unknown flag: $1" ;;
+        esac
+    done
+
+    local count=0
+    while IFS= read -r session; do
+        local output
+        output="$(zmx history "$session" 2>/dev/null | tail -n "$lines" | sed '/^[[:space:]]*$/d')"
+        [[ -z "$output" ]] && continue
+
+        # Apply filter if given
+        if [[ -n "$filter" ]]; then
+            if ! echo "$output" | _search -qi -- "$filter" 2>/dev/null; then
+                continue
+            fi
+        fi
+
+        echo "─── $session ───"
+        echo "$output"
+        echo ""
+        count=$((count + 1))
+    done < <(_session_names)
+
+    echo "--- peeked $count session(s) ---"
+}
+
+cmd_rename() {
+    check_deps
+    [[ $# -ge 2 ]] || die "usage: surrogate rename <session> <new-name>"
+    local session="$1"
+    local new_name="$2"
+
+    session_exists "$session" || die "session '$session' not found"
+
+    # Reject if target name already exists
+    if session_exists "$new_name"; then
+        die "session '$new_name' already exists"
+    fi
+
+    # Rename the zmx socket
+    local zmx_dir="/run/user/$(id -u)/zmx"
+    mv "$zmx_dir/$session" "$zmx_dir/$new_name" || die "failed to rename zmx socket"
+
+    # Kill old bridge if one exists — it holds a stale zmx attach command.
+    # A new bridge will be lazily created on next send/type with the new name.
+    local old_bridge
+    old_bridge="$(bridge_name "$session")"
+    if tmux has-session -t "$old_bridge" 2>/dev/null; then
+        tmux kill-session -t "$old_bridge" 2>/dev/null || true
+    fi
+
+    # Rename watermark/lock files if they exist
+    local old_wm new_wm old_lock new_lock
+    old_wm="$(watermark_file "$session")"
+    new_wm="$(watermark_file "$new_name")"
+    old_lock="$(lock_file "$session")"
+    new_lock="$(lock_file "$new_name")"
+    [[ -f "$old_wm" ]] && mv "$old_wm" "$new_wm" 2>/dev/null || true
+    [[ -f "$old_lock" ]] && mv "$old_lock" "$new_lock" 2>/dev/null || true
+
+    echo "renamed: $session -> $new_name"
 }
 
 cmd_bridge() {
@@ -275,6 +498,11 @@ case "${1}" in
     type)    shift; cmd_type "$@" ;;
     read)    shift; cmd_read "$@" ;;
     wait)    shift; cmd_wait "$@" ;;
+    find)    shift; cmd_find "$@" ;;
+    who)     shift; cmd_who "$@" ;;
+    active)  shift; cmd_active "$@" ;;
+    peek)    shift; cmd_peek "$@" ;;
+    rename)  shift; cmd_rename "$@" ;;
     bridge)  shift; cmd_bridge "$@" ;;
     cleanup) shift; cmd_cleanup "$@" ;;
     status)  shift; cmd_status "$@" ;;

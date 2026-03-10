@@ -100,6 +100,41 @@ surrogate-shell-setup --check
 surrogate list
 ```
 
+### Search all sessions
+
+```bash
+surrogate find "auth error"             # search last 200 lines of every session
+surrogate find "TODO" -n 500 -C 3       # deeper search with context lines
+```
+
+### Show sessions with snippets
+
+```bash
+surrogate who                            # age, session name, last visible line
+surrogate who -n 20                      # sniff last 20 lines for snippet
+```
+
+### Show attached sessions
+
+```bash
+surrogate active                         # only sessions with clients attached
+surrogate active --all                   # include non-empty detached sessions
+```
+
+### Batch read all sessions
+
+```bash
+surrogate peek                           # last 5 lines from every session
+surrogate peek --filter "shoulder"       # only sessions matching pattern
+surrogate peek -n 2 --filter "error"
+```
+
+### Rename a session
+
+```bash
+surrogate rename <old-session> <new-name>
+```
+
 ### Type text + Enter
 
 The most common operation. Types literal text and presses Enter.
@@ -216,6 +251,8 @@ These are enforced by automated tests and must hold for every change:
 | **Terminal-agnostic** | Zero references to specific terminal emulators in snippets or CLI |
 | **Full path to zmx** | Snippet uses `$HOME/.local/bin/zmx`, not `command -v zmx` (PATH isn't set when rc files run) |
 | **Parent process check** | Double-wrap prevention checks parent process name (`ps -o comm= -p $PPID`), not `$ZMX_SESSION` env var (which leaks through window managers to all children) |
+| **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no heuristics, no agent-type guessing |
+| **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
 
 ## Tests
 
@@ -223,7 +260,7 @@ These are enforced by automated tests and must hold for every change:
 bash tests/test_surrogate_e2e.sh
 ```
 
-19 end-to-end tests: 13 functional tests (list, type, send, read, wait, bridge creation/reuse, cleanup, status, concurrent serialization, error handling) + 6 design invariant tests.
+End-to-end tests: functional tests (list, type, send, read, wait, find, who, active, peek, rename, bridge creation/reuse, cleanup, status, concurrent serialization, input validation, error handling) + design invariant tests.
 
 ## Uninstall
 

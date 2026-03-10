@@ -17,6 +17,49 @@ An AI agent uses surrogate to act as a "surrogate user" -- typing into TUI apps 
 surrogate list
 ```
 
+### Search across all sessions
+
+```bash
+surrogate find <query> [-n LINES] [-C CONTEXT]
+# Search last 200 lines of every session (rg, falls back to grep)
+surrogate find "auth error"
+surrogate find "TODO" -n 500 -C 3
+```
+
+### Show all sessions with snippets
+
+```bash
+surrogate who [-n LINES]
+# Age, session name, last visible line from each session
+surrogate who
+surrogate who -n 20   # sniff last 20 lines for snippet
+```
+
+### Show attached sessions
+
+```bash
+surrogate active [--all]
+# Default: only sessions with clients attached
+surrogate active
+surrogate active --all   # include non-empty detached sessions
+```
+
+### Batch read all sessions
+
+```bash
+surrogate peek [-n LINES] [--filter PATTERN]
+# Last 5 lines from every session, optionally filtered
+surrogate peek
+surrogate peek --filter "shoulder"
+surrogate peek -n 2 --filter "error"
+```
+
+### Rename a session
+
+```bash
+surrogate rename <old-session> <new-name>
+```
+
 ### Type text + Enter (most common)
 
 ```bash
@@ -90,8 +133,10 @@ nohup bash -c 'sleep 10 && surrogate type MY_SESSION "banana"' &
 ### Inter-agent communication
 
 ```bash
-# Find the other agent's session
-surrogate list | grep shoulder
+# Find which session is working on shoulder
+surrogate find "shoulder" -n 50
+# Or peek at all sessions mentioning it
+surrogate peek --filter "shoulder"
 # Send them a prompt
 surrogate type 2026-03-10_09-48-54_EDT-4054495 "Please review my changes"
 ```

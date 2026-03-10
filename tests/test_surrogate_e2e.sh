@@ -469,6 +469,29 @@ test_invariant_parent_check_not_env_var() {
   fi
 }
 
+test_invariant_unsets_zmx_session_before_attach() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+
+  # zmx attach refuses to run if ZMX_SESSION is set (CannotAttachToSessionInSession).
+  # ZMX_SESSION leaks from parent zmx sessions through window managers to all children
+  # (VS Code, tmux panes, etc). The snippet MUST unset ZMX_SESSION before exec zmx attach.
+  # Without this, terminals launched from within a zmx-wrapped desktop will hang.
+  local snippet
+  snippet=$("$setup_script" --show 2>&1)
+
+  if echo "$snippet" | grep -q 'unset ZMX_SESSION\|set -e ZMX_SESSION'; then
+    pass "${FUNCNAME[0]} — snippet unsets ZMX_SESSION before zmx attach"
+  else
+    echo "    snippet does not unset ZMX_SESSION before exec zmx attach"
+    echo "    zmx attach will fail with CannotAttachToSessionInSession in leaked-env terminals"
+    fail "${FUNCNAME[0]} — MUST unset ZMX_SESSION before exec (env var leaks via WM)"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -500,6 +523,7 @@ test_invariant_no_terminal_specific_code
 test_invariant_surrogate_cli_terminal_agnostic
 test_invariant_zmx_full_path
 test_invariant_parent_check_not_env_var
+test_invariant_unsets_zmx_session_before_attach
 
 # ---------------------------------------------------------------------------
 # Summary

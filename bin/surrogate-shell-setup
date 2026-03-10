@@ -54,6 +54,7 @@ if [[ -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]]; then
     if [[ "$_surr_parent" != "zmx" ]]; then
       _surr_name="$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
       echo "surrogate: wrapping in zmx session $_surr_name"
+      unset ZMX_SESSION
       exec "$_surr_zmx" attach "$_surr_name"
     else
       echo "surrogate: zmx session ${ZMX_SESSION:-inherited}"
@@ -76,6 +77,7 @@ if not set -q SURROGATE_NO_ZMX; and status is-interactive
     if test "$_surr_parent" != "zmx"
       set -l _surr_name (date +'%Y-%m-%d_%H-%M-%S_%Z')"-$fish_pid"
       echo "surrogate: wrapping in zmx session $_surr_name"
+      set -e ZMX_SESSION
       exec $_surr_zmx attach $_surr_name
     else
       echo "surrogate: zmx session "(set -q ZMX_SESSION; and echo $ZMX_SESSION; or echo "inherited")

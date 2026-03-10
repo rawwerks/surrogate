@@ -9,12 +9,25 @@ Surrogate enables programmatic keystroke injection into any terminal application
 
 An AI agent uses surrogate to act as a "surrogate user" -- typing into TUI apps like Claude Code, vim, python REPL, htop, etc.
 
+## Session Aliases
+
+Every session gets a deterministic adjective-noun alias (e.g. `shiny-dolphin`, `robo-quokka`). Aliases are derived from the session name via hash — no state, no config. They never collide.
+
+All commands that take a `<session>` argument accept either the full zmx name or the alias:
+
+```bash
+surrogate type shiny-dolphin "hello"              # alias
+surrogate type 2026-03-08_20-44-12_EDT-539343 "hello"  # full name — same thing
+surrogate alias 2026-03-08_20-44-12_EDT-539343    # → shiny-dolphin
+```
+
 ## Quick Reference
 
 ### Discover sessions
 
 ```bash
 surrogate list
+# Shows alias + full session name for every session
 ```
 
 ### Search across all sessions
@@ -60,10 +73,17 @@ surrogate peek -n 2 --filter "error"
 surrogate rename <old-session> <new-name>
 ```
 
+### Show alias for a session
+
+```bash
+surrogate alias <session>
+```
+
 ### Type text + Enter (most common)
 
 ```bash
 surrogate type <session> "some text"
+# <session> can be an alias: surrogate type robo-quokka "some text"
 ```
 
 ### Send special keys (tmux send-keys syntax)
@@ -138,7 +158,7 @@ surrogate find "shoulder" -n 50
 # Or peek at all sessions mentioning it
 surrogate peek --filter "shoulder"
 # Send them a prompt
-surrogate type 2026-03-10_09-48-54_EDT-4054495 "Please review my changes"
+surrogate type elfin-squid "Please review my changes"
 ```
 
 ## Special Keys Reference

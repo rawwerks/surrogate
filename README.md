@@ -92,12 +92,28 @@ surrogate-shell-setup --show
 surrogate-shell-setup --check
 ```
 
+## Session Aliases
+
+Every session gets a deterministic adjective-noun alias derived from its name — no config, no state files. Aliases never collide.
+
+```bash
+surrogate list
+# shiny-dolphin      2026-03-08_20-44-12_EDT-539343
+# robo-quokka        2026-03-09_13-53-24_EDT-2132820
+# whimsy-capybara    2026-03-09_13-28-42_EDT-1872169
+
+surrogate type shiny-dolphin "hello"     # same as using the full timestamp
+surrogate alias 2026-03-08_20-44-12_EDT-539343   # → shiny-dolphin
+```
+
+All commands that take a `<session>` argument accept either the full zmx name or the alias.
+
 ## Usage
 
 ### List available sessions
 
 ```bash
-surrogate list
+surrogate list                           # shows alias + full name
 ```
 
 ### Search all sessions
@@ -203,10 +219,10 @@ Full list: `man tmux` → KEYS section.
 ### Send a prompt to Claude Code
 
 ```bash
-surrogate type 2026-03-10_09-48-54_EDT-4054495 "explain the auth module"
-surrogate wait 2026-03-10_09-48-54_EDT-4054495 "●" -t 60
+surrogate type robo-quokka "explain the auth module"
+surrogate wait robo-quokka "●" -t 60
 sleep 10
-surrogate read 2026-03-10_09-48-54_EDT-4054495 -n 100
+surrogate read robo-quokka -n 100
 ```
 
 ### Drive vim
@@ -251,6 +267,7 @@ These are enforced by automated tests and must hold for every change:
 | **Terminal-agnostic** | Zero references to specific terminal emulators in snippets or CLI |
 | **Full path to zmx** | Snippet uses `$HOME/.local/bin/zmx`, not `command -v zmx` (PATH isn't set when rc files run) |
 | **Parent process check** | Double-wrap prevention checks parent process name (`ps -o comm= -p $PPID`), not `$ZMX_SESSION` env var (which leaks through window managers to all children) |
+| **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
 | **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no heuristics, no agent-type guessing |
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
 

@@ -1,1 +1,6 @@
 .jj/
+
+# aPlumb internal state (gitignored; JSONL exports in .plumb/decisions/ are tracked)
+.plumb/*
+!.plumb/decisions/
+.env

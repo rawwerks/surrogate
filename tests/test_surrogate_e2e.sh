@@ -11,12 +11,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SURROGATE="${SURROGATE:-$(dirname "$SCRIPT_DIR")/bin/surrogate}"
 TEST_SESSION="test-surrogate-$$"
-PASS=0
-FAIL=0
-TESTS_RUN=0
+RESULTS_DIR="$(mktemp -d)"
+RESULTS_FILE="$RESULTS_DIR/results"
+touch "$RESULTS_FILE"
+TESTS_RUN=0  # legacy counter, summary uses RESULTS_FILE
 
-pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
-fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
+pass() { echo "PASS" >> "$RESULTS_FILE"; echo "  PASS: $1"; }
+fail() { echo "FAIL" >> "$RESULTS_FILE"; echo "  FAIL: $1"; }
 
 # ---------------------------------------------------------------------------
 # Setup / Teardown
@@ -30,6 +31,7 @@ cleanup() {
   for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_test-surrogate-\|^_surr_surr-dead-test-" || true); do
     tmux kill-session -t "$s" 2>/dev/null && echo "killed bridge $s" || true
   done
+  rm -rf "$RESULTS_DIR" 2>/dev/null || true
   echo "cleanup done"
 }
 trap cleanup EXIT
@@ -67,6 +69,7 @@ echo ""
 # ---------------------------------------------------------------------------
 
 test_list() {
+  # plumb:req-43c3eed5
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -83,6 +86,10 @@ test_list() {
 }
 
 test_type_and_read() {
+  # plumb:req-29b6b22a
+  # plumb:req-f6a28ee7
+  # plumb:req-c210345d
+  # plumb:req-da49d759
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -104,6 +111,7 @@ test_type_and_read() {
 }
 
 test_send_special_keys() {
+  # plumb:req-2335dd45
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -127,6 +135,8 @@ test_send_special_keys() {
 }
 
 test_bridge_creation() {
+  # plumb:req-b6f97f4e
+  # plumb:req-5b4577ce
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -142,6 +152,8 @@ test_bridge_creation() {
 }
 
 test_bridge_reuse() {
+  # plumb:req-ae4fb35e
+  # plumb:req-19170671
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -163,6 +175,9 @@ test_bridge_reuse() {
 }
 
 test_wait_success() {
+  # plumb:req-c53cf3b7
+  # plumb:req-4ecc2ef6
+  # plumb:req-2c9db8fd
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -189,6 +204,7 @@ test_wait_timeout() {
 }
 
 test_read_line_limit() {
+  # plumb:req-201cbd97
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -210,6 +226,8 @@ test_read_line_limit() {
 }
 
 test_dead_session_error() {
+  # plumb:req-0748d740
+  # plumb:req-f63f502d
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -223,6 +241,8 @@ test_dead_session_error() {
 }
 
 test_cleanup_dead() {
+  # plumb:req-3bb77a03
+  # plumb:req-129f015a
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -252,6 +272,7 @@ test_cleanup_dead() {
 }
 
 test_cleanup_all() {
+  # plumb:req-be66a1c3
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -280,6 +301,8 @@ test_cleanup_all() {
 }
 
 test_status() {
+  # plumb:req-a727036c
+  # plumb:req-04b8212d
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -297,6 +320,9 @@ test_status() {
 }
 
 test_concurrent_serialization() {
+  # plumb:req-271825d3
+  # plumb:req-29465905
+  # plumb:req-934a7095
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -336,6 +362,8 @@ test_concurrent_serialization() {
 # ---------------------------------------------------------------------------
 
 test_invariant_snippet_always_prints_message() {
+  # plumb:req-d1726bef
+  # plumb:req-a64328f9
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -362,6 +390,7 @@ test_invariant_snippet_always_prints_message() {
 }
 
 test_invariant_snippet_all_shells() {
+  # plumb:req-5523d6ad
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -398,6 +427,7 @@ test_invariant_snippet_all_shells() {
 }
 
 test_invariant_no_terminal_specific_code() {
+  # plumb:req-eb9fb624
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -421,6 +451,7 @@ test_invariant_no_terminal_specific_code() {
 }
 
 test_invariant_surrogate_cli_terminal_agnostic() {
+  # plumb:req-bef8d006
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -437,6 +468,7 @@ test_invariant_surrogate_cli_terminal_agnostic() {
 }
 
 test_invariant_zmx_full_path() {
+  # plumb:req-5ad4c151
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -456,6 +488,7 @@ test_invariant_zmx_full_path() {
 }
 
 test_invariant_parent_check_not_env_var() {
+  # plumb:req-51b97d09
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -481,6 +514,7 @@ test_invariant_parent_check_not_env_var() {
 }
 
 test_invariant_unsets_zmx_session_before_attach() {
+  # plumb:req-d2c194b8
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -552,10 +586,13 @@ test_status
 test_concurrent_serialization
 
 echo ""
-echo "--- new command tests ---"
+echo "--- alias + search tests ---"
 echo ""
 
 test_find() {
+  # plumb:req-24a68c42
+  # plumb:req-720a5bc2
+  # plumb:req-cfd97f85
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -576,6 +613,7 @@ test_find() {
 }
 
 test_find_empty_query() {
+  # plumb:req-4b5c0133
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -587,6 +625,7 @@ test_find_empty_query() {
 }
 
 test_find_no_match() {
+  # plumb:req-16dd55a0
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -603,6 +642,7 @@ test_find_no_match() {
 }
 
 test_find_with_context() {
+  # plumb:req-c38efd2f
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -623,6 +663,8 @@ test_find_with_context() {
 }
 
 test_who() {
+  # plumb:req-251007fd
+  # plumb:req-6a20e804
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -639,6 +681,8 @@ test_who() {
 }
 
 test_who_n_zero() {
+  # plumb:req-4e55b856
+  # plumb:req-0e241e62
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -654,6 +698,8 @@ test_who_n_zero() {
 }
 
 test_active() {
+  # plumb:req-295cf791
+  # plumb:req-55b5dea2
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -670,6 +716,9 @@ test_active() {
 }
 
 test_peek() {
+  # plumb:req-4ef11b15
+  # plumb:req-a02e09c7
+  # plumb:req-7fcde33b
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -690,6 +739,7 @@ test_peek() {
 }
 
 test_peek_no_filter_match() {
+  # plumb:req-53a2ec07
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -704,6 +754,10 @@ test_peek_no_filter_match() {
 }
 
 test_rename() {
+  # plumb:req-5ee05e33
+  # plumb:req-62eb9d36
+  # plumb:req-a6498a94
+  # plumb:req-56aebe04
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -733,6 +787,7 @@ test_rename() {
 }
 
 test_rename_nonexistent() {
+  # plumb:req-db99d33a
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -744,6 +799,7 @@ test_rename_nonexistent() {
 }
 
 test_rename_collision() {
+  # plumb:req-9b0bac5e
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -770,6 +826,8 @@ test_rename_collision() {
 }
 
 test_require_int() {
+  # plumb:req-41dfdd81
+  # plumb:req-73e7db09
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -808,6 +866,11 @@ test_require_int() {
   fi
 }
 
+# Alias tests that need TEST_SESSION (write operations)
+test_alias_resolve
+test_alias_rename_shows_aliases
+
+# Search/filter tests
 test_find
 test_find_empty_query
 test_find_no_match
@@ -840,14 +903,17 @@ test_invariant_installed_matches_repo
 # ---------------------------------------------------------------------------
 
 echo ""
+PASS_COUNT=$(grep -c PASS "$RESULTS_FILE" 2>/dev/null || echo 0)
+FAIL_COUNT=$(grep -c FAIL "$RESULTS_FILE" 2>/dev/null || echo 0)
+TOTAL=$((PASS_COUNT + FAIL_COUNT))
 echo "=== results ==="
-echo "  tests run: $TESTS_RUN"
-echo "  passed:    $PASS"
-echo "  failed:    $FAIL"
+echo "  tests run: $TOTAL"
+echo "  passed:    $PASS_COUNT"
+echo "  failed:    $FAIL_COUNT"
 echo ""
 
-if [[ "$FAIL" -gt 0 ]]; then
-  echo "FAIL: $FAIL test(s) failed"
+if [[ "$FAIL_COUNT" -gt 0 ]]; then
+  echo "FAIL: $FAIL_COUNT test(s) failed"
   exit 1
 else
   echo "ALL TESTS PASSED"

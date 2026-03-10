@@ -4,7 +4,7 @@ set -euo pipefail
 SURROGATE_TMP="/tmp"
 BRIDGE_PREFIX="_surr_"
 
-# --- helpers ---
+# --- helpers (needed early) ---
 
 die() { echo "surrogate: error: $*" >&2; exit 1; }
 
@@ -13,6 +13,123 @@ require_int() {
     [[ "$1" =~ ^[0-9]+$ ]] || die "'$1' is not a valid number"
 }
 
+check_deps() {
+    command -v zmx >/dev/null 2>&1 || die "zmx not found. Install zmx first."
+    command -v tmux >/dev/null 2>&1 || die "tmux not found. Install with your package manager."
+}
+
+session_exists() {
+    zmx list 2>/dev/null | grep -q "^session_name=$1	"
+}
+
+_session_names() {
+    zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p'
+}
+
+_search() {
+    # Use rg if available, fall back to grep -E
+    if command -v rg >/dev/null 2>&1; then
+        rg "$@"
+    else
+        grep -E "$@"
+    fi
+}
+
+# --- alias wordlists (100 adjectives × 100 nouns = 10,000 combinations) ---
+
+ADJECTIVES=(
+    astral binary bouncy brave bright buzzy calm chrome clever cosmic
+    cozy cubic cyber dandy deft dizzy dreamy dusty eager elfin
+    fancy fizzy fleet fluffy foggy funky fuzzy gentle giddy glossy
+    golden groovy happy hasty hex hollow holo idle ionic jazzy
+    jolly keen kinetic lanky laser lazy light lunar lucky lumpy
+    magic mellow merry micro misty nifty nimble noble nova odd
+    perky pixel plucky polar prismy proxy pudgy quaint quick quirky
+    radiant rapid retro robo rosy rusty sassy shiny silly sleek
+    snappy snowy sonic sparkly speedy spicy spry starry sunny swift
+    tidal tiny turbo twin vivid wacky warm whimsy wild zappy
+)
+
+NOUNS=(
+    badger beagle beacon bison bolt bunny capybara cheetah chipmunk clank
+    comet corgi coyote crane cricket cube cyborg dingo dolphin drone
+    falcon ferret finch fox gadget gecko gizmo goose griffin hamster
+    hawk heron husky iguana jackal kelpie koala lemur llama lynx
+    mantis marmot meerkat moose moth narwhal newt osprey otter owl
+    panda parrot pelican penguin photon pixel puffin quail quokka rabbit
+    raven reindeer robin rover sabot seal sensor shrew signal sloth
+    sparrow sphinx sprocket squid stork swift tapir thrush toucan urchin
+    vector viper walrus weasel widget wombat wren yak zebra zippy
+    axolotl bobcat camel chameleon condor ermine flamingo hedgehog ibis jellyfish
+)
+
+# --- alias functions ---
+
+# Cache: built once per invocation, maps session→alias and alias→session
+declare -A _ALIAS_CACHE _ALIAS_REVERSE
+_ALIAS_CACHE_BUILT=""
+
+_build_alias_cache() {
+    [[ -n "$_ALIAS_CACHE_BUILT" ]] && return
+    _ALIAS_CACHE=()
+    _ALIAS_REVERSE=()
+
+    local -a sorted_names
+    while IFS= read -r name; do
+        sorted_names+=("$name")
+    done < <(_session_names | sort)
+
+    # Compute aliases: inline djb2 hash + collision suffix
+    local -A base_count
+    local h i c s base cnt
+    for name in "${sorted_names[@]}"; do
+        # Inline djb2 hash — no subshells
+        s="$name" h=5381
+        for (( i=0; i<${#s}; i++ )); do
+            printf -v c '%d' "'${s:$i:1}"
+            h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
+        done
+        base="${ADJECTIVES[$((h % 100))]}-${NOUNS[$((h / 100 % 100))]}"
+        cnt="${base_count[$base]:-0}"
+        cnt=$((cnt + 1))
+        base_count["$base"]=$cnt
+        if [[ $cnt -eq 1 ]]; then
+            _ALIAS_CACHE["$name"]="$base"
+            _ALIAS_REVERSE["$base"]="$name"
+        else
+            _ALIAS_CACHE["$name"]="${base}-${cnt}"
+            _ALIAS_REVERSE["${base}-${cnt}"]="$name"
+        fi
+    done
+    _ALIAS_CACHE_BUILT=1
+}
+
+session_alias() {
+    _build_alias_cache
+    echo "${_ALIAS_CACHE[$1]}"
+}
+
+resolve_session() {
+    local input="$1"
+
+    # 1. Exact match — always wins
+    if session_exists "$input"; then
+        echo "$input"
+        return 0
+    fi
+
+    # 2. Alias lookup from reverse cache
+    _build_alias_cache
+    if [[ -n "${_ALIAS_REVERSE[$input]:-}" ]]; then
+        echo "${_ALIAS_REVERSE[$input]}"
+        return 0
+    fi
+
+    die "session '$input' not found (not a name or alias)"
+}
+
+# --- remaining helpers ---
+
 usage() {
     cat <<'EOF'
 surrogate - programmatic keystroke injection into zmx sessions
@@ -20,7 +137,7 @@ surrogate - programmatic keystroke injection into zmx sessions
 Usage: surrogate <command> [args]
 
 Commands:
-  list                          List available zmx sessions
+  list                          List available zmx sessions (with aliases)
   send  <session> [keys...]     Send tmux send-keys style keystrokes
   type  <session> <text>        Type literal text followed by Enter
   read  <session> [-n LINES]    Read recent output (default: 20 lines)
@@ -31,10 +148,15 @@ Commands:
   active [--all]                Show attached sessions (--all includes non-empty detached)
   peek  [-n LINES] [--filter PATTERN]
                                 Batch read last N lines from all sessions (default: 5)
+  alias <session>               Show the alias for a session
+  whoami                        Show current session name and alias
   rename <session> <new-name>   Rename a zmx session
   bridge <session>              Pre-create tmux bridge for a zmx session
   cleanup [--all|--dead]        Remove stale or all bridge sessions
   status                        Show bridge health
+
+Session arguments accept either the full zmx name or the auto-generated alias.
+Each session gets a deterministic adjective-noun alias (e.g. lazy-sheep).
 
 Special keys (for send):
   Enter Escape Tab Space BSpace
@@ -43,24 +165,14 @@ Special keys (for send):
 
 Examples:
   surrogate list
-  surrogate type my-session "echo hello"
+  surrogate type lazy-sheep "echo hello"
+  surrogate type 2026-03-08_15-07-15_EDT-132628 "echo hello"
   surrogate send my-session C-c
-  surrogate send my-session Escape ":wq" Enter
-  surrogate read my-session -n 50
-  surrogate wait my-session "PASS|FAIL" -t 60
-  surrogate rename 2026-03-08_15-07-15_EDT-132628 my-session
+  surrogate read bold-crane -n 50
+  surrogate alias 2026-03-08_15-07-15_EDT-132628
 
 EOF
     exit 0
-}
-
-check_deps() {
-    command -v zmx >/dev/null 2>&1 || die "zmx not found. Install zmx first."
-    command -v tmux >/dev/null 2>&1 || die "tmux not found. Install with your package manager."
-}
-
-session_exists() {
-    zmx list 2>/dev/null | grep -q "^session_name=$1	"
 }
 
 bridge_name() {
@@ -112,13 +224,17 @@ ensure_bridge() {
 
 cmd_list() {
     check_deps
-    zmx list
+    _build_alias_cache
+    while IFS= read -r session; do
+        printf "%-20s %s\n" "${_ALIAS_CACHE[$session]}" "$session"
+    done < <(_session_names)
 }
 
 cmd_send() {
     check_deps
     [[ $# -ge 1 ]] || die "usage: surrogate send <session> [keys...]"
-    local session="$1"
+    local session
+    session="$(resolve_session "$1")"
     shift
 
     ensure_bridge "$session"
@@ -138,7 +254,8 @@ cmd_send() {
 cmd_type() {
     check_deps
     [[ $# -ge 2 ]] || die "usage: surrogate type <session> <text>"
-    local session="$1"
+    local session
+    session="$(resolve_session "$1")"
     local text="$2"
 
     ensure_bridge "$session"
@@ -159,7 +276,8 @@ cmd_type() {
 cmd_read() {
     check_deps
     [[ $# -ge 1 ]] || die "usage: surrogate read <session> [-n LINES]"
-    local session="$1"
+    local session
+    session="$(resolve_session "$1")"
     shift
 
     local lines=20
@@ -170,14 +288,14 @@ cmd_read() {
         esac
     done
 
-    session_exists "$session" || die "session '$session' not found"
     zmx history "$session" | tail -n "$lines"
 }
 
 cmd_wait() {
     check_deps
     [[ $# -ge 2 ]] || die "usage: surrogate wait <session> <pattern> [-t TIMEOUT]"
-    local session="$1"
+    local session
+    session="$(resolve_session "$1")"
     local pattern="$2"
     shift 2
 
@@ -188,8 +306,6 @@ cmd_wait() {
             *)  die "unknown flag: $1" ;;
         esac
     done
-
-    session_exists "$session" || die "session '$session' not found"
 
     local wm_file
     wm_file="$(watermark_file "$session")"
@@ -210,21 +326,9 @@ cmd_wait() {
     die "timeout after ${timeout}s waiting for pattern: $pattern"
 }
 
-_search() {
-    # Use rg if available, fall back to grep -E
-    if command -v rg >/dev/null 2>&1; then
-        rg "$@"
-    else
-        grep -E "$@"
-    fi
-}
-
-_session_names() {
-    zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p'
-}
-
 cmd_find() {
     check_deps
+    _build_alias_cache
     [[ $# -ge 1 ]] || die "usage: surrogate find <query> [-n LINES] [-C CONTEXT]"
     local query="$1"
     [[ -z "$query" ]] && die "query must not be empty"
@@ -247,7 +351,7 @@ cmd_find() {
         if [[ -n "$output" ]]; then
             local count
             count="$(echo "$output" | _search -c -i -- "$query" 2>/dev/null || echo 0)"
-            echo "═══ $session ($count matches) ═══"
+            echo "═══ ${_ALIAS_CACHE[$session]}  $session ($count matches) ═══"
             echo "$output"
             echo ""
             found=$((found + 1))
@@ -263,6 +367,7 @@ cmd_find() {
 
 cmd_who() {
     check_deps
+    _build_alias_cache
 
     local lines=10
     while [[ $# -gt 0 ]]; do
@@ -298,9 +403,9 @@ cmd_who() {
 
         # Last N non-blank lines as snippet
         local snippet
-        snippet="$(zmx history "$session" 2>/dev/null | tail -n "$lines" | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-80)"
+        snippet="$(zmx history "$session" 2>/dev/null | tail -n "$lines" | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-60)"
 
-        printf "%-4s %-42s %s\n" "${ago}${attached}" "$session" "$snippet"
+        printf "%-4s %-18s %-42s %s\n" "${ago}${attached}" "${_ALIAS_CACHE[$session]}" "$session" "$snippet"
         total=$((total + 1))
     done < <(zmx list 2>/dev/null)
 
@@ -309,6 +414,7 @@ cmd_who() {
 
 cmd_active() {
     check_deps
+    _build_alias_cache
 
     local mode="attached"
     while [[ $# -gt 0 ]]; do
@@ -318,8 +424,8 @@ cmd_active() {
         esac
     done
 
-    printf "%-45s %-8s %s\n" "SESSION" "CLIENTS" "SNIPPET"
-    printf "%-45s %-8s %s\n" "-------" "-------" "-------"
+    printf "%-18s %-45s %-8s %s\n" "ALIAS" "SESSION" "CLIENTS" "SNIPPET"
+    printf "%-18s %-45s %-8s %s\n" "-----" "-------" "-------" "-------"
 
     local found=0
     while IFS= read -r line; do
@@ -342,7 +448,7 @@ cmd_active() {
 
         local snippet
         snippet="$(zmx history "$session" 2>/dev/null | tail -n 5 | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-60)"
-        printf "%-45s %-8s %s\n" "$session" "$clients" "$snippet"
+        printf "%-18s %-45s %-8s %s\n" "${_ALIAS_CACHE[$session]}" "$session" "$clients" "$snippet"
         found=$((found + 1))
     done < <(zmx list 2>/dev/null)
 
@@ -351,6 +457,7 @@ cmd_active() {
 
 cmd_peek() {
     check_deps
+    _build_alias_cache
 
     local lines=5
     local filter=""
@@ -368,14 +475,16 @@ cmd_peek() {
         output="$(zmx history "$session" 2>/dev/null | tail -n "$lines" | sed '/^[[:space:]]*$/d')"
         [[ -z "$output" ]] && continue
 
-        # Apply filter if given
+        # Apply filter if given (matches against output content AND alias)
         if [[ -n "$filter" ]]; then
             if ! echo "$output" | _search -qi -- "$filter" 2>/dev/null; then
-                continue
+                if ! echo "${_ALIAS_CACHE[$session]} $session" | _search -qi -- "$filter" 2>/dev/null; then
+                    continue
+                fi
             fi
         fi
 
-        echo "─── $session ───"
+        echo "─── ${_ALIAS_CACHE[$session]}  $session ───"
         echo "$output"
         echo ""
         count=$((count + 1))
@@ -384,18 +493,40 @@ cmd_peek() {
     echo "--- peeked $count session(s) ---"
 }
 
+cmd_alias() {
+    check_deps
+    [[ $# -ge 1 ]] || die "usage: surrogate alias <session>"
+    local session
+    session="$(resolve_session "$1")"
+    _build_alias_cache
+    echo "${_ALIAS_CACHE[$session]}"
+}
+
+cmd_whoami() {
+    check_deps
+    local session="${ZMX_SESSION:-}"
+    if [[ -z "$session" ]]; then
+        die "not inside a zmx session (ZMX_SESSION not set)"
+    fi
+    _build_alias_cache
+    local alias="${_ALIAS_CACHE[$session]:-unknown}"
+    echo "$alias  $session"
+}
+
 cmd_rename() {
     check_deps
     [[ $# -ge 2 ]] || die "usage: surrogate rename <session> <new-name>"
-    local session="$1"
+    local session
+    session="$(resolve_session "$1")"
     local new_name="$2"
-
-    session_exists "$session" || die "session '$session' not found"
 
     # Reject if target name already exists
     if session_exists "$new_name"; then
         die "session '$new_name' already exists"
     fi
+
+    _build_alias_cache
+    local old_alias="${_ALIAS_CACHE[$session]}"
 
     # Rename the zmx socket
     local zmx_dir="/run/user/$(id -u)/zmx"
@@ -418,13 +549,18 @@ cmd_rename() {
     [[ -f "$old_wm" ]] && mv "$old_wm" "$new_wm" 2>/dev/null || true
     [[ -f "$old_lock" ]] && mv "$old_lock" "$new_lock" 2>/dev/null || true
 
-    echo "renamed: $session -> $new_name"
+    # Invalidate cache and recompute for new name
+    _ALIAS_CACHE_BUILT=""
+    _build_alias_cache
+    local new_alias="${_ALIAS_CACHE[$new_name]}"
+    echo "renamed: $session ($old_alias) -> $new_name ($new_alias)"
 }
 
 cmd_bridge() {
     check_deps
     [[ $# -ge 1 ]] || die "usage: surrogate bridge <session>"
-    local session="$1"
+    local session
+    session="$(resolve_session "$1")"
     ensure_bridge "$session"
     echo "bridge ready: $(bridge_name "$session")"
 }
@@ -502,6 +638,8 @@ case "${1}" in
     who)     shift; cmd_who "$@" ;;
     active)  shift; cmd_active "$@" ;;
     peek)    shift; cmd_peek "$@" ;;
+    alias)   shift; cmd_alias "$@" ;;
+    whoami)  shift; cmd_whoami "$@" ;;
     rename)  shift; cmd_rename "$@" ;;
     bridge)  shift; cmd_bridge "$@" ;;
     cleanup) shift; cmd_cleanup "$@" ;;

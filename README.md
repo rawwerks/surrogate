@@ -48,7 +48,7 @@ surrogate-shell-setup --install
 surrogate-doctor
 ```
 
-This installs `surrogate`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`, then configures your shell for auto-zmx and verifies the installation.
+This installs `surrogate`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`. It also tries to install [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) by default as a recommended safety guard. If dcg install fails, surrogate still installs and works.
 
 ### Agent skill (for Claude Code)
 
@@ -64,6 +64,18 @@ Agents will then know how to discover zmx sessions, inject keystrokes, read outp
 
 - [zmx](https://github.com/neurosnap/zmx) — session persistence
 - [tmux](https://github.com/tmux/tmux) — used internally for keystroke injection
+
+### Recommended safety dependency
+
+- [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) — Destructive Command Guard for blocking dangerous commands before they execute
+
+`bash install.sh` will try to install dcg automatically. This is strongly recommended but technically optional: surrogate still works without dcg.
+
+To skip dcg auto-install:
+
+```bash
+SURROGATE_SKIP_DCG=1 bash install.sh
+```
 
 ### Auto-wrap all terminals in zmx
 

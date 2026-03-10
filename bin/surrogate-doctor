@@ -30,6 +30,12 @@ else
   fail "tmux not found — install with your package manager"
 fi
 
+if command -v dcg &>/dev/null; then
+  pass "dcg found at $(command -v dcg) (recommended)"
+else
+  warn "dcg not found — recommended safety guard; surrogate still works without it"
+fi
+
 echo ""
 
 # --- binaries ---

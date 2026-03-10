@@ -6,7 +6,7 @@ Mode: **agent-managed**
 
 - **Spec:** SPEC.md
 - **Tests:** tests/
-- **Decision log:** `.plumb/decisions/`
+- **Decision log:** `.aplumb/decisions/`
 - **CLI:** `aplumb` (or `plumb` for backwards compat)
 
 ### When working in this project:
@@ -18,7 +18,7 @@ Mode: **agent-managed**
 - Run `aplumb review` to see agent-reviewed decisions. The human owner can
   override any decision at any time.
 - Use `aplumb coverage` to identify what needs to be implemented or tested next.
-- Never edit files in `.plumb/decisions/` directly.
+- Never edit files in `.aplumb/decisions/` directly.
 - Treat the spec markdown files as the source of truth for intended behavior.
   aPlumb will keep them updated as decisions are approved.
 - For detailed agent workflow guidance: `aplumb skill-path` prints the path to

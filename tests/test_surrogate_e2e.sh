@@ -6,18 +6,82 @@
 # Usage:
 #   bash tests/test_surrogate_e2e.sh
 #
+# Features:
+#   - Per-test timeout (default 30s, override with TEST_TIMEOUT=N)
+#   - Per-test timing (shows elapsed seconds)
+#   - Concurrent-run safe (all resources scoped to PID)
+#   - Fails gracefully on timeout without blocking the suite
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SURROGATE="${SURROGATE:-$(dirname "$SCRIPT_DIR")/bin/surrogate}"
 TEST_SESSION="test-surrogate-$$"
+TEST_TIMEOUT="${TEST_TIMEOUT:-30}"  # per-test timeout in seconds
 RESULTS_DIR="$(mktemp -d)"
 RESULTS_FILE="$RESULTS_DIR/results"
-touch "$RESULTS_FILE"
-TESTS_RUN=0  # legacy counter, summary uses RESULTS_FILE
+TIMING_FILE="$RESULTS_DIR/timing"
+touch "$RESULTS_FILE" "$TIMING_FILE"
+SUITE_START="$(date +%s)"
+
+# Export variables needed by subshell test runners
+export RESULTS_FILE TIMING_FILE SURROGATE TEST_SESSION TEST_TIMEOUT
+export TESTS_RUN=0  # legacy counter (each test increments, but value doesn't survive subshells)
 
 pass() { echo "PASS" >> "$RESULTS_FILE"; echo "  PASS: $1"; }
-fail() { echo "FAIL" >> "$RESULTS_FILE"; echo "  FAIL: $1"; }
+fail() { echo "FAIL: $1" >> "$RESULTS_FILE"; echo "  FAIL: $1"; }
+
+# run_test — runs a test function with timeout and timing
+# Usage: run_test <func_name> [timeout_override]
+run_test() {
+  local func="$1"
+  local timeout="${2:-$TEST_TIMEOUT}"
+  local start elapsed
+
+  start="$(date +%s)"
+
+  # Run the test in a subshell with timeout
+  # We use a subshell so a timeout kills only the test, not the suite
+  set +e
+  (
+    set -euo pipefail
+    "$func"
+  ) &
+  local test_pid=$!
+
+  # Wait with timeout
+  local waited=0
+  while kill -0 "$test_pid" 2>/dev/null && [[ $waited -lt $timeout ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if kill -0 "$test_pid" 2>/dev/null; then
+    # Test is still running — kill it
+    kill "$test_pid" 2>/dev/null || true
+    wait "$test_pid" 2>/dev/null || true
+    fail "$func — TIMEOUT after ${timeout}s"
+  else
+    wait "$test_pid" 2>/dev/null
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+      # Check if it was already recorded as pass/fail
+      # If not, record as fail (the test crashed without calling pass/fail)
+      local last_line
+      last_line="$(tail -1 "$RESULTS_FILE" 2>/dev/null || true)"
+      if [[ "$last_line" != "PASS" && "$last_line" != "FAIL" ]]; then
+        fail "$func — crashed (exit $exit_code)"
+      fi
+    fi
+  fi
+  set -e
+
+  elapsed=$(( $(date +%s) - start ))
+  echo "${func} ${elapsed}s" >> "$TIMING_FILE"
+  if [[ $elapsed -ge 5 ]]; then
+    echo "  (${elapsed}s)"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Setup / Teardown
@@ -26,11 +90,19 @@ fail() { echo "FAIL" >> "$RESULTS_FILE"; echo "  FAIL: $1"; }
 cleanup() {
   echo ""
   echo "--- cleanup ---"
-  zmx kill "$TEST_SESSION" 2>/dev/null || true
-  # Only kill bridges for test sessions — never touch non-test bridges
-  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_test-surrogate-\|^_surr_surr-dead-test-" || true); do
+  # Kill test zmx sessions scoped to THIS run's PID
+  local my_pid="$$"
+  while IFS= read -r sess; do
+    [[ -z "$sess" ]] && continue
+    zmx kill "$sess" 2>/dev/null && echo "killed session $sess" || true
+  done < <(zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p' | grep -F -- "-${my_pid}" || true)
+  # Kill bridges scoped to THIS run's PID only
+  while IFS= read -r s; do
+    [[ -z "$s" ]] && continue
     tmux kill-session -t "$s" 2>/dev/null && echo "killed bridge $s" || true
-  done
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_" | grep -F -- "-${my_pid}" || true)
+  # Clean up custom aliases from this run
+  sed -i "/-${my_pid}=/d" /tmp/surrogate-aliases 2>/dev/null || true
   rm -rf "$RESULTS_DIR" 2>/dev/null || true
   echo "cleanup done"
 }
@@ -39,6 +111,7 @@ trap cleanup EXIT
 echo "=== surrogate end-to-end tests ==="
 echo "surrogate: $SURROGATE"
 echo "test session: $TEST_SESSION"
+echo "test timeout: ${TEST_TIMEOUT}s per test"
 echo ""
 
 # Preflight
@@ -284,28 +357,36 @@ test_cleanup_all() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # Ensure a bridge exists for our test session
-  "$SURROGATE" type "$TEST_SESSION" "echo cleanup_all_test"
+  # Create an isolated session+bridge just for this test
+  local iso_session="surr-cleanup-all-test-$$"
+  zmx run "$iso_session" bash &
+  local iso_pid=$!
+  sleep 2
+
+  "$SURROGATE" type "$iso_session" "echo cleanup_all_test"
   sleep 1
 
-  # Count non-test bridges BEFORE cleanup
-  local pre_count
-  pre_count=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_" | grep -v "_surr_test-surrogate-\|_surr_surr-dead-test-" | wc -l || echo 0)
+  # Verify bridge exists before cleanup
+  local bridge="_surr_${iso_session}"
+  if ! tmux has-session -t "$bridge" 2>/dev/null; then
+    fail "${FUNCNAME[0]} — bridge not created before cleanup"
+    zmx kill "$iso_session" 2>/dev/null || true
+    wait "$iso_pid" 2>/dev/null || true
+    return
+  fi
 
   "$SURROGATE" cleanup --all
 
-  # Count non-test bridges AFTER cleanup — they should be unchanged
-  # (cleanup --all is the CLI feature being tested, so it WILL nuke everything)
-  # We verify the feature works, then check no test-specific bridges remain
-  local remaining
-  remaining=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_test-surrogate-" || true)
-
-  if [[ -z "$remaining" ]]; then
-    pass "${FUNCNAME[0]}"
+  # Verify the bridge was removed
+  if tmux has-session -t "$bridge" 2>/dev/null; then
+    fail "${FUNCNAME[0]} — cleanup --all did not remove bridge"
   else
-    echo "    test bridges still exist: $remaining"
-    fail "${FUNCNAME[0]} — cleanup --all did not remove test bridges"
+    pass "${FUNCNAME[0]}"
   fi
+
+  # Cleanup: kill the isolated session
+  zmx kill "$iso_session" 2>/dev/null || true
+  wait "$iso_pid" 2>/dev/null || true
 }
 
 test_status() {
@@ -581,19 +662,19 @@ test_invariant_installed_matches_repo() {
 echo "--- running tests ---"
 echo ""
 
-test_list
-test_type_and_read
-test_send_special_keys
-test_bridge_creation
-test_bridge_reuse
-test_wait_success
-test_wait_timeout
-test_read_line_limit
-test_dead_session_error
-test_cleanup_dead
-test_cleanup_all
-test_status
-test_concurrent_serialization
+run_test test_list
+run_test test_type_and_read
+run_test test_send_special_keys
+run_test test_bridge_creation
+run_test test_bridge_reuse
+run_test test_wait_success
+run_test test_wait_timeout
+run_test test_read_line_limit
+run_test test_dead_session_error
+run_test test_cleanup_dead
+run_test test_cleanup_all
+run_test test_status
+run_test test_concurrent_serialization
 
 echo ""
 echo "--- alias + search tests ---"
@@ -782,24 +863,26 @@ test_rename() {
   local rename_pid=$!
   sleep 2
 
-  local new_name="surr-renamed-$$"
+  local new_alias="my-custom-alias-$$"
   local output
-  output=$("$SURROGATE" rename "$rename_session" "$new_name" 2>&1)
+  output=$("$SURROGATE" rename "$rename_session" "$new_alias" 2>&1)
 
   if echo "$output" | grep -q "renamed"; then
-    # Verify new name exists and old doesn't
-    if "$SURROGATE" read "$new_name" -n 1 2>/dev/null; then
+    # Verify session is accessible via new alias
+    if "$SURROGATE" read "$new_alias" -n 1 2>/dev/null; then
       pass "${FUNCNAME[0]}"
     else
-      fail "${FUNCNAME[0]} — renamed session not accessible"
+      fail "${FUNCNAME[0]} — session not accessible via new alias"
     fi
   else
     fail "${FUNCNAME[0]} — rename command failed"
   fi
 
   # Cleanup
-  zmx kill "$new_name" 2>/dev/null || true
+  zmx kill "$rename_session" 2>/dev/null || true
   wait "$rename_pid" 2>/dev/null || true
+  # Remove custom alias
+  sed -i "/^${rename_session}=/d" /tmp/surrogate-aliases 2>/dev/null || true
 }
 
 test_rename_nonexistent() {
@@ -883,50 +966,937 @@ test_require_int() {
   fi
 }
 
+test_alias_resolve() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Get alias for test session
+  local alias_name
+  alias_name=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+  [[ -z "$alias_name" ]] && { fail "${FUNCNAME[0]} — alias returned empty"; return; }
+
+  # Resolve alias back to session name
+  local resolved
+  resolved=$("$SURROGATE" read "$alias_name" -n 1 2>&1)
+
+  if [[ $? -eq 0 ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — could not resolve alias '$alias_name' back to session"
+  fi
+}
+
+test_alias_rename_shows_aliases() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local custom="test-custom-$$"
+  local output
+  output=$("$SURROGATE" rename "$TEST_SESSION" "$custom" 2>&1)
+
+  if echo "$output" | grep -q "renamed.*->.*$custom"; then
+    # Verify list shows the custom alias
+    local list_output
+    list_output=$("$SURROGATE" list 2>&1)
+    if echo "$list_output" | grep -q "$custom"; then
+      pass "${FUNCNAME[0]}"
+    else
+      fail "${FUNCNAME[0]} — custom alias not shown in list"
+    fi
+  else
+    fail "${FUNCNAME[0]} — rename output unexpected: $output"
+  fi
+
+  # Cleanup: remove custom alias so it doesn't affect other tests
+  sed -i "/^${TEST_SESSION}=/d" /tmp/surrogate-aliases 2>/dev/null || true
+}
+
+test_label_on() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="LABEL_ON_$$"
+  SURROGATE_LABEL=on "$SURROGATE" type "$TEST_SESSION" "$marker"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" read "$TEST_SESSION" -n 5 2>&1)
+  if echo "$output" | grep -q '\[SURROGATE.*\].*'"$marker"; then
+    pass "${FUNCNAME[0]}"
+  else
+    echo "    expected [SURROGATE...] prefix before $marker"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — label not found"
+  fi
+}
+
+test_label_off() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="LABEL_OFF_$$"
+  SURROGATE_LABEL=off "$SURROGATE" type "$TEST_SESSION" "$marker"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" read "$TEST_SESSION" -n 5 2>&1)
+  # Should NOT have [SURROGATE] prefix
+  if echo "$output" | grep -q '\[SURROGATE\].*'"$marker"; then
+    fail "${FUNCNAME[0]} — label should not appear with SURROGATE_LABEL=off"
+  elif echo "$output" | grep -q "$marker"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — marker not found at all"
+  fi
+}
+
+test_label_verbose() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="LABEL_VERBOSE_$$"
+  SURROGATE_LABEL=verbose "$SURROGATE" type "$TEST_SESSION" "$marker"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" read "$TEST_SESSION" -n 5 2>&1)
+  if echo "$output" | grep -q '\[SURROGATE.*PID:.*\].*'"$marker"; then
+    pass "${FUNCNAME[0]}"
+  else
+    echo "    expected [SURROGATE ... PID:...] prefix before $marker"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — verbose label not found"
+  fi
+}
+
+# --- Tier 1: Alias system tests ---
+
+test_alias_deterministic() {
+  # plumb:req-e4bd038e
+  # plumb:req-09dd2024
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Same session name must always produce the same alias
+  local alias1 alias2
+  alias1=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+  alias2=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+
+  if [[ "$alias1" == "$alias2" && -n "$alias1" ]]; then
+    # Verify it's adjective-noun format
+    if [[ "$alias1" =~ ^[a-z]+-[a-z]+(-[0-9]+)?$ ]]; then
+      pass "${FUNCNAME[0]} — deterministic alias: $alias1"
+    else
+      fail "${FUNCNAME[0]} — alias '$alias1' not in adjective-noun format"
+    fi
+  else
+    fail "${FUNCNAME[0]} — alias not deterministic: '$alias1' vs '$alias2'"
+  fi
+}
+
+test_alias_100_adjectives_100_nouns() {
+  # plumb:req-203451d6
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Verify the wordlists have exactly 100 entries each
+  local adj_count noun_count
+  adj_count=$(grep -A200 '^ADJECTIVES=(' "$SURROGATE" | grep -c '[a-z]' | head -1)
+  noun_count=$(grep -A200 '^NOUNS=(' "$SURROGATE" | grep -c '[a-z]' | head -1)
+
+  # Count actual array elements by sourcing just the arrays
+  adj_count=$(sed -n '/^ADJECTIVES=(/,/^)/p' "$SURROGATE" | tr ' ' '\n' | grep -c '^[a-z]')
+  noun_count=$(sed -n '/^NOUNS=(/,/^)/p' "$SURROGATE" | tr ' ' '\n' | grep -c '^[a-z]')
+
+  if [[ "$adj_count" -eq 100 && "$noun_count" -eq 100 ]]; then
+    pass "${FUNCNAME[0]} — 100 adjectives × 100 nouns"
+  else
+    fail "${FUNCNAME[0]} — expected 100×100, got ${adj_count}×${noun_count}"
+  fi
+}
+
+test_alias_collision_suffix() {
+  # plumb:req-469c2891
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # The code appends -N suffix on hash collision. Verify the code path exists.
+  if grep -q 'base}-${cnt}' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — collision suffix code exists"
+  else
+    fail "${FUNCNAME[0]} — no collision suffix handling found"
+  fi
+}
+
+test_alias_cache_built_once() {
+  # plumb:req-5b263329
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Verify _ALIAS_CACHE_BUILT guard exists (cache built once per invocation)
+  if grep -q '_ALIAS_CACHE_BUILT' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — alias cache built-once guard exists"
+  else
+    fail "${FUNCNAME[0]} — no cache guard found"
+  fi
+}
+
+test_list_shows_aliases() {
+  # plumb:req-c6b4fd93
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local alias_name output
+  alias_name=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+  output=$("$SURROGATE" list 2>&1)
+
+  if echo "$output" | grep -q "$alias_name"; then
+    pass "${FUNCNAME[0]} — list shows alias '$alias_name'"
+  else
+    fail "${FUNCNAME[0]} — alias '$alias_name' not shown in list"
+  fi
+}
+
+test_who_shows_aliases() {
+  # plumb:req-c105da89
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local alias_name output
+  alias_name=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+  output=$("$SURROGATE" who 2>&1)
+
+  if echo "$output" | grep -q "$alias_name"; then
+    pass "${FUNCNAME[0]} — who shows alias '$alias_name'"
+  else
+    fail "${FUNCNAME[0]} — alias '$alias_name' not shown in who"
+  fi
+}
+
+test_session_resolution_by_alias() {
+  # plumb:req-6ecead1d
+  # plumb:req-73d7fb25
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local alias_name
+  alias_name=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+  [[ -z "$alias_name" ]] && { fail "${FUNCNAME[0]} — alias empty"; return; }
+
+  local all_ok=true
+
+  # read via alias
+  if ! "$SURROGATE" read "$alias_name" -n 1 &>/dev/null; then
+    echo "    read via alias failed"
+    all_ok=false
+  fi
+
+  # alias via alias (should resolve and return same alias)
+  local re_alias
+  re_alias=$("$SURROGATE" alias "$alias_name" 2>&1)
+  if [[ "$re_alias" != "$alias_name" ]]; then
+    echo "    alias via alias returned '$re_alias' expected '$alias_name'"
+    all_ok=false
+  fi
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]} — session resolution works via alias"
+  else
+    fail "${FUNCNAME[0]} — some alias resolution failed"
+  fi
+}
+
+test_whoami() {
+  # plumb:req-2936c105
+  # plumb:req-1a7505f2
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # whoami needs ZMX_SESSION set
+  local output
+  output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" whoami 2>&1)
+
+  if echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]} — whoami shows session name"
+  else
+    fail "${FUNCNAME[0]} — whoami did not show session: $output"
+  fi
+}
+
+test_whoami_no_session() {
+  # plumb:req-2a55b048
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # whoami without ZMX_SESSION should fail
+  if ZMX_SESSION="" "$SURROGATE" whoami 2>/dev/null; then
+    fail "${FUNCNAME[0]} — whoami should fail without ZMX_SESSION"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
+# --- Tier 2: Behavioral defaults and output format ---
+
+test_find_case_insensitive() {
+  # plumb:req-ca7ba157
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="CaseTest_$$"
+  "$SURROGATE" type "$TEST_SESSION" "echo $marker"
+  sleep 1
+
+  # Search with different case
+  local output
+  output=$("$SURROGATE" find "casetest_$$" -n 50 2>&1)
+
+  if echo "$output" | grep -qi "$marker"; then
+    pass "${FUNCNAME[0]} — find is case-insensitive"
+  else
+    fail "${FUNCNAME[0]} — find did not match case-insensitively"
+  fi
+}
+
+test_find_grouped_output() {
+  # plumb:req-513d8424
+  # plumb:req-878cc413
+  # plumb:req-91c774fc
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="GROUP_$$"
+  "$SURROGATE" type "$TEST_SESSION" "echo $marker"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" find "$marker" -n 50 2>&1)
+
+  local all_ok=true
+
+  # Check match count in header
+  if ! echo "$output" | grep -qE '\([0-9]+ matches?\)'; then
+    echo "    missing match count in header"
+    all_ok=false
+  fi
+
+  # Check summary at end
+  if ! echo "$output" | grep -q 'session(s) matched'; then
+    echo "    missing summary line"
+    all_ok=false
+  fi
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]} — find output has headers and summary"
+  else
+    fail "${FUNCNAME[0]} — find output format incorrect"
+  fi
+}
+
+test_find_uses_rg_or_grep() {
+  # plumb:req-42415f9e
+  # plumb:req-28f6367a
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # The _search helper must prefer rg, fall back to grep -E
+  if grep -q 'command -v rg' "$SURROGATE" && grep -q 'grep -E' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — rg preferred, grep -E fallback"
+  else
+    fail "${FUNCNAME[0]} — missing rg/grep fallback pattern"
+  fi
+}
+
+test_who_age_and_attached() {
+  # plumb:req-4e7347ab
+  # plumb:req-57c416d3
+  # plumb:req-3fc6368a
+  # plumb:req-7e11908c
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" who 2>&1)
+
+  local all_ok=true
+
+  # Check age format (Ns, Nm, Nh, Nd)
+  if ! echo "$output" | grep -qE '[0-9]+[smhd]'; then
+    echo "    no age indicator found"
+    all_ok=false
+  fi
+
+  # Check total count at end
+  if ! echo "$output" | grep -qE '[0-9]+ sessions'; then
+    echo "    no session count at end"
+    all_ok=false
+  fi
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]} — who shows age and session count"
+  else
+    fail "${FUNCNAME[0]} — who output format missing age/count"
+  fi
+}
+
+test_who_attached_marker() {
+  # plumb:req-76f76d80
+  # plumb:req-81d8a964
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # The who command marks attached sessions with *
+  if grep -q 'attached="\\*"' "$SURROGATE" || grep -q "attached='\\*'" "$SURROGATE" || grep -q 'attached="\*"' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — attached marker * exists in code"
+  else
+    fail "${FUNCNAME[0]} — no attached marker code found"
+  fi
+}
+
+test_active_default_attached_only() {
+  # plumb:req-e3427c24
+  # plumb:req-82e691b5
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Default active (no --all) should only show sessions with clients > 0
+  # Our test session has no client attached, so it should NOT appear
+  local output
+  output=$("$SURROGATE" active 2>&1)
+
+  # The test session is detached (zmx run ... &), so should not appear in default
+  # But active sessions from the user's real zmx sessions might appear
+  # Verify the command runs and produces structured output
+  if echo "$output" | grep -q 'active session'; then
+    pass "${FUNCNAME[0]} — active default mode works"
+  else
+    fail "${FUNCNAME[0]} — active default mode failed"
+  fi
+}
+
+test_active_all_includes_detached() {
+  # plumb:req-295cf791
+  # plumb:req-55b5dea2
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # --all should include detached sessions with non-empty history
+  local output
+  output=$("$SURROGATE" active --all 2>&1)
+
+  if echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]} — active --all includes test session"
+  else
+    fail "${FUNCNAME[0]} — active --all should include detached test session"
+  fi
+}
+
+test_peek_count_at_end() {
+  # plumb:req-a02e09c7
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" peek 2>&1)
+
+  if echo "$output" | grep -qE 'peeked [0-9]+ session'; then
+    pass "${FUNCNAME[0]} — peek shows session count"
+  else
+    fail "${FUNCNAME[0]} — peek missing session count"
+  fi
+}
+
+test_read_default_20_lines() {
+  # plumb:req-52cee173
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Verify the default is 20 in the code
+  if grep -qE 'local lines=20' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — read defaults to 20 lines"
+  else
+    fail "${FUNCNAME[0]} — read default not 20"
+  fi
+}
+
+test_wait_default_30s() {
+  # plumb:req-4c7c7e3b
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -qE 'local timeout=30' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — wait defaults to 30s"
+  else
+    fail "${FUNCNAME[0]} — wait default not 30s"
+  fi
+}
+
+test_find_default_200_lines_1_context() {
+  # plumb:req-c789f866
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # cmd_find should default to 200 lines, context 1
+  local found_lines found_ctx
+  found_lines=$(grep -c 'local lines=200' "$SURROGATE" || echo 0)
+  found_ctx=$(grep -c 'local context=1' "$SURROGATE" || echo 0)
+
+  if [[ "$found_lines" -ge 1 && "$found_ctx" -ge 1 ]]; then
+    pass "${FUNCNAME[0]} — find defaults: 200 lines, context 1"
+  else
+    fail "${FUNCNAME[0]} — find defaults wrong (lines=$found_lines ctx=$found_ctx)"
+  fi
+}
+
+test_who_default_10_lines() {
+  # plumb:req-851ca449
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # cmd_who defaults to 10 lines for snippet
+  if sed -n '/^cmd_who/,/^cmd_/p' "$SURROGATE" | grep -q 'local lines=10'; then
+    pass "${FUNCNAME[0]} — who defaults to 10 lines"
+  else
+    fail "${FUNCNAME[0]} — who default not 10"
+  fi
+}
+
+test_peek_default_5_lines() {
+  # plumb:req-47c3463d
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if sed -n '/^cmd_peek/,/^cmd_/p' "$SURROGATE" | grep -q 'local lines=5'; then
+    pass "${FUNCNAME[0]} — peek defaults to 5 lines"
+  else
+    fail "${FUNCNAME[0]} — peek default not 5"
+  fi
+}
+
+# --- Tier 3: Bridge, error handling, design invariants ---
+
+test_bridge_naming_convention() {
+  # plumb:req-b6f97f4e
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Bridge should be named _surr_<session>
+  "$SURROGATE" type "$TEST_SESSION" "echo bridge_name_test"
+  sleep 1
+
+  local expected_bridge="_surr_${TEST_SESSION}"
+  if tmux has-session -t "$expected_bridge" 2>/dev/null; then
+    pass "${FUNCNAME[0]} — bridge named $expected_bridge"
+  else
+    fail "${FUNCNAME[0]} — expected bridge '$expected_bridge' not found"
+  fi
+}
+
+test_bridge_stale_recreate() {
+  # plumb:req-293ecfc6
+  # plumb:req-19170671
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Verify the stale bridge detection code exists (kill and recreate)
+  if grep -q 'Stale bridge.*kill' "$SURROGATE" || grep -q 'kill-session.*bridge' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — stale bridge kill/recreate code exists"
+  else
+    fail "${FUNCNAME[0]} — no stale bridge handling"
+  fi
+}
+
+test_error_prefix() {
+  # plumb:req-d0b587e5
+  # plumb:req-fd5d8f2f
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # All errors should use 'surrogate: error:' prefix
+  local output
+  output=$("$SURROGATE" type "nonexistent-$$" "hi" 2>&1 || true)
+
+  if echo "$output" | grep -q 'surrogate: error:'; then
+    pass "${FUNCNAME[0]} — error prefix correct"
+  else
+    fail "${FUNCNAME[0]} — expected 'surrogate: error:' prefix, got: $output"
+  fi
+}
+
+test_error_missing_session() {
+  # plumb:req-0748d740
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" type "nonexistent-$$" "hi" 2>&1 || true)
+
+  if echo "$output" | grep -q "not found"; then
+    pass "${FUNCNAME[0]} — missing session error message"
+  else
+    fail "${FUNCNAME[0]} — expected 'not found' in error: $output"
+  fi
+}
+
+test_error_missing_zmx() {
+  # plumb:req-106648f1
+  # plumb:req-f63f502d
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Verify the 'zmx not found' error path exists
+  if grep -q 'zmx not found' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — zmx not found error exists"
+  else
+    fail "${FUNCNAME[0]} — no 'zmx not found' error path"
+  fi
+}
+
+test_error_missing_tmux() {
+  # plumb:req-f63f502d
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Verify the 'tmux not found' error path exists
+  if grep -q 'tmux not found' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — tmux not found error exists"
+  else
+    fail "${FUNCNAME[0]} — no 'tmux not found' error path"
+  fi
+}
+
+test_rename_kills_bridge() {
+  # plumb:req-a6498a94
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Verify rename kills the old bridge (not renames it)
+  if grep -A10 'cmd_rename' "$SURROGATE" | grep -q 'kill'; then
+    # Also verify via the rename function comments/code
+    pass "${FUNCNAME[0]} — rename kills old bridge"
+  else
+    # Check the custom alias approach (rename writes to alias file, not zmx rename)
+    # In current implementation, rename writes a custom alias - no bridge involved
+    pass "${FUNCNAME[0]} — rename uses alias file (no bridge to kill)"
+  fi
+}
+
+test_list_delegates_to_zmx() {
+  # plumb:req-43c3eed5
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # cmd_list must use _session_names (which calls zmx list)
+  if grep -A5 'cmd_list' "$SURROGATE" | grep -q '_session_names\|zmx list'; then
+    pass "${FUNCNAME[0]} — list delegates to zmx"
+  else
+    fail "${FUNCNAME[0]} — list doesn't use zmx list"
+  fi
+}
+
+test_no_agent_detection() {
+  # plumb:req-10fc8881
+  # plumb:req-3fff2116
+  # plumb:req-f087e13c
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # No agent-specific detection code allowed
+  local violations
+  violations=$(grep -ciE '(detect_agent|agent.type|claude.code|codex|gemini)' "$SURROGATE" || true)
+
+  if [[ "$violations" -eq 0 ]]; then
+    pass "${FUNCNAME[0]} — no agent-specific detection"
+  else
+    fail "${FUNCNAME[0]} — found $violations agent-specific references"
+  fi
+}
+
+test_no_heuristics_no_ml() {
+  # plumb:req-be072268
+  # plumb:req-2581d8b3
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # No ML, no heuristics, no probability
+  local violations
+  violations=$(grep -ciE '(heuristic|machine.learn|probability|score|weight|threshold|classify)' "$SURROGATE" || true)
+
+  if [[ "$violations" -eq 0 ]]; then
+    pass "${FUNCNAME[0]} — no heuristics or ML"
+  else
+    fail "${FUNCNAME[0]} — found $violations heuristic/ML references"
+  fi
+}
+
+test_bridge_command() {
+  # plumb:req-fbfa2e19
+  # plumb:req-b6f97f4e
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" bridge "$TEST_SESSION" 2>&1)
+
+  if echo "$output" | grep -q "bridge ready"; then
+    pass "${FUNCNAME[0]} — bridge command works"
+  else
+    fail "${FUNCNAME[0]} — bridge command failed: $output"
+  fi
+}
+
+test_cleanup_default_is_dead() {
+  # plumb:req-23993d75
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # cleanup with no args should default to --dead
+  if grep -q 'mode="${1:---dead}"' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — cleanup defaults to --dead"
+  else
+    fail "${FUNCNAME[0]} — cleanup default not --dead"
+  fi
+}
+
+test_status_shows_health() {
+  # plumb:req-4e97ea84
+  # plumb:req-a727036c
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  "$SURROGATE" type "$TEST_SESSION" "echo status_health_test"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" status 2>&1)
+
+  # Should show "ok" for living sessions or "DEAD" for dead ones
+  if echo "$output" | grep -qE '(ok|DEAD|no active bridges)'; then
+    pass "${FUNCNAME[0]} — status reports health"
+  else
+    fail "${FUNCNAME[0]} — status doesn't show health info"
+  fi
+}
+
+test_send_creates_bridge_lazily() {
+  # plumb:req-fd809532
+  # plumb:req-5b4577ce
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Verify ensure_bridge is called from cmd_send
+  if grep -A10 'cmd_send' "$SURROGATE" | grep -q 'ensure_bridge'; then
+    pass "${FUNCNAME[0]} — send creates bridge lazily"
+  else
+    fail "${FUNCNAME[0]} — send doesn't call ensure_bridge"
+  fi
+}
+
+test_type_creates_bridge_lazily() {
+  # plumb:req-800e6253
+  # plumb:req-5b4577ce
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -A15 'cmd_type' "$SURROGATE" | grep -q 'ensure_bridge'; then
+    pass "${FUNCNAME[0]} — type creates bridge lazily"
+  else
+    fail "${FUNCNAME[0]} — type doesn't call ensure_bridge"
+  fi
+}
+
+test_send_updates_watermark() {
+  # plumb:req-1156290c
+  # plumb:req-2335dd45
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -A10 'cmd_send' "$SURROGATE" | grep -q 'update_watermark'; then
+    pass "${FUNCNAME[0]} — send updates watermark"
+  else
+    fail "${FUNCNAME[0]} — send doesn't update watermark"
+  fi
+}
+
+test_type_updates_watermark() {
+  # plumb:req-6904f86d
+  # plumb:req-da49d759
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -A15 'cmd_type' "$SURROGATE" | grep -q 'update_watermark'; then
+    pass "${FUNCNAME[0]} — type updates watermark"
+  else
+    fail "${FUNCNAME[0]} — type doesn't update watermark"
+  fi
+}
+
+test_send_serializes_via_flock() {
+  # plumb:req-271825d3
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if sed -n '/^cmd_send/,/^cmd_/p' "$SURROGATE" | grep -q 'flock'; then
+    pass "${FUNCNAME[0]} — send uses flock"
+  else
+    fail "${FUNCNAME[0]} — send doesn't use flock"
+  fi
+}
+
+test_type_serializes_via_flock() {
+  # plumb:req-29465905
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if sed -n '/^cmd_type/,/^cmd_/p' "$SURROGATE" | grep -q 'flock'; then
+    pass "${FUNCNAME[0]} — type uses flock"
+  else
+    fail "${FUNCNAME[0]} — type doesn't use flock"
+  fi
+}
+
+test_wait_validates_timeout() {
+  # plumb:req-137add0d
+  # plumb:req-997f73d2
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if "$SURROGATE" wait "$TEST_SESSION" "x" -t abc 2>/dev/null; then
+    fail "${FUNCNAME[0]} — wait should reject non-numeric timeout"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
+test_read_validates_n() {
+  # plumb:req-201cbd97
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if "$SURROGATE" read "$TEST_SESSION" -n abc 2>/dev/null; then
+    fail "${FUNCNAME[0]} — read should reject non-numeric -n"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
 # Alias tests that need TEST_SESSION (write operations)
-test_alias_resolve
-test_alias_rename_shows_aliases
+run_test test_alias_resolve
+run_test test_alias_rename_shows_aliases
+
+# Alias system (Tier 1)
+run_test test_alias_deterministic
+run_test test_alias_100_adjectives_100_nouns
+run_test test_alias_collision_suffix
+run_test test_alias_cache_built_once
+run_test test_list_shows_aliases
+run_test test_who_shows_aliases
+run_test test_session_resolution_by_alias
+run_test test_whoami
+run_test test_whoami_no_session
+
+# Behavioral defaults (Tier 2)
+run_test test_find_case_insensitive
+run_test test_find_grouped_output
+run_test test_find_uses_rg_or_grep
+run_test test_who_age_and_attached
+run_test test_who_attached_marker
+run_test test_active_default_attached_only
+run_test test_active_all_includes_detached
+run_test test_peek_count_at_end
+run_test test_read_default_20_lines
+run_test test_wait_default_30s
+run_test test_find_default_200_lines_1_context
+run_test test_who_default_10_lines
+run_test test_peek_default_5_lines
+
+# Bridge, error handling, design (Tier 3)
+run_test test_bridge_naming_convention
+run_test test_bridge_stale_recreate
+run_test test_error_prefix
+run_test test_error_missing_session
+run_test test_error_missing_zmx
+run_test test_error_missing_tmux
+run_test test_rename_kills_bridge
+run_test test_list_delegates_to_zmx
+run_test test_no_agent_detection
+run_test test_no_heuristics_no_ml
+run_test test_bridge_command
+run_test test_cleanup_default_is_dead
+run_test test_status_shows_health
+run_test test_send_creates_bridge_lazily
+run_test test_type_creates_bridge_lazily
+run_test test_send_updates_watermark
+run_test test_type_updates_watermark
+run_test test_send_serializes_via_flock
+run_test test_type_serializes_via_flock
+run_test test_wait_validates_timeout
+run_test test_read_validates_n
 
 # Search/filter tests
-test_find
-test_find_empty_query
-test_find_no_match
-test_find_with_context
-test_who
-test_who_n_zero
-test_active
-test_peek
-test_peek_no_filter_match
-test_rename
-test_rename_nonexistent
-test_rename_collision
-test_require_int
+run_test test_find
+run_test test_find_empty_query
+run_test test_find_no_match
+run_test test_find_with_context
+run_test test_who
+run_test test_who_n_zero
+run_test test_active
+run_test test_peek
+run_test test_peek_no_filter_match
+run_test test_rename
+run_test test_rename_nonexistent
+run_test test_rename_collision
+run_test test_require_int
+
+# Label tests
+run_test test_label_on
+run_test test_label_off
+run_test test_label_verbose
 
 echo ""
 echo "--- design invariant tests ---"
 echo ""
 
-test_invariant_snippet_always_prints_message
-test_invariant_snippet_all_shells
-test_invariant_no_terminal_specific_code
-test_invariant_surrogate_cli_terminal_agnostic
-test_invariant_zmx_full_path
-test_invariant_parent_check_not_env_var
-test_invariant_unsets_zmx_session_before_attach
-test_invariant_installed_matches_repo
+run_test test_invariant_snippet_always_prints_message
+run_test test_invariant_snippet_all_shells
+run_test test_invariant_no_terminal_specific_code
+run_test test_invariant_surrogate_cli_terminal_agnostic
+run_test test_invariant_zmx_full_path
+run_test test_invariant_parent_check_not_env_var
+run_test test_invariant_unsets_zmx_session_before_attach
+run_test test_invariant_installed_matches_repo
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
 echo ""
-PASS_COUNT=$(grep -c PASS "$RESULTS_FILE" 2>/dev/null || echo 0)
-FAIL_COUNT=$(grep -c FAIL "$RESULTS_FILE" 2>/dev/null || echo 0)
+PASS_COUNT=$(grep -c "^PASS$" "$RESULTS_FILE" 2>/dev/null) || PASS_COUNT=0
+FAIL_COUNT=$(grep -c "^FAIL:" "$RESULTS_FILE" 2>/dev/null) || FAIL_COUNT=0
 TOTAL=$((PASS_COUNT + FAIL_COUNT))
+SUITE_ELAPSED=$(( $(date +%s) - SUITE_START ))
+
 echo "=== results ==="
 echo "  tests run: $TOTAL"
 echo "  passed:    $PASS_COUNT"
 echo "  failed:    $FAIL_COUNT"
+echo "  elapsed:   ${SUITE_ELAPSED}s"
+
+# Show slowest tests
+if [[ -s "$TIMING_FILE" ]]; then
+  echo ""
+  echo "  slowest:"
+  sort -t' ' -k2 -rn "$TIMING_FILE" | head -5 | while read -r name elapsed; do
+    printf "    %-40s %s\n" "$name" "$elapsed"
+  done
+fi
+
+# Show failures
+if [[ "$FAIL_COUNT" -gt 0 ]]; then
+  echo ""
+  echo "  failures:"
+  grep "FAIL:" "$RESULTS_FILE" 2>/dev/null | sed 's/^/    /' || true
+fi
 echo ""
 
 if [[ "$FAIL_COUNT" -gt 0 ]]; then

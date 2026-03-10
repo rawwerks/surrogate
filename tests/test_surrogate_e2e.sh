@@ -492,6 +492,33 @@ test_invariant_unsets_zmx_session_before_attach() {
   fi
 }
 
+test_invariant_installed_matches_repo() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local install_dir="${INSTALL_DIR:-$HOME/.local/bin}"
+  local repo_dir
+  repo_dir="$(dirname "$SCRIPT_DIR")/bin"
+  local all_match=true
+
+  for file in surrogate surrogate-shell-setup; do
+    if [[ ! -f "$install_dir/$file" ]]; then
+      echo "    $file not installed at $install_dir/$file"
+      all_match=false
+    elif ! diff -q "$repo_dir/$file" "$install_dir/$file" &>/dev/null; then
+      echo "    $file: installed copy differs from repo"
+      echo "    Run: bash install.sh"
+      all_match=false
+    fi
+  done
+
+  if $all_match; then
+    pass "${FUNCNAME[0]} — installed binaries match repo"
+  else
+    fail "${FUNCNAME[0]} — installed binaries are stale (run install.sh)"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -524,6 +551,7 @@ test_invariant_surrogate_cli_terminal_agnostic
 test_invariant_zmx_full_path
 test_invariant_parent_check_not_env_var
 test_invariant_unsets_zmx_session_before_attach
+test_invariant_installed_matches_repo
 
 # ---------------------------------------------------------------------------
 # Summary

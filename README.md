@@ -10,7 +10,7 @@ Type into Claude Code, vim, REPL — anything running in a terminal — from scr
 
 > [!CAUTION]
 > This tool is really dangerous. This is the YOLO mode of all YOLO modes. You could really get pwned.
-> Any process or agent that can run `surrogate type` can inject keystrokes into any terminal session on the machine.
+> Any process or agent that can run `surrogate type` can inject keystrokes into any zmx terminal session on the machine.
 
 ## Motivation
 

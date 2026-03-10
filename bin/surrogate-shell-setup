@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MARKER_BEGIN="# surrogate:zmx:begin"
+MARKER_END="# surrogate:zmx:end"
+
+usage() {
+  cat <<'EOF'
+surrogate-shell-setup — install/manage auto-zmx for interactive terminals
+
+Usage:
+  surrogate-shell-setup [--show]      Show the snippet for your shell (default)
+  surrogate-shell-setup --install     Append snippet to your shell rc file
+  surrogate-shell-setup --uninstall   Remove snippet from your shell rc file
+  surrogate-shell-setup --check       Check if snippet is already installed
+  surrogate-shell-setup --help        Show this help
+
+Environment:
+  SURROGATE_NO_ZMX=1   Set in any session to skip auto-zmx
+  ZMX_SESSION           Set automatically by zmx (prevents double-wrapping)
+EOF
+}
+
+detect_shell() {
+  local sh
+  sh="$(basename "${SHELL:-/bin/bash}")"
+  case "$sh" in
+    bash|zsh|fish) echo "$sh" ;;
+    *) echo "bash" ;;  # fallback
+  esac
+}
+
+rc_file_for() {
+  case "$1" in
+    bash) echo "$HOME/.bashrc" ;;
+    zsh)  echo "$HOME/.zshrc" ;;
+    fish) echo "$HOME/.config/fish/config.fish" ;;
+  esac
+}
+
+snippet_for() {
+  case "$1" in
+    bash|zsh)
+      cat <<'SNIPPET'
+# surrogate:zmx:begin
+# surrogate: auto-zmx for all interactive terminals
+if [[ -z "${ZMX_SESSION:-}" && -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]] && command -v zmx >/dev/null 2>&1; then
+  exec zmx attach "$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
+fi
+# surrogate:zmx:end
+SNIPPET
+      ;;
+    fish)
+      cat <<'SNIPPET'
+# surrogate:zmx:begin
+# surrogate: auto-zmx for all interactive terminals
+if not set -q ZMX_SESSION; and not set -q SURROGATE_NO_ZMX; and status is-interactive; and command -v zmx >/dev/null 2>&1
+  exec zmx attach (date +'%Y-%m-%d_%H-%M-%S_%Z')"-$fish_pid"
+end
+# surrogate:zmx:end
+SNIPPET
+      ;;
+  esac
+}
+
+is_installed() {
+  local rc="$1"
+  [[ -f "$rc" ]] && grep -qF "$MARKER_BEGIN" "$rc"
+}
+
+do_show() {
+  local sh="$1"
+  local rc
+  rc="$(rc_file_for "$sh")"
+  echo "Shell:   $sh"
+  echo "RC file: $rc"
+  echo ""
+  echo "Snippet that would be added:"
+  echo "---"
+  snippet_for "$sh"
+  echo "---"
+}
+
+do_check() {
+  local sh="$1"
+  local rc
+  rc="$(rc_file_for "$sh")"
+  if is_installed "$rc"; then
+    echo "Installed in $rc"
+    return 0
+  else
+    echo "Not installed in $rc"
+    return 1
+  fi
+}
+
+do_install() {
+  local sh="$1"
+  local rc
+  rc="$(rc_file_for "$sh")"
+
+  if is_installed "$rc"; then
+    echo "Already installed in $rc — nothing to do."
+    return 0
+  fi
+
+  # Ensure rc file and parent dirs exist
+  mkdir -p "$(dirname "$rc")"
+  touch "$rc"
+
+  # Prepend snippet to rc file (it must run early, before other config)
+  local tmp
+  tmp="$(mktemp)"
+  {
+    snippet_for "$sh"
+    echo ""
+    cat "$rc"
+  } > "$tmp"
+
+  mv "$tmp" "$rc"
+  echo "Installed auto-zmx snippet at top of $rc"
+}
+
+do_uninstall() {
+  local sh="$1"
+  local rc
+  rc="$(rc_file_for "$sh")"
+
+  if ! is_installed "$rc"; then
+    echo "Not installed in $rc — nothing to do."
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+
+  # Remove everything between markers (inclusive), plus one trailing blank line if present
+  awk -v begin="$MARKER_BEGIN" -v end="$MARKER_END" '
+    $0 == begin { skip=1; next }
+    $0 == end   { skip=0; getline; if ($0 != "") print; next }
+    !skip       { print }
+  ' "$rc" > "$tmp"
+
+  mv "$tmp" "$rc"
+  echo "Removed auto-zmx snippet from $rc"
+}
+
+main() {
+  local action="show"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --show)      action="show"; shift ;;
+      --install)   action="install"; shift ;;
+      --uninstall) action="uninstall"; shift ;;
+      --check)     action="check"; shift ;;
+      --help|-h)   usage; exit 0 ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  local sh
+  sh="$(detect_shell)"
+
+  case "$action" in
+    show)      do_show "$sh" ;;
+    check)     do_check "$sh" ;;
+    install)   do_install "$sh" ;;
+    uninstall) do_uninstall "$sh" ;;
+  esac
+}
+
+main "$@"

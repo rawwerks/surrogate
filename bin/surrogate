@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SURROGATE_TMP="/tmp"
+BRIDGE_PREFIX="_surr_"
+
+# --- helpers ---
+
+die() { echo "surrogate: error: $*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+surrogate - programmatic keystroke injection into zmx sessions
+
+Usage: surrogate <command> [args]
+
+Commands:
+  list                          List available zmx sessions
+  send  <session> [keys...]     Send tmux send-keys style keystrokes
+  type  <session> <text>        Type literal text followed by Enter
+  read  <session> [-n LINES]    Read recent output (default: 20 lines)
+  wait  <session> <pattern> [-t TIMEOUT]
+                                Wait for regex pattern in new output (default: 30s)
+  bridge <session>              Pre-create tmux bridge for a zmx session
+  cleanup [--all|--dead]        Remove stale or all bridge sessions
+  status                        Show bridge health
+
+EOF
+    exit 0
+}
+
+check_deps() {
+    command -v zmx >/dev/null 2>&1 || die "zmx not found. Install zmx first."
+    command -v tmux >/dev/null 2>&1 || die "tmux not found. Install with: pacman -S tmux (or your package manager)"
+}
+
+session_exists() {
+    zmx list 2>/dev/null | grep -q "^session_name=$1	"
+}
+
+bridge_name() {
+    echo "${BRIDGE_PREFIX}${1}"
+}
+
+lock_file() {
+    echo "${SURROGATE_TMP}/surrogate-${1}.lock"
+}
+
+watermark_file() {
+    echo "${SURROGATE_TMP}/surrogate-${1}.watermark"
+}
+
+line_count() {
+    zmx history "$1" 2>/dev/null | wc -l
+}
+
+update_watermark() {
+    local session="$1"
+    line_count "$session" > "$(watermark_file "$session")"
+}
+
+ensure_bridge() {
+    local session="$1"
+    local bridge
+    bridge="$(bridge_name "$session")"
+
+    session_exists "$session" || die "session '$session' not found"
+
+    # Check if bridge tmux session exists and is healthy
+    if tmux has-session -t "$bridge" 2>/dev/null; then
+        # Verify the pane is still running zmx
+        local cmd
+        cmd="$(tmux display-message -t "$bridge" -p '#{pane_current_command}' 2>/dev/null || true)"
+        if [[ -n "$cmd" ]]; then
+            return 0
+        fi
+        # Stale bridge — kill and recreate
+        tmux kill-session -t "$bridge" 2>/dev/null || true
+    fi
+
+    # Create bridge
+    tmux new-session -d -s "$bridge" "zmx attach $session"
+    sleep 1
+}
+
+# --- subcommands ---
+
+cmd_list() {
+    check_deps
+    zmx list
+}
+
+cmd_send() {
+    check_deps
+    local session="${1:?usage: surrogate send <session> [keys...]}"
+    shift
+
+    ensure_bridge "$session"
+    update_watermark "$session"
+
+    local bridge
+    bridge="$(bridge_name "$session")"
+    local lock
+    lock="$(lock_file "$session")"
+
+    (
+        flock 9
+        tmux send-keys -t "$bridge" "$@"
+    ) 9>"$lock"
+}
+
+cmd_type() {
+    check_deps
+    local session="${1:?usage: surrogate type <session> <text>}"
+    local text="${2:?usage: surrogate type <session> <text>}"
+
+    ensure_bridge "$session"
+    update_watermark "$session"
+
+    local bridge
+    bridge="$(bridge_name "$session")"
+    local lock
+    lock="$(lock_file "$session")"
+
+    (
+        flock 9
+        tmux send-keys -t "$bridge" -l "$text"
+        tmux send-keys -t "$bridge" Enter
+    ) 9>"$lock"
+}
+
+cmd_read() {
+    check_deps
+    local session="${1:?usage: surrogate read <session> [-n LINES]}"
+    shift
+
+    local lines=20
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n) lines="${2:?-n requires a number}"; shift 2 ;;
+            *)  die "unknown flag: $1" ;;
+        esac
+    done
+
+    session_exists "$session" || die "session '$session' not found"
+    zmx history "$session" | tail -n "$lines"
+}
+
+cmd_wait() {
+    check_deps
+    local session="${1:?usage: surrogate wait <session> <pattern> [-t TIMEOUT]}"
+    local pattern="${2:?usage: surrogate wait <session> <pattern> [-t TIMEOUT]}"
+    shift 2
+
+    local timeout=30
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t) timeout="${2:?-t requires seconds}"; shift 2 ;;
+            *)  die "unknown flag: $1" ;;
+        esac
+    done
+
+    session_exists "$session" || die "session '$session' not found"
+
+    local wm_file
+    wm_file="$(watermark_file "$session")"
+    local watermark=0
+    if [[ -f "$wm_file" ]]; then
+        watermark="$(cat "$wm_file")"
+    fi
+
+    local elapsed=0
+    while [[ $elapsed -lt $timeout ]]; do
+        if zmx history "$session" | tail -n +"$((watermark + 1))" | grep -qE "$pattern"; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    die "timeout after ${timeout}s waiting for pattern: $pattern"
+}
+
+cmd_bridge() {
+    check_deps
+    local session="${1:?usage: surrogate bridge <session>}"
+    ensure_bridge "$session"
+    echo "bridge ready: $(bridge_name "$session")"
+}
+
+cmd_cleanup() {
+    check_deps
+    local mode="${1:---dead}"
+
+    case "$mode" in
+        --all)
+            local sessions
+            sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${BRIDGE_PREFIX}" || true)"
+            if [[ -z "$sessions" ]]; then
+                echo "no bridges to clean up"
+                return
+            fi
+            while IFS= read -r s; do
+                tmux kill-session -t "$s" 2>/dev/null && echo "killed $s" || true
+            done <<< "$sessions"
+            ;;
+        --dead|"")
+            local sessions
+            sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${BRIDGE_PREFIX}" || true)"
+            if [[ -z "$sessions" ]]; then
+                echo "no bridges to clean up"
+                return
+            fi
+            while IFS= read -r s; do
+                local zmx_name="${s#"$BRIDGE_PREFIX"}"
+                if ! session_exists "$zmx_name"; then
+                    tmux kill-session -t "$s" 2>/dev/null && echo "killed $s (zmx session gone)" || true
+                fi
+            done <<< "$sessions"
+            ;;
+        *)
+            die "unknown flag: $mode (use --all or --dead)"
+            ;;
+    esac
+}
+
+cmd_status() {
+    check_deps
+    local sessions
+    sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${BRIDGE_PREFIX}" || true)"
+
+    if [[ -z "$sessions" ]]; then
+        echo "no active bridges"
+        return
+    fi
+
+    printf "%-50s %s\n" "BRIDGE" "STATUS"
+    while IFS= read -r s; do
+        local zmx_name="${s#"$BRIDGE_PREFIX"}"
+        local status
+        if session_exists "$zmx_name"; then
+            status="ok"
+        else
+            status="DEAD (zmx session gone)"
+        fi
+        printf "%-50s %s\n" "$s" "$status"
+    done <<< "$sessions"
+}
+
+# --- main ---
+
+[[ $# -eq 0 ]] && usage
+
+case "${1}" in
+    list)    shift; cmd_list "$@" ;;
+    send)    shift; cmd_send "$@" ;;
+    type)    shift; cmd_type "$@" ;;
+    read)    shift; cmd_read "$@" ;;
+    wait)    shift; cmd_wait "$@" ;;
+    bridge)  shift; cmd_bridge "$@" ;;
+    cleanup) shift; cmd_cleanup "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    help|-h|--help) usage ;;
+    *)       die "unknown command: $1" ;;
+esac

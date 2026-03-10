@@ -38,6 +38,16 @@ bash install.sh
 
 This copies `surrogate` and `surrogate-shell-setup` to `~/.local/bin/`.
 
+### Agent skill (for Claude Code)
+
+To teach Claude Code how to use surrogate, install the skill:
+
+```bash
+ln -s ~/Documents/GitHub/surrogate/SKILL.md ~/.claude/skills/surrogate.md
+```
+
+Agents will then know how to discover zmx sessions, inject keystrokes, read output, and wait for patterns.
+
 ### Dependencies
 
 - [zmx](https://github.com/neurosnap/zmx) — session persistence

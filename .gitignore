@@ -4,3 +4,7 @@
 .plumb/*
 !.plumb/decisions/
 .env
+
+# aPlumb internal state (gitignored; JSONL exports in .aplumb/decisions/ are tracked)
+.aplumb/*
+!.aplumb/decisions/

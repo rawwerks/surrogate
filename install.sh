@@ -34,6 +34,44 @@ detect_pkg_manager() {
   fi
 }
 
+install_dcg() {
+  local dcg_url="https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/master/install.sh"
+  local dcg_path="${INSTALL_DIR}/dcg"
+
+  if [[ -x "$dcg_path" ]]; then
+    info "  dcg: found at $dcg_path"
+    return 0
+  fi
+
+  if command -v dcg &>/dev/null; then
+    info "  dcg: found at $(command -v dcg)"
+    return 0
+  fi
+
+  if [[ "${SURROGATE_SKIP_DCG:-0}" == "1" ]]; then
+    warn "  dcg: skipped (SURROGATE_SKIP_DCG=1)"
+    return 1
+  fi
+
+  info "  dcg: not found"
+  info "  dcg: installing recommended safety guard"
+  if curl -fsSL "${dcg_url}?$(date +%s)" | bash -s -- --easy-mode; then
+    if [[ -x "$dcg_path" ]]; then
+      info "  dcg: installed at $dcg_path"
+      return 0
+    fi
+    if command -v dcg &>/dev/null; then
+      info "  dcg: installed at $(command -v dcg)"
+      return 0
+    fi
+  fi
+
+  warn "  dcg: install failed"
+  warn "  surrogate still works without dcg, but typing will be less guarded"
+  echo "  Install manually: curl -fsSL \"${dcg_url}?\\$(date +%s)\" | bash -s -- --easy-mode"
+  return 1
+}
+
 install_tmux_hint() {
   local pkg
   pkg="$(detect_pkg_manager)"
@@ -106,8 +144,14 @@ else
   echo "  zmx is required for surrogate to work."
 fi
 
+echo ""
+info "Checking recommended safety tooling..."
+install_dcg || true
+
 # --- next steps ---
 
 echo ""
 info "To auto-wrap all terminals in zmx sessions:"
 info "  surrogate-shell-setup --install"
+info "To skip dcg auto-install next time:"
+info "  SURROGATE_SKIP_DCG=1 bash install.sh"

@@ -3,6 +3,9 @@ set -euo pipefail
 
 SURROGATE_TMP="/tmp"
 BRIDGE_PREFIX="_surr_"
+ALIAS_FILE="${SURROGATE_TMP}/surrogate-aliases"
+AUDIT_FILE="${SURROGATE_AUDIT_FILE:-${SURROGATE_TMP}/surrogate-audit.jsonl}"
+SURROGATE_LABEL="${SURROGATE_LABEL:-on}"  # on | off | verbose
 
 # --- helpers (needed early) ---
 
@@ -33,6 +36,68 @@ _search() {
     else
         grep -E "$@"
     fi
+}
+
+contains_multiline() {
+    [[ "$1" == *$'\n'* ]]
+}
+
+guard_type_text() {
+    local text="$1"
+    contains_multiline "$text" || return 0
+    echo "multiline payloads are reserved for direct human control"
+    return 1
+}
+
+guard_send_keys() {
+    local key
+    for key in "$@"; do
+        case "$key" in
+            C-c|C-d|C-z)
+                echo "dangerous control key '$key' is reserved for direct human control"
+                return 1
+                ;;
+        esac
+    done
+}
+
+json_escape() {
+    printf '%s' "$1" | sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\t/\\t/g;s/\r/\\r/g;s/\n/\\n/g'
+}
+
+audit_event() {
+    local action="$1" session="$2" decision="$3" detail="$4" reason="${5:-}"
+    local ts detail_json reason_json
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    detail_json="$(json_escape "$detail")"
+    reason_json="$(json_escape "$reason")"
+    printf '{"ts":"%s","action":"%s","session":"%s","decision":"%s","detail":"%s","reason":"%s"}\n' \
+        "$ts" "$action" "$session" "$decision" "$detail_json" "$reason_json" >> "$AUDIT_FILE"
+}
+
+scan_with_dcg() {
+    local text="$1"
+    command -v dcg >/dev/null 2>&1 || return 0
+
+    local dcg_output="" dcg_rc=0 reason=""
+    set +e
+    dcg_output="$(dcg --robot test "$text" 2>/dev/null)"
+    dcg_rc=$?
+    set -e
+
+    case "$dcg_rc" in
+        0) return 0 ;;
+        1)
+            reason="$(printf '%s\n' "$dcg_output" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"
+            [[ -n "$reason" ]] || reason="blocked by dcg"
+            echo "dcg denied payload: $reason"
+            return 1
+            ;;
+        *)
+            # DCG is an optional layer; surrogate's built-in guardrails remain authoritative.
+            return 0
+            ;;
+    esac
 }
 
 # --- alias wordlists (100 adjectives × 100 nouns = 10,000 combinations) ---
@@ -69,36 +134,57 @@ NOUNS=(
 declare -A _ALIAS_CACHE _ALIAS_REVERSE
 _ALIAS_CACHE_BUILT=""
 
+_load_custom_aliases() {
+    # Load custom aliases from file: session=alias (one per line)
+    local -n _out="$1"
+    [[ -f "$ALIAS_FILE" ]] || return 0
+    local _sess _cust
+    while IFS='=' read -r _sess _cust; do
+        [[ -z "$_sess" || "$_sess" == \#* ]] && continue
+        _out["$_sess"]="$_cust"
+    done < "$ALIAS_FILE"
+}
+
 _build_alias_cache() {
     [[ -n "$_ALIAS_CACHE_BUILT" ]] && return
     _ALIAS_CACHE=()
     _ALIAS_REVERSE=()
+
+    # Load custom aliases first
+    local -A custom_aliases
+    _load_custom_aliases custom_aliases
 
     local -a sorted_names
     while IFS= read -r name; do
         sorted_names+=("$name")
     done < <(_session_names | sort)
 
-    # Compute aliases: inline djb2 hash + collision suffix
+    # Compute aliases: custom overrides hash-derived
     local -A base_count
     local h i c s base cnt
     for name in "${sorted_names[@]}"; do
-        # Inline djb2 hash — no subshells
-        s="$name" h=5381
-        for (( i=0; i<${#s}; i++ )); do
-            printf -v c '%d' "'${s:$i:1}"
-            h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
-        done
-        base="${ADJECTIVES[$((h % 100))]}-${NOUNS[$((h / 100 % 100))]}"
-        cnt="${base_count[$base]:-0}"
-        cnt=$((cnt + 1))
-        base_count["$base"]=$cnt
-        if [[ $cnt -eq 1 ]]; then
-            _ALIAS_CACHE["$name"]="$base"
-            _ALIAS_REVERSE["$base"]="$name"
+        if [[ -n "${custom_aliases[$name]:-}" ]]; then
+            # Custom alias — use directly
+            _ALIAS_CACHE["$name"]="${custom_aliases[$name]}"
+            _ALIAS_REVERSE["${custom_aliases[$name]}"]="$name"
         else
-            _ALIAS_CACHE["$name"]="${base}-${cnt}"
-            _ALIAS_REVERSE["${base}-${cnt}"]="$name"
+            # Hash-derived alias
+            s="$name" h=5381
+            for (( i=0; i<${#s}; i++ )); do
+                printf -v c '%d' "'${s:$i:1}"
+                h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
+            done
+            base="${ADJECTIVES[$((h % 100))]}-${NOUNS[$((h / 100 % 100))]}"
+            cnt="${base_count[$base]:-0}"
+            cnt=$((cnt + 1))
+            base_count["$base"]=$cnt
+            if [[ $cnt -eq 1 ]]; then
+                _ALIAS_CACHE["$name"]="$base"
+                _ALIAS_REVERSE["$base"]="$name"
+            else
+                _ALIAS_CACHE["$name"]="${base}-${cnt}"
+                _ALIAS_REVERSE["${base}-${cnt}"]="$name"
+            fi
         fi
     done
     _ALIAS_CACHE_BUILT=1
@@ -106,7 +192,18 @@ _build_alias_cache() {
 
 session_alias() {
     _build_alias_cache
-    echo "${_ALIAS_CACHE[$1]}"
+    if [[ -n "${_ALIAS_CACHE[$1]:-}" ]]; then
+        echo "${_ALIAS_CACHE[$1]}"
+        return 0
+    fi
+
+    local name="$1" h=5381 i c base
+    for (( i=0; i<${#name}; i++ )); do
+        printf -v c '%d' "'${name:$i:1}"
+        h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
+    done
+    base="${ADJECTIVES[$((h % 100))]}-${NOUNS[$((h / 100 % 100))]}"
+    echo "$base"
 }
 
 resolve_session() {
@@ -144,13 +241,13 @@ Commands:
   wait  <session> <pattern> [-t TIMEOUT]
                                 Wait for regex pattern in new output (default: 30s)
   find  <query> [-n LINES]      Search all sessions for text (grep, default: last 200 lines)
-  who                           Show sessions with detected agent type and cwd
+  who   [-n LINES]              Show sessions with age and last visible line
   active [--all]                Show attached sessions (--all includes non-empty detached)
   peek  [-n LINES] [--filter PATTERN]
                                 Batch read last N lines from all sessions (default: 5)
   alias <session>               Show the alias for a session
   whoami                        Show current session name and alias
-  rename <session> <new-name>   Rename a zmx session
+  rename <session> <new-alias>  Set a custom alias (session ID stays the same)
   bridge <session>              Pre-create tmux bridge for a zmx session
   cleanup [--all|--dead]        Remove stale or all bridge sessions
   status                        Show bridge health
@@ -158,16 +255,22 @@ Commands:
 Session arguments accept either the full zmx name or the auto-generated alias.
 Each session gets a deterministic adjective-noun alias (e.g. lazy-sheep).
 
+Environment:
+  SURROGATE_LABEL=on       Prepend [SURROGATE <alias>] to typed text (default)
+  SURROGATE_LABEL=off      No prefix
+  SURROGATE_LABEL=verbose  Include process name, cwd, PID in prefix
+  SURROGATE_AUDIT_FILE     Audit log path (default: /tmp/surrogate-audit.jsonl)
+
 Special keys (for send):
   Enter Escape Tab Space BSpace
-  C-c C-d C-u C-l (Ctrl combos)
+  C-u C-l (Ctrl combos)
   Up Down Left Right
 
 Examples:
   surrogate list
   surrogate type lazy-sheep "echo hello"
   surrogate type 2026-03-08_15-07-15_EDT-132628 "echo hello"
-  surrogate send my-session C-c
+  surrogate send my-session Escape ":wq" Enter
   surrogate read bold-crane -n 50
   surrogate alias 2026-03-08_15-07-15_EDT-132628
 
@@ -236,6 +339,12 @@ cmd_send() {
     local session
     session="$(resolve_session "$1")"
     shift
+    local send_detail="$*"
+    local guard_reason=""
+    if ! guard_reason="$(guard_send_keys "$@")"; then
+        audit_event "send" "$session" "deny" "$send_detail" "$guard_reason"
+        die "$guard_reason"
+    fi
 
     ensure_bridge "$session"
     update_watermark "$session"
@@ -249,6 +358,36 @@ cmd_send() {
         flock 9
         tmux send-keys -t "$bridge" "$@"
     ) 9>"$lock"
+    audit_event "send" "$session" "allow" "$send_detail"
+}
+
+_surrogate_prefix() {
+    # Build the [SURROGATE ...] prefix based on SURROGATE_LABEL mode
+    case "$SURROGATE_LABEL" in
+        off) return ;;
+        verbose)
+            local sender_info=""
+            if [[ -n "${ZMX_SESSION:-}" ]]; then
+                _build_alias_cache
+                local sender_alias="${_ALIAS_CACHE[$ZMX_SESSION]:-$ZMX_SESSION}"
+                sender_info=" ${sender_alias}"
+            fi
+            local proc_name=""
+            proc_name="$(ps -o comm= -p $PPID 2>/dev/null || true)"
+            local cwd_short=""
+            cwd_short="$(basename "$PWD")"
+            printf '[SURROGATE%s %s %s PID:%s] ' "$sender_info" "${proc_name:-?}" "$cwd_short" "$$"
+            ;;
+        *)  # "on" (default)
+            if [[ -n "${ZMX_SESSION:-}" ]]; then
+                _build_alias_cache
+                local sender_alias="${_ALIAS_CACHE[$ZMX_SESSION]:-$ZMX_SESSION}"
+                printf '[SURROGATE %s] ' "$sender_alias"
+            else
+                printf '[SURROGATE] '
+            fi
+            ;;
+    esac
 }
 
 cmd_type() {
@@ -257,6 +396,22 @@ cmd_type() {
     local session
     session="$(resolve_session "$1")"
     local text="$2"
+    local guard_reason=""
+    if ! guard_reason="$(guard_type_text "$text")"; then
+        audit_event "type" "$session" "deny" "$text" "$guard_reason"
+        die "$guard_reason"
+    fi
+    if ! guard_reason="$(scan_with_dcg "$text")"; then
+        audit_event "type" "$session" "deny" "$text" "$guard_reason"
+        die "$guard_reason"
+    fi
+
+    # Prepend surrogate label
+    local prefix
+    prefix="$(_surrogate_prefix)"
+    if [[ -n "$prefix" ]]; then
+        text="${prefix}${text}"
+    fi
 
     ensure_bridge "$session"
     update_watermark "$session"
@@ -271,6 +426,7 @@ cmd_type() {
         tmux send-keys -t "$bridge" -l "$text"
         tmux send-keys -t "$bridge" Enter
     ) 9>"$lock"
+    audit_event "type" "$session" "allow" "$text"
 }
 
 cmd_read() {
@@ -502,58 +658,72 @@ cmd_alias() {
     echo "${_ALIAS_CACHE[$session]}"
 }
 
+whoami_usage() {
+    cat <<'EOF'
+usage: surrogate whoami
+
+Show the current zmx session name and its surrogate alias.
+EOF
+}
+
 cmd_whoami() {
     check_deps
+    case "${1:-}" in
+        -h|--help)
+            whoami_usage
+            return 0
+            ;;
+    esac
+    [[ $# -eq 0 ]] || die "usage: surrogate whoami"
+
     local session="${ZMX_SESSION:-}"
     if [[ -z "$session" ]]; then
         die "not inside a zmx session (ZMX_SESSION not set)"
     fi
+    if ! session_exists "$session"; then
+        die "current ZMX_SESSION '$session' is not present in zmx list (stale or leaked environment)"
+    fi
     _build_alias_cache
-    local alias="${_ALIAS_CACHE[$session]:-unknown}"
+    local alias="${_ALIAS_CACHE[$session]:-}"
+    if [[ -z "$alias" ]]; then
+        alias="$(session_alias "$session")"
+    fi
     echo "$alias  $session"
 }
 
 cmd_rename() {
     check_deps
-    [[ $# -ge 2 ]] || die "usage: surrogate rename <session> <new-name>"
+    [[ $# -ge 2 ]] || die "usage: surrogate rename <session> <new-alias>"
     local session
     session="$(resolve_session "$1")"
-    local new_name="$2"
+    local new_alias="$2"
 
-    # Reject if target name already exists
-    if session_exists "$new_name"; then
-        die "session '$new_name' already exists"
+    # Check the new alias doesn't collide with an existing session name
+    if session_exists "$new_alias"; then
+        die "'$new_alias' is a zmx session name, not an alias — use a different name"
     fi
 
     _build_alias_cache
-    local old_alias="${_ALIAS_CACHE[$session]}"
+    set +u
+    local old_alias="${_ALIAS_CACHE[$session]:-$session}"
+    set -u
 
-    # Rename the zmx socket
-    local zmx_dir="/run/user/$(id -u)/zmx"
-    mv "$zmx_dir/$session" "$zmx_dir/$new_name" || die "failed to rename zmx socket"
-
-    # Kill old bridge if one exists — it holds a stale zmx attach command.
-    # A new bridge will be lazily created on next send/type with the new name.
-    local old_bridge
-    old_bridge="$(bridge_name "$session")"
-    if tmux has-session -t "$old_bridge" 2>/dev/null; then
-        tmux kill-session -t "$old_bridge" 2>/dev/null || true
+    # Check the new alias isn't already taken by another session
+    if [[ -n "${_ALIAS_REVERSE[$new_alias]:-}" ]]; then
+        local other="${_ALIAS_REVERSE[$new_alias]}"
+        if [[ "$other" != "$session" ]]; then
+            die "alias '$new_alias' is already used by $other"
+        fi
     fi
 
-    # Rename watermark/lock files if they exist
-    local old_wm new_wm old_lock new_lock
-    old_wm="$(watermark_file "$session")"
-    new_wm="$(watermark_file "$new_name")"
-    old_lock="$(lock_file "$session")"
-    new_lock="$(lock_file "$new_name")"
-    [[ -f "$old_wm" ]] && mv "$old_wm" "$new_wm" 2>/dev/null || true
-    [[ -f "$old_lock" ]] && mv "$old_lock" "$new_lock" 2>/dev/null || true
+    # Write custom alias to file (append or update)
+    if [[ -f "$ALIAS_FILE" ]] && grep -q "^${session}=" "$ALIAS_FILE" 2>/dev/null; then
+        sed -i "s|^${session}=.*|${session}=${new_alias}|" "$ALIAS_FILE"
+    else
+        echo "${session}=${new_alias}" >> "$ALIAS_FILE"
+    fi
 
-    # Invalidate cache and recompute for new name
-    _ALIAS_CACHE_BUILT=""
-    _build_alias_cache
-    local new_alias="${_ALIAS_CACHE[$new_name]}"
-    echo "renamed: $session ($old_alias) -> $new_name ($new_alias)"
+    echo "renamed: $old_alias -> $new_alias  ($session)"
 }
 
 cmd_bridge() {

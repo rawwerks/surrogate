@@ -48,7 +48,7 @@ surrogate-shell-setup --install
 surrogate-doctor
 ```
 
-This installs `surrogate`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`, then configures your shell for auto-zmx and verifies the installation.
+This installs `surrogate`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`. It also tries to install [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) by default as a recommended safety guard. If dcg install fails, surrogate still installs and works.
 
 ### Agent skill (for Claude Code)
 
@@ -64,6 +64,41 @@ Agents will then know how to discover zmx sessions, inject keystrokes, read outp
 
 - [zmx](https://github.com/neurosnap/zmx) — session persistence
 - [tmux](https://github.com/tmux/tmux) — used internally for keystroke injection
+
+### Recommended safety dependency
+
+- [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) — Destructive Command Guard for blocking dangerous commands before they execute
+
+`bash install.sh` will try to install dcg automatically. This is strongly recommended but technically optional: surrogate still works without dcg.
+
+To skip dcg auto-install:
+
+```bash
+SURROGATE_SKIP_DCG=1 bash install.sh
+```
+
+## Security Model
+
+Surrogate stays ambiently available, but it no longer treats that as unlimited authority.
+
+- Surrogate enforces a built-in deterministic safety floor of its own.
+- DCG is an optional second layer for content scanning, not the only guardrail.
+- Some actions are intentionally outside Surrogate's authority surface and require direct human control.
+
+Current built-in structural guardrails:
+
+- `type` rejects multiline payloads
+- `send` rejects `C-c`, `C-d`, and `C-z`
+- there is no global "disable guards" switch
+- there is no persistent unsafe mode
+
+If DCG is installed, `type` also scans command-like payloads and blocks on DCG denials. On this machine, the current measured overhead is about `9ms` average added latency on `surrogate type`.
+
+Surrogate also writes a deterministic audit trail for `type` and `send` actions:
+
+- default path: `/tmp/surrogate-audit.jsonl`
+- override path: `SURROGATE_AUDIT_FILE=/path/to/file.jsonl`
+- both allowed and blocked actions are logged
 
 ### Auto-wrap all terminals in zmx
 
@@ -159,16 +194,19 @@ The most common operation. Types literal text and presses Enter.
 surrogate type <session> "echo hello world"
 ```
 
+`type` is single-line only. Multiline/script payloads are reserved for direct human control.
+
 ### Send special keys
 
-Full tmux `send-keys` syntax — Enter, Escape, Ctrl combos, arrow keys, etc.
+Full tmux `send-keys` syntax for low-risk keys such as `Enter`, `Escape`, arrows, and text literals.
 
 ```bash
 surrogate send <session> "banana" Enter
-surrogate send <session> C-c                    # Ctrl+C
 surrogate send <session> Escape ":wq" Enter     # vim save+quit
 surrogate send <session> Up Up Enter             # repeat 2 commands ago
 ```
+
+Dangerous control keys `C-c`, `C-d`, and `C-z` are reserved for direct human control and are rejected by surrogate.
 
 ### Read output
 
@@ -203,8 +241,6 @@ surrogate cleanup --all         # remove all bridges
 |-----|-------------|
 | `Enter` | Enter/Return |
 | `Escape` | Escape |
-| `C-c` | Ctrl+C |
-| `C-d` | Ctrl+D (EOF) |
 | `C-u` | Ctrl+U (clear line) |
 | `C-l` | Ctrl+L (clear screen) |
 | `Tab` | Tab |
@@ -270,6 +306,9 @@ These are enforced by automated tests and must hold for every change:
 | **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
 | **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no heuristics, no agent-type guessing |
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
+| **Security floor** | `type` rejects multiline payloads, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
+| **Security overhead tracked** | The test harness reports baseline vs guarded `type` latency as a metric, not a pass/fail gate |
+| **Audit trail** | `type` and `send` append JSONL audit records for both allowed and blocked actions |
 
 ## Tests
 

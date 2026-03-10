@@ -2,7 +2,7 @@
 
 Programmatic keystroke injection for any terminal application, via [zmx](https://github.com/neurosnap/zmx) sessions.
 
-Type into Claude Code, vim, python REPL, htop — anything running in a terminal — from scripts, AI agents, or other programs.
+Type into Claude Code, vim, REPL — anything running in a terminal — from scripts, AI agents, or other programs.
 
 ![Surrogate](surrogate.webp)
 

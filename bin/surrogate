@@ -25,13 +25,26 @@ Commands:
   cleanup [--all|--dead]        Remove stale or all bridge sessions
   status                        Show bridge health
 
+Special keys (for send):
+  Enter Escape Tab Space BSpace
+  C-c C-d C-u C-l (Ctrl combos)
+  Up Down Left Right
+
+Examples:
+  surrogate list
+  surrogate type my-session "echo hello"
+  surrogate send my-session C-c
+  surrogate send my-session Escape ":wq" Enter
+  surrogate read my-session -n 50
+  surrogate wait my-session "PASS|FAIL" -t 60
+
 EOF
     exit 0
 }
 
 check_deps() {
     command -v zmx >/dev/null 2>&1 || die "zmx not found. Install zmx first."
-    command -v tmux >/dev/null 2>&1 || die "tmux not found. Install with: pacman -S tmux (or your package manager)"
+    command -v tmux >/dev/null 2>&1 || die "tmux not found. Install with your package manager."
 }
 
 session_exists() {
@@ -92,7 +105,8 @@ cmd_list() {
 
 cmd_send() {
     check_deps
-    local session="${1:?usage: surrogate send <session> [keys...]}"
+    [[ $# -ge 1 ]] || die "usage: surrogate send <session> [keys...]"
+    local session="$1"
     shift
 
     ensure_bridge "$session"
@@ -111,8 +125,9 @@ cmd_send() {
 
 cmd_type() {
     check_deps
-    local session="${1:?usage: surrogate type <session> <text>}"
-    local text="${2:?usage: surrogate type <session> <text>}"
+    [[ $# -ge 2 ]] || die "usage: surrogate type <session> <text>"
+    local session="$1"
+    local text="$2"
 
     ensure_bridge "$session"
     update_watermark "$session"
@@ -131,13 +146,14 @@ cmd_type() {
 
 cmd_read() {
     check_deps
-    local session="${1:?usage: surrogate read <session> [-n LINES]}"
+    [[ $# -ge 1 ]] || die "usage: surrogate read <session> [-n LINES]"
+    local session="$1"
     shift
 
     local lines=20
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -n) lines="${2:?-n requires a number}"; shift 2 ;;
+            -n) [[ $# -ge 2 ]] || die "-n requires a number"; lines="$2"; shift 2 ;;
             *)  die "unknown flag: $1" ;;
         esac
     done
@@ -148,14 +164,15 @@ cmd_read() {
 
 cmd_wait() {
     check_deps
-    local session="${1:?usage: surrogate wait <session> <pattern> [-t TIMEOUT]}"
-    local pattern="${2:?usage: surrogate wait <session> <pattern> [-t TIMEOUT]}"
+    [[ $# -ge 2 ]] || die "usage: surrogate wait <session> <pattern> [-t TIMEOUT]"
+    local session="$1"
+    local pattern="$2"
     shift 2
 
     local timeout=30
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -t) timeout="${2:?-t requires seconds}"; shift 2 ;;
+            -t) [[ $# -ge 2 ]] || die "-t requires seconds"; timeout="$2"; shift 2 ;;
             *)  die "unknown flag: $1" ;;
         esac
     done
@@ -183,7 +200,8 @@ cmd_wait() {
 
 cmd_bridge() {
     check_deps
-    local session="${1:?usage: surrogate bridge <session>}"
+    [[ $# -ge 1 ]] || die "usage: surrogate bridge <session>"
+    local session="$1"
     ensure_bridge "$session"
     echo "bridge ready: $(bridge_name "$session")"
 }

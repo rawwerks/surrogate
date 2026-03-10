@@ -6,9 +6,9 @@ Type into Claude Code, vim, python REPL, htop — anything running in a terminal
 
 ![Surrogate](surrogate.webp)
 
-## Warning
-
-This tool is really dangerous. This is the YOLO mode of all YOLO modes. You could really get pwned.
+> [!CAUTION]
+> This tool is really dangerous. This is the YOLO mode of all YOLO modes. You could really get pwned.
+> Any process that can run `surrogate type` can inject keystrokes into any terminal session on the machine.
 
 ## Motivation
 

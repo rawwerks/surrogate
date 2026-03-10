@@ -1283,9 +1283,55 @@ test_whoami() {
   output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" whoami 2>&1)
 
   if echo "$output" | grep -q "$TEST_SESSION"; then
-    pass "${FUNCNAME[0]} — whoami shows session name"
+    if echo "$output" | grep -q '^unknown  '; then
+      fail "${FUNCNAME[0]} — whoami fell back to unknown: $output"
+    else
+      pass "${FUNCNAME[0]} — whoami shows session name and alias"
+    fi
   else
     fail "${FUNCNAME[0]} — whoami did not show session: $output"
+  fi
+}
+
+test_whoami_help() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" whoami --help 2>&1)
+
+  if echo "$output" | grep -q 'usage: surrogate whoami'; then
+    pass "${FUNCNAME[0]} — whoami help works"
+  else
+    fail "${FUNCNAME[0]} — whoami --help did not show help: $output"
+  fi
+}
+
+test_whoami_rejects_extra_args() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" whoami banana 2>&1 || true)
+
+  if echo "$output" | grep -q 'usage: surrogate whoami'; then
+    pass "${FUNCNAME[0]} — whoami rejects extra args"
+  else
+    fail "${FUNCNAME[0]} — whoami extra args were not rejected: $output"
+  fi
+}
+
+test_whoami_rejects_stale_env_session() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$(ZMX_SESSION="stale-session-$$" "$SURROGATE" whoami 2>&1 || true)
+
+  if echo "$output" | grep -q 'not present in zmx list'; then
+    pass "${FUNCNAME[0]} — whoami rejects stale leaked env session"
+  else
+    fail "${FUNCNAME[0]} — whoami did not explain stale env mismatch: $output"
   fi
 }
 
@@ -1669,6 +1715,52 @@ EOF
   fi
 }
 
+test_audit_logs_allowed_type() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local audit_file marker
+  audit_file="$(mktemp)"
+  marker="AUDIT_ALLOW_${$}"
+
+  SURROGATE_AUDIT_FILE="$audit_file" SURROGATE_LABEL=off "$SURROGATE" type "$TEST_SESSION" "echo $marker"
+  sleep 1
+
+  if grep -q '"action":"type"' "$audit_file" &&
+     grep -q '"decision":"allow"' "$audit_file" &&
+     grep -q "$TEST_SESSION" "$audit_file" &&
+     grep -q "echo $marker" "$audit_file"; then
+    pass "${FUNCNAME[0]} — allowed type action logged"
+  else
+    echo "    audit log contents:"
+    sed 's/^/    /' "$audit_file"
+    fail "${FUNCNAME[0]} — allowed type action not logged correctly"
+  fi
+}
+
+test_audit_logs_blocked_send() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local audit_file output
+  audit_file="$(mktemp)"
+  output=$(SURROGATE_AUDIT_FILE="$audit_file" "$SURROGATE" send "$TEST_SESSION" C-c 2>&1 || true)
+
+  if grep -q '"action":"send"' "$audit_file" &&
+     grep -q '"decision":"deny"' "$audit_file" &&
+     grep -q "$TEST_SESSION" "$audit_file" &&
+     grep -q '"detail":"C-c"' "$audit_file" &&
+     echo "$output" | grep -qi 'dangerous control key'; then
+    pass "${FUNCNAME[0]} — blocked send action logged"
+  else
+    echo "    send output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    audit log contents:"
+    sed 's/^/    /' "$audit_file"
+    fail "${FUNCNAME[0]} — blocked send action not logged correctly"
+  fi
+}
+
 test_error_missing_zmx() {
   # plumb:req-106648f1
   # plumb:req-f63f502d
@@ -1838,7 +1930,7 @@ test_send_creates_bridge_lazily() {
   TESTS_RUN=$((TESTS_RUN + 1))
 
   # Verify ensure_bridge is called from cmd_send
-  if grep -A10 'cmd_send' "$SURROGATE" | grep -q 'ensure_bridge'; then
+  if sed -n '/^cmd_send/,/^cmd_/p' "$SURROGATE" | grep -q 'ensure_bridge'; then
     pass "${FUNCNAME[0]} — send creates bridge lazily"
   else
     fail "${FUNCNAME[0]} — send doesn't call ensure_bridge"
@@ -1864,7 +1956,7 @@ test_send_updates_watermark() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  if grep -A10 'cmd_send' "$SURROGATE" | grep -q 'update_watermark'; then
+  if sed -n '/^cmd_send/,/^cmd_/p' "$SURROGATE" | grep -q 'update_watermark'; then
     pass "${FUNCNAME[0]} — send updates watermark"
   else
     fail "${FUNCNAME[0]} — send doesn't update watermark"
@@ -1946,6 +2038,9 @@ run_test test_list_shows_aliases
 run_test test_who_shows_aliases
 run_test test_session_resolution_by_alias
 run_test test_whoami
+run_test test_whoami_help
+run_test test_whoami_rejects_extra_args
+run_test test_whoami_rejects_stale_env_session
 run_test test_whoami_no_session
 
 # Behavioral defaults (Tier 2)
@@ -1972,6 +2067,8 @@ run_test test_security_model_section_exists
 run_test test_type_rejects_multiline
 run_test test_send_rejects_dangerous_control_keys
 run_test test_dcg_blocks_type_when_available
+run_test test_audit_logs_allowed_type
+run_test test_audit_logs_blocked_send
 run_test test_error_missing_zmx
 run_test test_error_missing_tmux
 run_test test_rename_kills_bridge

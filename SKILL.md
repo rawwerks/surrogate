@@ -26,6 +26,8 @@ Current built-in guardrails:
 
 If DCG is installed, `surrogate type` may also be blocked by DCG for destructive command-like payloads.
 
+Surrogate also writes JSONL audit records for `type` and `send` actions. By default this goes to `/tmp/surrogate-audit.jsonl`, and it can be overridden with `SURROGATE_AUDIT_FILE`.
+
 ## Session Aliases
 
 Every session gets a deterministic adjective-noun alias (e.g. `shiny-dolphin`, `robo-quokka`). Aliases are derived from the session name via hash — no state, no config. They never collide.

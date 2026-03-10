@@ -4,6 +4,7 @@ set -euo pipefail
 SURROGATE_TMP="/tmp"
 BRIDGE_PREFIX="_surr_"
 ALIAS_FILE="${SURROGATE_TMP}/surrogate-aliases"
+AUDIT_FILE="${SURROGATE_AUDIT_FILE:-${SURROGATE_TMP}/surrogate-audit.jsonl}"
 SURROGATE_LABEL="${SURROGATE_LABEL:-on}"  # on | off | verbose
 
 # --- helpers (needed early) ---
@@ -44,7 +45,8 @@ contains_multiline() {
 guard_type_text() {
     local text="$1"
     contains_multiline "$text" || return 0
-    die "multiline payloads are reserved for direct human control"
+    echo "multiline payloads are reserved for direct human control"
+    return 1
 }
 
 guard_send_keys() {
@@ -52,10 +54,25 @@ guard_send_keys() {
     for key in "$@"; do
         case "$key" in
             C-c|C-d|C-z)
-                die "dangerous control key '$key' is reserved for direct human control"
+                echo "dangerous control key '$key' is reserved for direct human control"
+                return 1
                 ;;
         esac
     done
+}
+
+json_escape() {
+    printf '%s' "$1" | sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\t/\\t/g;s/\r/\\r/g;s/\n/\\n/g'
+}
+
+audit_event() {
+    local action="$1" session="$2" decision="$3" detail="$4" reason="${5:-}"
+    local ts detail_json reason_json
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    detail_json="$(json_escape "$detail")"
+    reason_json="$(json_escape "$reason")"
+    printf '{"ts":"%s","action":"%s","session":"%s","decision":"%s","detail":"%s","reason":"%s"}\n' \
+        "$ts" "$action" "$session" "$decision" "$detail_json" "$reason_json" >> "$AUDIT_FILE"
 }
 
 scan_with_dcg() {
@@ -73,7 +90,8 @@ scan_with_dcg() {
         1)
             reason="$(printf '%s\n' "$dcg_output" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"
             [[ -n "$reason" ]] || reason="blocked by dcg"
-            die "dcg denied payload: $reason"
+            echo "dcg denied payload: $reason"
+            return 1
             ;;
         *)
             # DCG is an optional layer; surrogate's built-in guardrails remain authoritative.
@@ -174,7 +192,18 @@ _build_alias_cache() {
 
 session_alias() {
     _build_alias_cache
-    echo "${_ALIAS_CACHE[$1]}"
+    if [[ -n "${_ALIAS_CACHE[$1]:-}" ]]; then
+        echo "${_ALIAS_CACHE[$1]}"
+        return 0
+    fi
+
+    local name="$1" h=5381 i c base
+    for (( i=0; i<${#name}; i++ )); do
+        printf -v c '%d' "'${name:$i:1}"
+        h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
+    done
+    base="${ADJECTIVES[$((h % 100))]}-${NOUNS[$((h / 100 % 100))]}"
+    echo "$base"
 }
 
 resolve_session() {
@@ -230,6 +259,7 @@ Environment:
   SURROGATE_LABEL=on       Prepend [SURROGATE <alias>] to typed text (default)
   SURROGATE_LABEL=off      No prefix
   SURROGATE_LABEL=verbose  Include process name, cwd, PID in prefix
+  SURROGATE_AUDIT_FILE     Audit log path (default: /tmp/surrogate-audit.jsonl)
 
 Special keys (for send):
   Enter Escape Tab Space BSpace
@@ -309,7 +339,12 @@ cmd_send() {
     local session
     session="$(resolve_session "$1")"
     shift
-    guard_send_keys "$@"
+    local send_detail="$*"
+    local guard_reason=""
+    if ! guard_reason="$(guard_send_keys "$@")"; then
+        audit_event "send" "$session" "deny" "$send_detail" "$guard_reason"
+        die "$guard_reason"
+    fi
 
     ensure_bridge "$session"
     update_watermark "$session"
@@ -323,6 +358,7 @@ cmd_send() {
         flock 9
         tmux send-keys -t "$bridge" "$@"
     ) 9>"$lock"
+    audit_event "send" "$session" "allow" "$send_detail"
 }
 
 _surrogate_prefix() {
@@ -360,8 +396,15 @@ cmd_type() {
     local session
     session="$(resolve_session "$1")"
     local text="$2"
-    guard_type_text "$text"
-    scan_with_dcg "$text"
+    local guard_reason=""
+    if ! guard_reason="$(guard_type_text "$text")"; then
+        audit_event "type" "$session" "deny" "$text" "$guard_reason"
+        die "$guard_reason"
+    fi
+    if ! guard_reason="$(scan_with_dcg "$text")"; then
+        audit_event "type" "$session" "deny" "$text" "$guard_reason"
+        die "$guard_reason"
+    fi
 
     # Prepend surrogate label
     local prefix
@@ -383,6 +426,7 @@ cmd_type() {
         tmux send-keys -t "$bridge" -l "$text"
         tmux send-keys -t "$bridge" Enter
     ) 9>"$lock"
+    audit_event "type" "$session" "allow" "$text"
 }
 
 cmd_read() {
@@ -614,14 +658,36 @@ cmd_alias() {
     echo "${_ALIAS_CACHE[$session]}"
 }
 
+whoami_usage() {
+    cat <<'EOF'
+usage: surrogate whoami
+
+Show the current zmx session name and its surrogate alias.
+EOF
+}
+
 cmd_whoami() {
     check_deps
+    case "${1:-}" in
+        -h|--help)
+            whoami_usage
+            return 0
+            ;;
+    esac
+    [[ $# -eq 0 ]] || die "usage: surrogate whoami"
+
     local session="${ZMX_SESSION:-}"
     if [[ -z "$session" ]]; then
         die "not inside a zmx session (ZMX_SESSION not set)"
     fi
+    if ! session_exists "$session"; then
+        die "current ZMX_SESSION '$session' is not present in zmx list (stale or leaked environment)"
+    fi
     _build_alias_cache
-    local alias="${_ALIAS_CACHE[$session]:-unknown}"
+    local alias="${_ALIAS_CACHE[$session]:-}"
+    if [[ -z "$alias" ]]; then
+        alias="$(session_alias "$session")"
+    fi
     echo "$alias  $session"
 }
 

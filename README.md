@@ -94,6 +94,12 @@ Current built-in structural guardrails:
 
 If DCG is installed, `type` also scans command-like payloads and blocks on DCG denials. On this machine, the current measured overhead is about `9ms` average added latency on `surrogate type`.
 
+Surrogate also writes a deterministic audit trail for `type` and `send` actions:
+
+- default path: `/tmp/surrogate-audit.jsonl`
+- override path: `SURROGATE_AUDIT_FILE=/path/to/file.jsonl`
+- both allowed and blocked actions are logged
+
 ### Auto-wrap all terminals in zmx
 
 By default, surrogate can only talk to apps running inside zmx sessions. To make **every** new terminal window a zmx session automatically:
@@ -302,6 +308,7 @@ These are enforced by automated tests and must hold for every change:
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
 | **Security floor** | `type` rejects multiline payloads, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
 | **Security overhead tracked** | The test harness reports baseline vs guarded `type` latency as a metric, not a pass/fail gate |
+| **Audit trail** | `type` and `send` append JSONL audit records for both allowed and blocked actions |
 
 ## Tests
 

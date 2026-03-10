@@ -74,6 +74,25 @@ The test harness must report a non-blocking security-overhead metric for the hot
 
 This metric is for observability and regression tracking. It is not a release-blocking threshold in v0.
 
+### Audit Logging
+
+Surrogate must produce a deterministic audit trail for guarded actions.
+
+The audit log requirements for v0 are:
+
+1. `type` and `send` actions must append a JSON Lines entry to an audit log file.
+2. The audit log must include both allowed and blocked actions.
+3. Each audit record must include at least:
+   - timestamp
+   - action (`type` or `send`)
+   - target session
+   - decision (`allow` or `deny`)
+   - detail payload or key sequence
+4. The default audit log path must be `/tmp/surrogate-audit.jsonl`.
+5. The audit log path must be overrideable via `SURROGATE_AUDIT_FILE`.
+
+Audit logging is for observability and incident review. It must not change command behavior except for writing the log entry.
+
 ### Authority Boundary
 
 Surrogate may support routine remote-hands actions such as reading session output, searching session history, typing plain text, and other low-risk deterministic helpers.
@@ -136,7 +155,7 @@ The `alias` command must accept a session name (or alias) and print its determin
 
 ### whoami
 
-The `whoami` command must print the alias and zmx session name of the current surrogate session (the zmx session this terminal is running in). It must detect the current session by checking the zmx environment or parent process.
+The `whoami` command must print the alias and zmx session name of the current surrogate session (the zmx session this terminal is running in). It must detect the current session by checking the zmx environment or parent process. It must support `-h`/`--help` and reject extra positional arguments with `usage: surrogate whoami`. For a live current session, it must deterministically compute the alias rather than printing `unknown`. If `ZMX_SESSION` is set but not present in `zmx list`, `whoami` must reject it explicitly as a stale or leaked environment value instead of treating it as a live session.
 
 ### Session Resolution
 

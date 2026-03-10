@@ -32,13 +32,23 @@ zmx is the source of truth for sessions. tmux is invisible plumbing. You use wha
 
 ## Install
 
+One-liner:
+
+```bash
+git clone https://github.com/rawwerks/surrogate.git && cd surrogate && bash install.sh && surrogate-shell-setup --install && surrogate-doctor
+```
+
+Or step by step:
+
 ```bash
 git clone https://github.com/rawwerks/surrogate.git
 cd surrogate
 bash install.sh
+surrogate-shell-setup --install
+surrogate-doctor
 ```
 
-This copies `surrogate` and `surrogate-shell-setup` to `~/.local/bin/`.
+This installs `surrogate`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`, then configures your shell for auto-zmx and verifies the installation.
 
 ### Agent skill (for Claude Code)
 

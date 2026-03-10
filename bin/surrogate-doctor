@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# surrogate-doctor — check and diagnose surrogate installation
+
+PASS=0
+WARN=0
+FAIL=0
+
+pass() { PASS=$((PASS + 1)); echo "  OK: $1"; }
+warn() { WARN=$((WARN + 1)); echo "  WARN: $1"; }
+fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1"; }
+
+echo "surrogate doctor"
+echo ""
+
+# --- dependencies ---
+
+echo "Dependencies:"
+
+if command -v zmx &>/dev/null; then
+  pass "zmx found at $(command -v zmx)"
+else
+  fail "zmx not found — install from https://github.com/neurosnap/zmx"
+fi
+
+if command -v tmux &>/dev/null; then
+  pass "tmux $(tmux -V)"
+else
+  fail "tmux not found — install with your package manager"
+fi
+
+echo ""
+
+# --- binaries ---
+
+echo "Binaries:"
+
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+
+for bin in surrogate surrogate-shell-setup surrogate-doctor; do
+  if [[ -x "$INSTALL_DIR/$bin" ]]; then
+    pass "$bin installed at $INSTALL_DIR/$bin"
+  elif command -v "$bin" &>/dev/null; then
+    pass "$bin found at $(command -v "$bin")"
+  else
+    fail "$bin not found — run install.sh"
+  fi
+done
+
+echo ""
+
+# --- PATH ---
+
+echo "PATH:"
+
+if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+  pass "$INSTALL_DIR is in PATH"
+else
+  warn "$INSTALL_DIR is not in PATH — add: export PATH=\"$INSTALL_DIR:\$PATH\""
+fi
+
+echo ""
+
+# --- shell snippet ---
+
+echo "Shell snippet:"
+
+detect_shell() {
+  local sh
+  sh="$(basename "${SHELL:-/bin/bash}")"
+  case "$sh" in
+    bash|zsh|fish) echo "$sh" ;;
+    *) echo "bash" ;;
+  esac
+}
+
+rc_file_for() {
+  case "$1" in
+    bash) echo "$HOME/.bashrc" ;;
+    zsh)  echo "$HOME/.zshrc" ;;
+    fish) echo "$HOME/.config/fish/config.fish" ;;
+  esac
+}
+
+SHELL_NAME="$(detect_shell)"
+RC_FILE="$(rc_file_for "$SHELL_NAME")"
+
+if [[ -f "$RC_FILE" ]] && grep -qF "surrogate:zmx:begin" "$RC_FILE"; then
+  pass "auto-zmx snippet installed in $RC_FILE"
+
+  # Check snippet has critical fixes
+  if grep -q 'unset ZMX_SESSION\|set -e ZMX_SESSION' "$RC_FILE"; then
+    pass "snippet unsets ZMX_SESSION before attach"
+  else
+    fail "snippet missing 'unset ZMX_SESSION' — run: surrogate-shell-setup --uninstall && surrogate-shell-setup --install"
+  fi
+
+  if grep -q 'ps -o comm= -p.*PPID\|ps -o comm= -p %self' "$RC_FILE"; then
+    pass "snippet uses parent process check (not env var)"
+  else
+    fail "snippet uses old env var check — run: surrogate-shell-setup --uninstall && surrogate-shell-setup --install"
+  fi
+
+  if grep -q 'ZMX_BIN:-.*/.local/bin/zmx' "$RC_FILE"; then
+    pass "snippet uses full path to zmx"
+  else
+    warn "snippet may not use full path to zmx — could fail if PATH not set early"
+  fi
+else
+  warn "auto-zmx snippet not installed in $RC_FILE — run: surrogate-shell-setup --install"
+fi
+
+echo ""
+
+# --- zmx sessions ---
+
+echo "ZMX sessions:"
+
+if command -v zmx &>/dev/null; then
+  SESSION_COUNT=$(zmx list 2>/dev/null | wc -l)
+  CLIENT_COUNT=$(zmx list 2>/dev/null | grep -c 'clients=1' || echo 0)
+  pass "$SESSION_COUNT sessions, $CLIENT_COUNT with active clients"
+else
+  warn "cannot check — zmx not installed"
+fi
+
+echo ""
+
+# --- bridges ---
+
+echo "Surrogate bridges:"
+
+if command -v tmux &>/dev/null; then
+  BRIDGE_COUNT=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -c "^_surr_" 2>/dev/null || true)
+  BRIDGE_COUNT="${BRIDGE_COUNT:-0}"
+  DEAD_COUNT=0
+  if [[ "$BRIDGE_COUNT" -gt 0 ]] && command -v zmx &>/dev/null; then
+    while IFS= read -r s; do
+      zmx_name="${s#_surr_}"
+      if ! zmx list 2>/dev/null | grep -q "^session_name=$zmx_name	"; then
+        DEAD_COUNT=$((DEAD_COUNT + 1))
+      fi
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_")
+  fi
+  pass "$BRIDGE_COUNT active bridges"
+  if [[ "$DEAD_COUNT" -gt 0 ]]; then
+    warn "$DEAD_COUNT dead bridges — run: surrogate cleanup"
+  fi
+else
+  warn "cannot check — tmux not installed"
+fi
+
+# --- summary ---
+
+echo ""
+echo "--- summary ---"
+echo "  passed: $PASS"
+echo "  warnings: $WARN"
+echo "  failures: $FAIL"
+
+if [[ "$FAIL" -gt 0 ]]; then
+  echo ""
+  echo "Fix failures above, then run surrogate-doctor again."
+  exit 1
+elif [[ "$WARN" -gt 0 ]]; then
+  echo ""
+  echo "Surrogate is functional but has warnings."
+  exit 0
+else
+  echo ""
+  echo "Everything looks good!"
+  exit 0
+fi

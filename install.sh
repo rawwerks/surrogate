@@ -70,9 +70,13 @@ chmod +x "$INSTALL_DIR/surrogate"
 cp "$SCRIPT_DIR/bin/surrogate-shell-setup" "$INSTALL_DIR/surrogate-shell-setup"
 chmod +x "$INSTALL_DIR/surrogate-shell-setup"
 
+cp "$SCRIPT_DIR/bin/surrogate-doctor" "$INSTALL_DIR/surrogate-doctor"
+chmod +x "$INSTALL_DIR/surrogate-doctor"
+
 info "Installed:"
 info "  $INSTALL_DIR/surrogate"
 info "  $INSTALL_DIR/surrogate-shell-setup"
+info "  $INSTALL_DIR/surrogate-doctor"
 
 # --- check PATH ---
 

@@ -86,6 +86,7 @@ test_list() {
 }
 
 test_type_and_read() {
+  # plumb:req-77cf38f4
   # plumb:req-29b6b22a
   # plumb:req-f6a28ee7
   # plumb:req-c210345d
@@ -175,6 +176,8 @@ test_bridge_reuse() {
 }
 
 test_wait_success() {
+  # plumb:req-4c7c7e3b
+  # plumb:req-997f73d2
   # plumb:req-c53cf3b7
   # plumb:req-4ecc2ef6
   # plumb:req-2c9db8fd
@@ -193,6 +196,7 @@ test_wait_success() {
 }
 
 test_wait_timeout() {
+  # plumb:req-8f64803b
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -204,6 +208,7 @@ test_wait_timeout() {
 }
 
 test_read_line_limit() {
+  # plumb:req-52cee173
   # plumb:req-201cbd97
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -226,6 +231,7 @@ test_read_line_limit() {
 }
 
 test_dead_session_error() {
+  # plumb:req-fd5d8f2f
   # plumb:req-0748d740
   # plumb:req-f63f502d
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -241,6 +247,7 @@ test_dead_session_error() {
 }
 
 test_cleanup_dead() {
+  # plumb:req-23993d75
   # plumb:req-3bb77a03
   # plumb:req-129f015a
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -272,6 +279,7 @@ test_cleanup_dead() {
 }
 
 test_cleanup_all() {
+  # plumb:req-231e031f
   # plumb:req-be66a1c3
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -301,6 +309,7 @@ test_cleanup_all() {
 }
 
 test_status() {
+  # plumb:req-3a11209c
   # plumb:req-a727036c
   # plumb:req-04b8212d
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -362,6 +371,7 @@ test_concurrent_serialization() {
 # ---------------------------------------------------------------------------
 
 test_invariant_snippet_always_prints_message() {
+  # plumb:req-ca2be6e0
   # plumb:req-d1726bef
   # plumb:req-a64328f9
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -590,6 +600,7 @@ echo "--- alias + search tests ---"
 echo ""
 
 test_find() {
+  # plumb:req-c789f866
   # plumb:req-24a68c42
   # plumb:req-720a5bc2
   # plumb:req-cfd97f85
@@ -642,6 +653,7 @@ test_find_no_match() {
 }
 
 test_find_with_context() {
+  # plumb:req-095a3f96
   # plumb:req-c38efd2f
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -663,6 +675,7 @@ test_find_with_context() {
 }
 
 test_who() {
+  # plumb:req-851ca449
   # plumb:req-251007fd
   # plumb:req-6a20e804
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -681,6 +694,7 @@ test_who() {
 }
 
 test_who_n_zero() {
+  # plumb:req-40defb6c
   # plumb:req-4e55b856
   # plumb:req-0e241e62
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -698,6 +712,7 @@ test_who_n_zero() {
 }
 
 test_active() {
+  # plumb:req-82e691b5
   # plumb:req-295cf791
   # plumb:req-55b5dea2
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -716,6 +731,7 @@ test_active() {
 }
 
 test_peek() {
+  # plumb:req-47c3463d
   # plumb:req-4ef11b15
   # plumb:req-a02e09c7
   # plumb:req-7fcde33b
@@ -826,6 +842,7 @@ test_rename_collision() {
 }
 
 test_require_int() {
+  # plumb:req-45a5c9ee
   # plumb:req-41dfdd81
   # plumb:req-73e7db09
   echo "=== test: ${FUNCNAME[0]} ==="

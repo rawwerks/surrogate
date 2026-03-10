@@ -61,6 +61,26 @@ The `peek` command must accept optional `-n LINES` (default 5) and `--filter PAT
 
 The `rename` command must accept a source session name and a target name. It must rename the zmx socket file (the source of truth). It must kill any existing bridge for the old name — bridges hold a stale `zmx attach` command and must not be renamed. A fresh bridge will be created lazily on the next send/type. Watermark and lock files must be renamed. The command must reject if the source session does not exist. The command must reject if the target name already exists.
 
+### alias
+
+The `alias` command must accept a session name (or alias) and print its deterministic alias. The alias must be computed from the session name using a hash function, selecting one adjective and one noun from built-in wordlists (100 adjectives × 100 nouns = 10,000 combinations). The alias must be deterministic — the same session name must always produce the same alias. On hash collision, a numeric suffix must be appended. The alias cache must be built once per invocation and shared across all commands.
+
+### whoami
+
+The `whoami` command must print the alias and zmx session name of the current surrogate session (the zmx session this terminal is running in). It must detect the current session by checking the zmx environment or parent process.
+
+### Session Resolution
+
+All commands that accept a session name must also accept an alias. Session resolution must first check if the argument is a known alias and resolve it to the actual session name. If not an alias, it must be treated as a literal session name. This applies to: send, type, read, wait, bridge, rename, and alias commands.
+
+### list (alias display)
+
+The `list` command must include the deterministic alias for each session alongside its zmx session name.
+
+### who (alias display)
+
+The `who` command must include the alias for each session in its output.
+
 ### bridge
 
 The `bridge` command must pre-create a tmux bridge session for a zmx session.

@@ -6,6 +6,9 @@ set -euo pipefail
 PASS=0
 WARN=0
 FAIL=0
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_BIN_DIR="$REPO_DIR/bin"
 
 pass() { PASS=$((PASS + 1)); echo "  OK: $1"; }
 warn() { WARN=$((WARN + 1)); echo "  WARN: $1"; }
@@ -65,6 +68,35 @@ if echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
 else
   warn "$INSTALL_DIR is not in PATH — add: export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
+
+echo ""
+
+# --- repo sync ---
+
+echo "Repo sync:"
+
+for bin in surrogate surrogate-shell-setup surrogate-doctor; do
+  installed_path="$(command -v "$bin" 2>/dev/null || true)"
+  repo_path="$REPO_BIN_DIR/$bin"
+
+  if [[ -z "$installed_path" || ! -e "$repo_path" ]]; then
+    continue
+  fi
+
+  if [[ -L "$installed_path" ]]; then
+    link_target="$(readlink -f "$installed_path" 2>/dev/null || readlink "$installed_path" 2>/dev/null || true)"
+    repo_target="$(readlink -f "$repo_path" 2>/dev/null || printf '%s' "$repo_path")"
+    if [[ "$link_target" == "$repo_target" ]]; then
+      pass "$bin uses dev-link install (symlinked to repo checkout)"
+    else
+      warn "$bin is a symlink, but not to this repo checkout"
+    fi
+  elif ! diff -q "$repo_path" "$installed_path" >/dev/null 2>&1; then
+    warn "$bin installed copy differs from repo checkout — run: bash install.sh or bash install.sh --dev-link"
+  else
+    pass "$bin installed copy matches repo checkout"
+  fi
+done
 
 echo ""
 

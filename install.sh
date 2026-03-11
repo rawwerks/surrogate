@@ -6,12 +6,26 @@ set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DEV_LINK_MODE="${SURROGATE_DEV_LINK:-0}"
 
 # --- helpers ---
 
 info()  { echo "surrogate: $*"; }
 warn()  { echo "surrogate: WARNING: $*" >&2; }
 die()   { echo "surrogate: FATAL: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: bash install.sh [--dev-link]
+
+Options:
+  --dev-link   Symlink binaries from this checkout instead of copying them
+
+Environment:
+  SURROGATE_DEV_LINK=1   Same as --dev-link
+  SURROGATE_SKIP_DCG=1   Skip recommended dcg auto-install
+EOF
+}
 
 detect_os() {
   case "$(uname -s)" in
@@ -88,7 +102,33 @@ install_tmux_hint() {
   esac
 }
 
+install_binary() {
+  local src="$1" dest="$2"
+  if [[ "$DEV_LINK_MODE" == "1" ]]; then
+    ln -sfn "$src" "$dest"
+  else
+    cp "$src" "$dest"
+    chmod +x "$dest"
+  fi
+}
+
 # --- preflight ---
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dev-link)
+      DEV_LINK_MODE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown flag: $1"
+      ;;
+  esac
+done
 
 OS="$(detect_os)"
 
@@ -102,19 +142,17 @@ info "Installing to $INSTALL_DIR"
 
 mkdir -p "$INSTALL_DIR"
 
-cp "$SCRIPT_DIR/bin/surrogate" "$INSTALL_DIR/surrogate"
-chmod +x "$INSTALL_DIR/surrogate"
-
-cp "$SCRIPT_DIR/bin/surrogate-shell-setup" "$INSTALL_DIR/surrogate-shell-setup"
-chmod +x "$INSTALL_DIR/surrogate-shell-setup"
-
-cp "$SCRIPT_DIR/bin/surrogate-doctor" "$INSTALL_DIR/surrogate-doctor"
-chmod +x "$INSTALL_DIR/surrogate-doctor"
+install_binary "$SCRIPT_DIR/bin/surrogate" "$INSTALL_DIR/surrogate"
+install_binary "$SCRIPT_DIR/bin/surrogate-shell-setup" "$INSTALL_DIR/surrogate-shell-setup"
+install_binary "$SCRIPT_DIR/bin/surrogate-doctor" "$INSTALL_DIR/surrogate-doctor"
 
 info "Installed:"
 info "  $INSTALL_DIR/surrogate"
 info "  $INSTALL_DIR/surrogate-shell-setup"
 info "  $INSTALL_DIR/surrogate-doctor"
+if [[ "$DEV_LINK_MODE" == "1" ]]; then
+  info "Mode: dev-link (installed binaries symlink to this checkout)"
+fi
 
 # --- check PATH ---
 
@@ -155,3 +193,5 @@ info "To auto-wrap all terminals in zmx sessions:"
 info "  surrogate-shell-setup --install"
 info "To skip dcg auto-install next time:"
 info "  SURROGATE_SKIP_DCG=1 bash install.sh"
+info "To keep installed binaries synced during development:"
+info "  bash install.sh --dev-link"

@@ -50,6 +50,14 @@ surrogate-doctor
 
 This installs `surrogate`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`. It also tries to install [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) by default as a recommended safety guard. If dcg install fails, surrogate still installs and works.
 
+For contributors working from a checkout, use dev-link mode so the installed CLI never drifts from the repo:
+
+```bash
+bash install.sh --dev-link
+```
+
+This symlinks the installed binaries to the current checkout instead of copying them.
+
 ### Agent skill (for Claude Code)
 
 To teach Claude Code how to use surrogate, install the skill:

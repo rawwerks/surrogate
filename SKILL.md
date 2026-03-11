@@ -26,7 +26,7 @@ Current built-in guardrails:
 
 If DCG is installed, `surrogate type` may also be blocked by DCG for destructive command-like payloads.
 
-Surrogate also writes JSONL audit records for `type` and `send` actions. By default this goes to `/tmp/surrogate-audit.jsonl`, and it can be overridden with `SURROGATE_AUDIT_FILE`.
+Surrogate also writes JSONL audit records for `type` and `send` actions. By default this goes to `/tmp/surrogate-audit.jsonl`, and it can be overridden with `SURROGATE_AUDIT_FILE`. Records include target alias, actor session/alias when available, repo, and optional `SURROGATE_WORK_ID` / `SURROGATE_REASON` metadata.
 
 ## Session Aliases
 

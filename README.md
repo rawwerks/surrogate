@@ -115,6 +115,9 @@ Surrogate also writes a deterministic audit trail for `type` and `send` actions:
 - default path: `/tmp/surrogate-audit.jsonl`
 - override path: `SURROGATE_AUDIT_FILE=/path/to/file.jsonl`
 - both allowed and blocked actions are logged
+- records include target alias, actor session/alias when available, repo, and optional causal metadata
+- `SURROGATE_WORK_ID=...` annotates a causal work ID
+- `SURROGATE_REASON=...` annotates an intent reason
 
 ### Auto-wrap all terminals in zmx
 

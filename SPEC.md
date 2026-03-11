@@ -41,9 +41,9 @@ The following rules are part of surrogate itself and must apply even when DCG is
 1. The `type` command must normalize embedded newlines to spaces and submit once. A successful `type` must mean the prompt was actually submitted to the target application, not merely staged in the input field.
 2. The `type` delivery path must include a configurable fixed submit pause with a sensible default so Enter lands reliably in agent TUIs without introducing heuristics.
 3. If `type` transport fails after staging text, surrogate must provide one obvious repair path that agents can invoke directly.
-2. The `send` command must reject dangerous control keys: `C-c`, `C-d`, and `C-z`.
-3. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
-4. Surrogate must not implement a persistent unsafe mode.
+4. The `send` command must reject dangerous control keys: `C-c`, `C-d`, and `C-z`.
+5. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
+6. Surrogate must not implement a persistent unsafe mode.
 
 These rules define the minimum safety floor. Opting out of optional tools must never disable them.
 
@@ -88,10 +88,18 @@ The audit log requirements for v0 are:
    - timestamp
    - action (`type` or `send`)
    - target session
+   - target alias
    - decision (`allow` or `deny`)
    - detail payload or key sequence
+   - actor session when available
+   - actor alias when available
+   - repo name
+   - work ID when provided
+   - intent reason when provided
 4. The default audit log path must be `/tmp/surrogate-audit.jsonl`.
 5. The audit log path must be overrideable via `SURROGATE_AUDIT_FILE`.
+6. `SURROGATE_WORK_ID` may annotate audit records with a causal work identifier.
+7. `SURROGATE_REASON` may annotate audit records with an intent reason.
 
 Audit logging is for observability and incident review. It must not change command behavior except for writing the log entry.
 

@@ -63,14 +63,36 @@ json_escape() {
     printf '%s' "$1" | sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\t/\\t/g;s/\r/\\r/g;s/\n/\\n/g'
 }
 
+current_repo_name() {
+    local git_root=""
+    if command -v git >/dev/null 2>&1 &&
+       git_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+        basename "$git_root"
+    else
+        basename "$PWD"
+    fi
+}
+
 audit_event() {
     local action="$1" session="$2" decision="$3" detail="$4" reason="${5:-}"
     local ts detail_json reason_json
+    local target_alias actor_session actor_alias repo_name work_id intent_reason
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     detail_json="$(json_escape "$detail")"
     reason_json="$(json_escape "$reason")"
-    printf '{"ts":"%s","action":"%s","session":"%s","decision":"%s","detail":"%s","reason":"%s"}\n' \
-        "$ts" "$action" "$session" "$decision" "$detail_json" "$reason_json" >> "$AUDIT_FILE"
+    target_alias="$(session_alias "$session")"
+    actor_session="${ZMX_SESSION:-}"
+    actor_alias=""
+    if [[ -n "$actor_session" ]] && session_exists "$actor_session"; then
+        actor_alias="$(session_alias "$actor_session")"
+    fi
+    repo_name="$(current_repo_name)"
+    work_id="${SURROGATE_WORK_ID:-}"
+    intent_reason="${SURROGATE_REASON:-}"
+    printf '{"ts":"%s","action":"%s","session":"%s","target_alias":"%s","decision":"%s","detail":"%s","reason":"%s","actor_session":"%s","actor_alias":"%s","work_id":"%s","intent_reason":"%s","repo":"%s"}\n' \
+        "$ts" "$action" "$session" "$(json_escape "$target_alias")" "$decision" "$detail_json" "$reason_json" \
+        "$(json_escape "$actor_session")" "$(json_escape "$actor_alias")" "$(json_escape "$work_id")" \
+        "$(json_escape "$intent_reason")" "$(json_escape "$repo_name")" >> "$AUDIT_FILE"
 }
 
 scan_with_dcg() {
@@ -259,6 +281,8 @@ Environment:
   SURROGATE_LABEL=off      No prefix
   SURROGATE_LABEL=verbose  Include process name, cwd, PID in prefix
   SURROGATE_AUDIT_FILE     Audit log path (default: /tmp/surrogate-audit.jsonl)
+  SURROGATE_WORK_ID        Optional causal work ID for audit records
+  SURROGATE_REASON         Optional intent reason for audit records
   SURROGATE_TYPE_ENTER_DELAY_SECS
                           Fixed pause before Enter in `type` (default: 0.02)
 

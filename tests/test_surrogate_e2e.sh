@@ -1889,22 +1889,34 @@ test_audit_logs_allowed_type() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local audit_file marker
+  local audit_file marker target_alias
   audit_file="$(mktemp)"
   marker="AUDIT_ALLOW_${$}"
+  target_alias=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
 
-  SURROGATE_AUDIT_FILE="$audit_file" SURROGATE_LABEL=off "$SURROGATE" type "$TEST_SESSION" "echo $marker"
+  SURROGATE_AUDIT_FILE="$audit_file" \
+  SURROGATE_LABEL=off \
+  SURROGATE_WORK_ID="work-allow-${$}" \
+  SURROGATE_REASON="audit metadata test" \
+  ZMX_SESSION="$TEST_SESSION" \
+  "$SURROGATE" type "$TEST_SESSION" "echo $marker"
   sleep 1
 
   if grep -q '"action":"type"' "$audit_file" &&
      grep -q '"decision":"allow"' "$audit_file" &&
      grep -q "$TEST_SESSION" "$audit_file" &&
+     grep -q "\"target_alias\":\"${target_alias}\"" "$audit_file" &&
+     grep -q "\"actor_session\":\"${TEST_SESSION}\"" "$audit_file" &&
+     grep -q "\"actor_alias\":\"${target_alias}\"" "$audit_file" &&
+     grep -q '"work_id":"work-allow-' "$audit_file" &&
+     grep -q '"intent_reason":"audit metadata test"' "$audit_file" &&
+     grep -q '"repo":"surrogate"' "$audit_file" &&
      grep -q "echo $marker" "$audit_file"; then
-    pass "${FUNCNAME[0]} — allowed type action logged"
+    pass "${FUNCNAME[0]} — allowed type action logs causal metadata"
   else
     echo "    audit log contents:"
     sed 's/^/    /' "$audit_file"
-    fail "${FUNCNAME[0]} — allowed type action not logged correctly"
+    fail "${FUNCNAME[0]} — allowed type action metadata not logged correctly"
   fi
 }
 
@@ -1912,22 +1924,35 @@ test_audit_logs_blocked_send() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local audit_file output
+  local audit_file output target_alias
   audit_file="$(mktemp)"
-  output=$(SURROGATE_AUDIT_FILE="$audit_file" "$SURROGATE" send "$TEST_SESSION" C-c 2>&1 || true)
+  target_alias=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+  output=$(
+    SURROGATE_AUDIT_FILE="$audit_file" \
+    SURROGATE_WORK_ID="work-deny-${$}" \
+    SURROGATE_REASON="blocked send metadata test" \
+    ZMX_SESSION="$TEST_SESSION" \
+    "$SURROGATE" send "$TEST_SESSION" C-c 2>&1 || true
+  )
 
   if grep -q '"action":"send"' "$audit_file" &&
      grep -q '"decision":"deny"' "$audit_file" &&
      grep -q "$TEST_SESSION" "$audit_file" &&
      grep -q '"detail":"C-c"' "$audit_file" &&
+     grep -q "\"target_alias\":\"${target_alias}\"" "$audit_file" &&
+     grep -q "\"actor_session\":\"${TEST_SESSION}\"" "$audit_file" &&
+     grep -q "\"actor_alias\":\"${target_alias}\"" "$audit_file" &&
+     grep -q '"work_id":"work-deny-' "$audit_file" &&
+     grep -q '"intent_reason":"blocked send metadata test"' "$audit_file" &&
+     grep -q '"repo":"surrogate"' "$audit_file" &&
      echo "$output" | grep -qi 'dangerous control key'; then
-    pass "${FUNCNAME[0]} — blocked send action logged"
+    pass "${FUNCNAME[0]} — blocked send action logs causal metadata"
   else
     echo "    send output:"
     echo "$output" | sed 's/^/    /'
     echo "    audit log contents:"
     sed 's/^/    /' "$audit_file"
-    fail "${FUNCNAME[0]} — blocked send action not logged correctly"
+    fail "${FUNCNAME[0]} — blocked send action metadata not logged correctly"
   fi
 }
 

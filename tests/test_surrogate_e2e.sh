@@ -1761,6 +1761,104 @@ test_audit_logs_blocked_send() {
   fi
 }
 
+test_type_uses_single_tmux_invocation_for_text_and_enter() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmpbin audit_file tmux_log output
+  tmpbin="$(mktemp -d)"
+  audit_file="$(mktemp)"
+  tmux_log="$(mktemp)"
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  list)
+    printf 'session_name=test-surrogate-mock\tattached=true\tcreated_at=0\n'
+    ;;
+  history)
+    printf 'line one\nline two\n'
+    ;;
+  attach)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/tmux" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+log_file="$tmux_log"
+case "\${1:-}" in
+  has-session)
+    exit 1
+    ;;
+  new-session)
+    exit 0
+    ;;
+  display-message)
+    printf 'zmx\n'
+    exit 0
+    ;;
+  send-keys)
+    printf '%s\n' "\$*" >> "\$log_file"
+    if [[ "\$*" == *" Enter" ]]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/tmux"
+
+  output=$(
+    PATH="$tmpbin:/usr/bin:/bin" \
+    SURROGATE_AUDIT_FILE="$audit_file" \
+    SURROGATE_LABEL=off \
+    "$SURROGATE" type test-surrogate-mock "hello from test" 2>&1 || true
+  )
+
+  if [[ "$(wc -l < "$tmux_log")" -eq 1 ]] &&
+     grep -Fq 'send-keys -t _surr_test-surrogate-mock -l hello from test ; send-keys -t _surr_test-surrogate-mock Enter' "$tmux_log" &&
+     ! grep -q '"decision":"allow"' "$audit_file"; then
+    pass "${FUNCNAME[0]} — type uses one tmux invocation for text plus Enter and avoids false allow audit on failure"
+  else
+    echo "    surrogate output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    tmux log:"
+    sed 's/^/    /' "$tmux_log" 2>/dev/null || true
+    echo "    audit log:"
+    sed 's/^/    /' "$audit_file" 2>/dev/null || true
+    fail "${FUNCNAME[0]} — expected single tmux invocation for text plus Enter with no allow audit on failure"
+  fi
+}
+
+test_type_implementation_is_single_tmux_command_sequence() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local cmd_type_block tmux_count
+  cmd_type_block="$(sed -n '/^cmd_type()/,/^cmd_[a-z_].*()/p' "$SURROGATE")"
+  tmux_count="$(printf '%s\n' "$cmd_type_block" | grep -c 'tmux send-keys' || true)"
+
+  if [[ "$tmux_count" -eq 1 ]] &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'tmux send-keys -t "$bridge" -l "$text" \; send-keys -t "$bridge" Enter'; then
+    pass "${FUNCNAME[0]} — cmd_type uses a single tmux command sequence"
+  else
+    echo "    cmd_type block:"
+    printf '%s\n' "$cmd_type_block" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — cmd_type must not split text and Enter across separate tmux calls"
+  fi
+}
+
 test_error_missing_zmx() {
   # plumb:req-106648f1
   # plumb:req-f63f502d
@@ -2069,6 +2167,8 @@ run_test test_send_rejects_dangerous_control_keys
 run_test test_dcg_blocks_type_when_available
 run_test test_audit_logs_allowed_type
 run_test test_audit_logs_blocked_send
+run_test test_type_uses_single_tmux_invocation_for_text_and_enter
+run_test test_type_implementation_is_single_tmux_command_sequence
 run_test test_error_missing_zmx
 run_test test_error_missing_tmux
 run_test test_rename_kills_bridge

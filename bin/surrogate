@@ -423,8 +423,7 @@ cmd_type() {
 
     (
         flock 9
-        tmux send-keys -t "$bridge" -l "$text"
-        tmux send-keys -t "$bridge" Enter
+        tmux send-keys -t "$bridge" -l "$text" \; send-keys -t "$bridge" Enter
     ) 9>"$lock"
     audit_event "type" "$session" "allow" "$text"
 }

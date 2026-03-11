@@ -104,6 +104,8 @@ Surrogate stays ambiently available, but it no longer treats that as unlimited a
 Current built-in structural guardrails:
 
 - `type` normalizes embedded newlines to spaces and must actually submit, not just stage text in the target input
+- `type`, `send`, and `submit` reject self-targeting and tell you the current alias/session
+- `cull` rejects the current live session and any attached session with clients still present
 - `send` rejects `C-c`, `C-d`, and `C-z`
 - there is no global "disable guards" switch
 - there is no persistent unsafe mode
@@ -115,9 +117,6 @@ Surrogate also writes a deterministic audit trail for `type` and `send` actions:
 - default path: `/tmp/surrogate-audit.jsonl`
 - override path: `SURROGATE_AUDIT_FILE=/path/to/file.jsonl`
 - both allowed and blocked actions are logged
-- records include target alias, actor session/alias when available, repo, and optional causal metadata
-- `SURROGATE_WORK_ID=...` annotates a causal work ID
-- `SURROGATE_REASON=...` annotates an intent reason
 
 ### Auto-wrap all terminals in zmx
 
@@ -180,9 +179,16 @@ surrogate find "TODO" -n 500 -C 3       # deeper search with context lines
 ### Show sessions with snippets
 
 ```bash
-surrogate who                            # age, session name, last visible line
-surrogate who -n 20                      # sniff last 20 lines for snippet
+surrogate who                            # newest first: age, session name, last visible line
+surrogate who --recent 20                # show the 20 most recent sessions
+surrogate who --recent 2h                # only sessions seen in the last 2 hours
+surrogate who --project surrogate        # filter by visible repo basename hint
+surrogate who --cwd /home/raw/Documents/GitHub/surrogate
+surrogate who --json                     # machine-readable output for agents/scripts
+surrogate who -n 20                      # inspect more recent history for snippet/hints
 ```
+
+`--project` and `--cwd` are deterministic visibility filters derived from recent visible output. They are convenient hints, not authoritative process cwd introspection.
 
 ### Show attached sessions
 
@@ -190,6 +196,17 @@ surrogate who -n 20                      # sniff last 20 lines for snippet
 surrogate active                         # only sessions with clients attached
 surrogate active --all                   # include non-empty detached sessions
 ```
+
+### Show stale detached sessions
+
+```bash
+surrogate stale                          # oldest detached sessions older than 24h
+surrogate stale --older-than 72          # oldest detached sessions older than 72h
+surrogate stale --older-than 24 --filter "2026-03-08"
+surrogate stale --older-than 24 --limit 20
+```
+
+`stale` is ordered oldest-first.
 
 ### Batch read all sessions
 
@@ -204,6 +221,19 @@ surrogate peek -n 2 --filter "error"
 ```bash
 surrogate rename <old-session> <new-name>
 ```
+
+### Cull stale or explicit sessions
+
+`zmx` remains the source of truth. `surrogate cull` delegates the kill to `zmx kill`, then removes surrogate’s bridge/alias/lock/watermark plumbing for that session.
+
+```bash
+surrogate cull sleepy-otter
+surrogate cull --stale --older-than 48
+surrogate cull --stale --older-than 24 --filter "2026-03-08" --dry-run
+surrogate cull --stale --older-than 24 --limit 10
+```
+
+Batch stale culls are ordered oldest-first.
 
 ### Type text + Enter
 
@@ -226,6 +256,8 @@ If a prompt is visibly staged and just needs the missing Enter, the obvious repa
 ```bash
 surrogate submit my-session
 ```
+
+If the target resolves to your current live zmx session, surrogate refuses and tells you who you are instead of typing into itself.
 
 ### Send special keys
 
@@ -266,6 +298,8 @@ surrogate cleanup               # remove bridges for dead zmx sessions
 surrogate cleanup --all         # remove all bridges
 ```
 
+Bridge cleanup only touches tmux plumbing. Session culling uses `zmx kill` and is handled separately by `surrogate cull`.
+
 ## Special keys reference
 
 | Key | Description |
@@ -303,12 +337,12 @@ surrogate send my-session Escape ":wq" Enter    # save and quit
 surrogate submit my-session                     # submit staged prompt
 ```
 
-### Agent self-talk (strange loop)
+### Self-target guard
 
-An AI agent can send input to its own session — but must delay it since it can't type while generating:
+Surrogate refuses to type into the current live session. If you are unsure which session you are in:
 
 ```bash
-nohup bash -c 'sleep 10 && surrogate type MY_SESSION "banana"' &
+surrogate whoami
 ```
 
 ### Automation loop
@@ -338,17 +372,18 @@ These are enforced by automated tests and must hold for every change:
 | **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
 | **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no heuristics, no agent-type guessing |
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
-| **Security floor** | `type` normalizes embedded newlines to spaces and must actually submit, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
+| **Security floor** | `type` normalizes embedded newlines to spaces and must actually submit, self-targeted `type`/`send`/`submit` are rejected with identity context, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
 | **Security overhead tracked** | The test harness reports baseline vs guarded `type` latency as a metric, not a pass/fail gate |
 | **Audit trail** | `type` and `send` append JSONL audit records for both allowed and blocked actions |
 
 ## Tests
 
 ```bash
-bash tests/test_surrogate_e2e.sh
+bash tests/test_surrogate_e2e.sh         # fast smoke suite (default)
+bash tests/test_surrogate_e2e.sh --full  # complete suite
 ```
 
-End-to-end tests: functional tests (list, type, send, read, wait, find, who, active, peek, rename, bridge creation/reuse, cleanup, status, concurrent serialization, input validation, error handling) + design invariant tests.
+The default smoke run covers the core end-to-end paths and safety regressions quickly. Use `--full` for the complete functional and invariant suite.
 
 ## Uninstall
 

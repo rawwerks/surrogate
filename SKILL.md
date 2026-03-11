@@ -20,13 +20,15 @@ Surrogate is intentionally deterministic and does not offer unlimited authority 
 Current built-in guardrails:
 
 - `surrogate type` normalizes embedded newlines to spaces and must actually submit, not just stage text
+- `surrogate type`, `surrogate send`, and `surrogate submit` reject self-targeting and tell you the current alias/session
+- `surrogate cull` rejects the current live session and any attached session with clients still present
 - `surrogate send` rejects `C-c`, `C-d`, and `C-z`
 - there is no global guard-disable mode
 - there is no persistent unsafe mode
 
 If DCG is installed, `surrogate type` may also be blocked by DCG for destructive command-like payloads.
 
-Surrogate also writes JSONL audit records for `type` and `send` actions. By default this goes to `/tmp/surrogate-audit.jsonl`, and it can be overridden with `SURROGATE_AUDIT_FILE`. Records include target alias, actor session/alias when available, repo, and optional `SURROGATE_WORK_ID` / `SURROGATE_REASON` metadata.
+Surrogate also writes JSONL audit records for `type` and `send` actions. By default this goes to `/tmp/surrogate-audit.jsonl`, and it can be overridden with `SURROGATE_AUDIT_FILE`.
 
 ## Session Aliases
 
@@ -61,10 +63,14 @@ surrogate find "TODO" -n 500 -C 3
 ### Show all sessions with snippets
 
 ```bash
-surrogate who [-n LINES]
-# Age, session name, last visible line from each session
+surrogate who [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
+# Newest first, with age, session name, last visible line, and optional filters
 surrogate who
-surrogate who -n 20   # sniff last 20 lines for snippet
+surrogate who --recent 20
+surrogate who --project surrogate
+surrogate who --cwd /home/raw/Documents/GitHub/surrogate
+surrogate who --json
+surrogate who -n 20   # inspect more history for snippet and path hints
 ```
 
 ### Show attached sessions
@@ -75,6 +81,17 @@ surrogate active [--all]
 surrogate active
 surrogate active --all   # include non-empty detached sessions
 ```
+
+### Show stale detached sessions
+
+```bash
+surrogate stale [--older-than HOURS] [--filter PATTERN]
+surrogate stale
+surrogate stale --older-than 72
+surrogate stale --older-than 24 --limit 20
+```
+
+`stale` returns the oldest matching detached sessions first.
 
 ### Batch read all sessions
 
@@ -98,6 +115,16 @@ surrogate rename <old-session> <new-name>
 surrogate alias <session>
 ```
 
+### Cull sessions
+
+`zmx` is still the source of truth. `surrogate cull` kills the zmx session and then cleans surrogate’s own bridge/alias/lock/watermark state.
+
+```bash
+surrogate cull <session>...
+surrogate cull --stale [--older-than HOURS] [--filter PATTERN] [--dry-run]
+surrogate cull --stale --older-than 24 --limit 10
+```
+
 ### Type text + Enter (most common)
 
 ```bash
@@ -105,7 +132,7 @@ surrogate type <session> "some text"
 # <session> can be an alias: surrogate type robo-quokka "some text"
 ```
 
-Keep `type` payloads single-line. Multiline/script payloads are reserved for direct human control. A successful `type` should correspond to an actual submitted prompt, not staged input.
+`type` auto-normalizes long prose by flattening embedded newlines to spaces and then submitting once. This is meant for conversational prompts, not scripts. A successful `type` should correspond to an actual submitted prompt, not staged input.
 
 If the target TUI needs a slightly different cadence, `type` uses a fixed submit pause that can be configured via `SURROGATE_TYPE_ENTER_DELAY_SECS`.
 
@@ -148,6 +175,8 @@ surrogate cleanup          # remove bridges for dead zmx sessions
 surrogate cleanup --all    # remove ALL bridges
 ```
 
+Bridge cleanup does not remove zmx sessions. Use `surrogate cull` for that.
+
 ### Show bridge health
 
 ```bash
@@ -174,11 +203,12 @@ surrogate send my-session "i"  # Insert mode
 surrogate send my-session "// new comment" Escape ":wq" Enter
 ```
 
-### Self-talk (agent sends input to its own session)
+### Self-target guard
+
+Surrogate refuses to send input to the current live session. If you need to confirm where you are, ask first:
 
 ```bash
-# Must use delayed send since agent can't type while generating
-nohup bash -c 'sleep 10 && surrogate type MY_SESSION "banana"' &
+surrogate whoami
 ```
 
 ### Inter-agent communication
@@ -213,7 +243,6 @@ Since `surrogate send` passes through to tmux send-keys:
 - Communicating with other AI agents running in terminal sessions
 - Automating interactive terminal workflows
 - Testing TUI applications end-to-end
-- The "strange loop" -- talking to yourself
 
 ## When NOT to Use Surrogate
 
@@ -221,6 +250,7 @@ Since `surrogate send` passes through to tmux send-keys:
 - For file I/O -- use Read/Write/Edit tools
 - When you have a proper API -- prefer APIs over keystroke injection
 - For sending messages between agents -- prefer Agent Mail for structured communication. Use surrogate only when you need to type into the agent's actual TUI.
+- For your current live session -- surrogate rejects self-targeting; use `surrogate whoami` if the agent seems confused about its identity.
 
 ## Setup
 

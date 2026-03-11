@@ -42,8 +42,10 @@ The following rules are part of surrogate itself and must apply even when DCG is
 2. The `type` delivery path must include a configurable fixed submit pause with a sensible default so Enter lands reliably in agent TUIs without introducing heuristics.
 3. If `type` transport fails after staging text, surrogate must provide one obvious repair path that agents can invoke directly.
 4. The `send` command must reject dangerous control keys: `C-c`, `C-d`, and `C-z`.
-5. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
-6. Surrogate must not implement a persistent unsafe mode.
+5. `type`, `send`, and `submit` must reject targeting the current live session. The error must clearly state the current alias and session name so the caller can re-orient.
+6. `cull` must reject the current live session and any session that still has attached clients.
+7. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
+8. Surrogate must not implement a persistent unsafe mode.
 
 These rules define the minimum safety floor. Opting out of optional tools must never disable them.
 
@@ -88,18 +90,10 @@ The audit log requirements for v0 are:
    - timestamp
    - action (`type` or `send`)
    - target session
-   - target alias
    - decision (`allow` or `deny`)
    - detail payload or key sequence
-   - actor session when available
-   - actor alias when available
-   - repo name
-   - work ID when provided
-   - intent reason when provided
 4. The default audit log path must be `/tmp/surrogate-audit.jsonl`.
 5. The audit log path must be overrideable via `SURROGATE_AUDIT_FILE`.
-6. `SURROGATE_WORK_ID` may annotate audit records with a causal work identifier.
-7. `SURROGATE_REASON` may annotate audit records with an intent reason.
 
 Audit logging is for observability and incident review. It must not change command behavior except for writing the log entry.
 
@@ -125,13 +119,13 @@ The `list` command must print all zmx sessions by delegating directly to `zmx li
 
 ### send
 
-The `send` command must accept a session name and one or more tmux send-keys arguments. It must create a bridge lazily if one does not exist, update the watermark for wait tracking, and serialize concurrent sends via flock.
+The `send` command must accept a session name and one or more tmux send-keys arguments. It must create a bridge lazily if one does not exist, update the watermark for wait tracking, and serialize concurrent sends via flock. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
 
 ### type
 
-The `type` command must accept a session name and a text string. It must type the literal text followed by Enter. A successful `type` must correspond to an actual submission, not a staged-but-unentered prompt. The delivery path must remain deterministic and include any fixed submit pause needed to make Enter land reliably in agent TUIs. The submit pause must be configurable with a sensible default. If transport fails after the text may already be staged, the error must point to a single obvious recovery command. It must create a bridge lazily, update the watermark, and serialize via flock.
+The `type` command must accept a session name and a text string. It must type the literal text followed by Enter. A successful `type` must correspond to an actual submission, not a staged-but-unentered prompt. The delivery path must remain deterministic and include any fixed submit pause needed to make Enter land reliably in agent TUIs. The submit pause must be configurable with a sensible default. If transport fails after the text may already be staged, the error must point to a single obvious recovery command. It must create a bridge lazily, update the watermark, and serialize via flock. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
 
-The `submit` command must accept a session name (or alias) and press Enter for a staged prompt. It exists as the deterministic one-command repair path if a prompt is visibly staged and needs to be submitted.
+The `submit` command must accept a session name (or alias) and press Enter for a staged prompt. It exists as the deterministic one-command repair path if a prompt is visibly staged and needs to be submitted. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
 
 ### read
 
@@ -153,6 +147,10 @@ The `who` command must accept an optional `-n LINES` flag (default 10) controlli
 
 The `active` command must accept an optional `--all` flag. By default, it must show only sessions with attached clients (clients > 0). With `--all`, it must also include detached sessions that have non-empty history.
 
+### stale
+
+The `stale` command must list detached zmx sessions older than an `--older-than HOURS` threshold (default 24). Age must be derived from the zmx socket mtime, consistent with `who`. It may accept `--filter PATTERN` to match against alias, session name, or snippet, and `--limit N` to cap the result count. Results must be ordered oldest-first. It must not kill anything.
+
 ### peek
 
 The `peek` command must accept optional `-n LINES` (default 5) and `--filter PATTERN` flags. It must print the last N non-blank lines from every session. If `--filter` is provided, only sessions whose output matches the pattern must be shown. The total count of peeked sessions must be printed at the end. The `-n` flag must be validated as a non-negative integer.
@@ -169,9 +167,13 @@ The `alias` command must accept a session name (or alias) and print its determin
 
 The `whoami` command must print the alias and zmx session name of the current surrogate session (the zmx session this terminal is running in). It must detect the current session by checking the zmx environment or parent process. It must support `-h`/`--help` and reject extra positional arguments with `usage: surrogate whoami`. For a live current session, it must deterministically compute the alias rather than printing `unknown`. If `ZMX_SESSION` is set but not present in `zmx list`, `whoami` must reject it explicitly as a stale or leaked environment value instead of treating it as a live session.
 
+### cull
+
+The `cull` command must remove zmx sessions, with zmx remaining the source of truth. Explicit `cull <session>...` must accept session names or aliases, reject the current live session, and reject sessions with attached clients. Batch `cull --stale` must select from the same detached/old candidate set as `stale`, support `--older-than HOURS`, may accept `--filter PATTERN`, may accept `--limit N`, and may support `--dry-run`. Batch results must be ordered oldest-first. Successful culls must call `zmx kill` and then clean surrogate’s own bridge, alias, lock, and watermark state for the culled session.
+
 ### Session Resolution
 
-All commands that accept a session name must also accept an alias. Session resolution must first check if the argument is a known alias and resolve it to the actual session name. If not an alias, it must be treated as a literal session name. This applies to: send, type, read, wait, bridge, rename, and alias commands.
+All commands that accept a session name must also accept an alias. Session resolution must first check if the argument is a known alias and resolve it to the actual session name. If not an alias, it must be treated as a literal session name. This applies to: send, type, read, wait, bridge, rename, alias, and explicit cull commands.
 
 ### list (alias display)
 
@@ -179,7 +181,16 @@ The `list` command must include the deterministic alias for each session alongsi
 
 ### who (alias display)
 
-The `who` command must include the alias for each session in its output.
+The `who` command must include the alias for each session in its output. It must sort sessions with the most recent sessions first. It must support:
+
+- `-n LINES` to control how much recent history is inspected for the visible snippet
+- `--recent N` to limit to the N most recent sessions
+- `--recent Ns|Nm|Nh|Nd` to filter sessions by maximum age
+- `--project NAME` to filter using the visible project basename derived from recent output
+- `--cwd PATH` to filter using the visible path prefix derived from recent output
+- `--json` to emit machine-readable session metadata
+
+The `--project` and `--cwd` filters must remain deterministic and derive only from recent visible output. They must not depend on agent-specific UI parsing or machine-learning classification.
 
 ### bridge
 
@@ -204,6 +215,8 @@ A bridge is a tmux session named `_surr_<zmx-session>` that runs `zmx attach <se
 ## Input Validation
 
 All numeric flags (`-n`, `-C`, `-t`) must be validated as non-negative integers before being passed to internal commands like `tail` or `grep`. Invalid values must produce a clear error message (`'<value>' is not a valid number`) and exit 1. This prevents leaking internal tool errors (e.g., 76 `tail: invalid number` messages) to the user.
+
+The `--recent` flag on `who` must accept either a non-negative integer count or a duration in `Ns`, `Nm`, `Nh`, or `Nd` form. Invalid values must produce a clear error message.
 
 ---
 

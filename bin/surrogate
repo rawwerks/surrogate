@@ -21,6 +21,10 @@ require_seconds() {
     [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "'$1' is not a valid seconds value"
 }
 
+require_hours() {
+    [[ "$1" =~ ^[0-9]+$ ]] || die "'$1' is not a valid hour count"
+}
+
 check_deps() {
     command -v zmx >/dev/null 2>&1 || die "zmx not found. Install zmx first."
     command -v tmux >/dev/null 2>&1 || die "tmux not found. Install with your package manager."
@@ -32,6 +36,23 @@ session_exists() {
 
 _session_names() {
     zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p'
+}
+
+session_clients() {
+    local target="$1"
+    local line session clients
+    while IFS= read -r line; do
+        session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
+        [[ "$session" == "$target" ]] || continue
+        clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
+        echo "${clients:-0}"
+        return 0
+    done < <(zmx list 2>/dev/null)
+    return 1
+}
+
+bridge_exists() {
+    tmux has-session -t "$(bridge_name "$1")" 2>/dev/null
 }
 
 _search() {
@@ -70,6 +91,14 @@ current_repo_name() {
         basename "$git_root"
     else
         basename "$PWD"
+    fi
+}
+
+json_or_null() {
+    if [[ -n "$1" ]]; then
+        printf '"%s"' "$(json_escape "$1")"
+    else
+        printf 'null'
     fi
 }
 
@@ -245,6 +274,161 @@ resolve_session() {
     die "session '$input' not found (not a name or alias)"
 }
 
+current_live_session() {
+    local session="${ZMX_SESSION:-}"
+    [[ -n "$session" ]] || return 1
+    session_exists "$session" || return 1
+    echo "$session"
+}
+
+guard_self_target() {
+    local target_session="$1"
+    local current_session=""
+    current_session="$(current_live_session 2>/dev/null || true)"
+    [[ -n "$current_session" ]] || return 0
+    [[ "$current_session" != "$target_session" ]] || {
+        _build_alias_cache
+        local current_alias="${_ALIAS_CACHE[$current_session]:-$(session_alias "$current_session")}"
+        echo "refusing to message your own live session. You are $current_alias ($current_session). Use direct input in this session instead."
+        return 1
+    }
+}
+
+guard_self_cull() {
+    local target_session="$1"
+    local current_session=""
+    current_session="$(current_live_session 2>/dev/null || true)"
+    [[ -n "$current_session" ]] || return 0
+    [[ "$current_session" != "$target_session" ]] || {
+        _build_alias_cache
+        local current_alias="${_ALIAS_CACHE[$current_session]:-$(session_alias "$current_session")}"
+        echo "refusing to cull your own live session. You are $current_alias ($current_session). Detach or close it first."
+        return 1
+    }
+}
+
+zmx_socket_dir() {
+    echo "/run/user/$(id -u)/zmx"
+}
+
+session_age_secs() {
+    local session="$1"
+    local socket_dir socket_path now mtime
+    socket_dir="$(zmx_socket_dir)"
+    socket_path="$socket_dir/$session"
+    [[ -e "$socket_path" ]] || {
+        echo 0
+        return 0
+    }
+    now="$(date +%s)"
+    mtime="$(stat -c %Y "$socket_path" 2>/dev/null || echo "$now")"
+    if [[ "$mtime" -gt "$now" ]]; then
+        echo 0
+    else
+        echo $(( now - mtime ))
+    fi
+}
+
+format_age_secs() {
+    local age="$1"
+    if [[ "$age" -lt 60 ]]; then
+        echo "${age}s"
+    elif [[ "$age" -lt 3600 ]]; then
+        echo "$((age / 60))m"
+    elif [[ "$age" -lt 86400 ]]; then
+        echo "$((age / 3600))h"
+    else
+        echo "$((age / 86400))d"
+    fi
+}
+
+session_snippet() {
+    local session="$1"
+    local lines="${2:-5}"
+    zmx history "$session" 2>/dev/null | tail -n "$lines" | sed '/^[[:space:]]*$/d' | tail -1 | tr '\t' ' ' | cut -c1-60
+}
+
+remove_custom_alias() {
+    local session="$1"
+    [[ -f "$ALIAS_FILE" ]] || return 0
+    local tmp
+    tmp="$(mktemp)"
+    awk -F= -v target="$session" '$1 != target { print $0 }' "$ALIAS_FILE" > "$tmp"
+    mv "$tmp" "$ALIAS_FILE"
+    _ALIAS_CACHE_BUILT=""
+}
+
+remove_session_plumbing() {
+    local session="$1"
+    tmux kill-session -t "$(bridge_name "$session")" 2>/dev/null || true
+    rm -f "$(lock_file "$session")" "$(watermark_file "$session")"
+    remove_custom_alias "$session"
+}
+
+stale_candidates() {
+    local older_than_hours="$1"
+    local filter="${2:-}"
+    local limit="${3:-0}"
+    local cutoff_secs=$((older_than_hours * 3600))
+    local current_session=""
+    local line session clients age alias snippet
+    local rows=""
+
+    current_session="$(current_live_session 2>/dev/null || true)"
+    _build_alias_cache
+
+    rows="$(
+        while IFS= read -r line; do
+            session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
+            clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
+            [[ -n "$session" ]] || continue
+            if bridge_exists "$session" && [[ "${clients:-0}" -gt 0 ]]; then
+                clients=$((clients - 1))
+            fi
+            [[ "${clients:-0}" -eq 0 ]] || continue
+            [[ "$session" != "$current_session" ]] || continue
+            age="$(session_age_secs "$session")"
+            [[ "$age" -ge "$cutoff_secs" ]] || continue
+            alias="${_ALIAS_CACHE[$session]:-$(session_alias "$session")}"
+            snippet="$(session_snippet "$session" 5)"
+            if [[ -n "$filter" ]]; then
+                if ! printf '%s\n' "$alias $session $snippet" | _search -qi -- "$filter" 2>/dev/null; then
+                    continue
+                fi
+            fi
+            printf '%s\t%s\t%s\t%s\n' "$age" "$alias" "$session" "$snippet"
+        done < <(zmx list 2>/dev/null) | sort -rn -k1,1
+    )"
+
+    [[ -n "$rows" ]] || return 0
+    if [[ "$limit" -gt 0 ]]; then
+        printf '%s\n' "$rows" | head -n "$limit"
+    else
+        printf '%s\n' "$rows"
+    fi
+}
+
+ensure_cullable_session() {
+    local session="$1"
+    local guard_reason=""
+    local clients=""
+    if ! guard_reason="$(guard_self_cull "$session")"; then
+        echo "$guard_reason"
+        return 1
+    fi
+    clients="$(session_effective_clients "$session")"
+    if [[ "${clients:-0}" -gt 0 ]]; then
+        echo "session '$session' has ${clients} client(s); detach it before culling"
+        return 1
+    fi
+}
+
+cull_session() {
+    local session="$1"
+    zmx kill "$session" >/dev/null 2>&1 || die "failed to cull session '$session'"
+    remove_session_plumbing "$session"
+}
+
 # --- remaining helpers ---
 
 usage() {
@@ -255,6 +439,7 @@ Usage: surrogate <command> [args]
 
 Commands:
   list                          List available zmx sessions (with aliases)
+  stale [--older-than HOURS]    List oldest detached stale zmx sessions (default: 24h)
   send  <session> [keys...]     Send tmux send-keys style keystrokes
   submit <session>              Press Enter for a staged prompt
   type  <session> <text>        Type literal text followed by Enter
@@ -262,13 +447,16 @@ Commands:
   wait  <session> <pattern> [-t TIMEOUT]
                                 Wait for regex pattern in new output (default: 30s)
   find  <query> [-n LINES]      Search all sessions for text (grep, default: last 200 lines)
-  who   [-n LINES]              Show sessions with age and last visible line
+  who   [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
+                                Show sessions with age and last visible line
   active [--all]                Show attached sessions (--all includes non-empty detached)
   peek  [-n LINES] [--filter PATTERN]
                                 Batch read last N lines from all sessions (default: 5)
   alias <session>               Show the alias for a session
   whoami                        Show current session name and alias
   rename <session> <new-alias>  Set a custom alias (session ID stays the same)
+  cull  <session>...            Cull detached zmx sessions by name or alias
+  cull  --stale [options]       Cull oldest detached stale zmx sessions in batch
   bridge <session>              Pre-create tmux bridge for a zmx session
   cleanup [--all|--dead]        Remove stale or all bridge sessions
   status                        Show bridge health
@@ -281,8 +469,6 @@ Environment:
   SURROGATE_LABEL=off      No prefix
   SURROGATE_LABEL=verbose  Include process name, cwd, PID in prefix
   SURROGATE_AUDIT_FILE     Audit log path (default: /tmp/surrogate-audit.jsonl)
-  SURROGATE_WORK_ID        Optional causal work ID for audit records
-  SURROGATE_REASON         Optional intent reason for audit records
   SURROGATE_TYPE_ENTER_DELAY_SECS
                           Fixed pause before Enter in `type` (default: 0.02)
 
@@ -293,6 +479,11 @@ Special keys (for send):
 
 Examples:
   surrogate list
+  surrogate stale --older-than 72 --limit 20
+  surrogate cull sleepy-otter
+  surrogate cull --stale --older-than 48 --filter '2026-03-08' --limit 10
+  surrogate who --recent 2h --project surrogate
+  surrogate who --cwd /home/raw/Documents/GitHub/surrogate --json
   surrogate submit lazy-sheep
   surrogate type lazy-sheep "echo hello"
   surrogate type 2026-03-08_15-07-15_EDT-132628 "echo hello"
@@ -318,6 +509,77 @@ watermark_file() {
 
 line_count() {
     zmx history "$1" 2>/dev/null | wc -l
+}
+
+session_age_seconds() {
+    local session="$1"
+    local zmx_dir="/run/user/$(id -u)/zmx"
+    if [[ -e "$zmx_dir/$session" ]]; then
+        local now mtime
+        now="$(date +%s)"
+        mtime="$(stat -c %Y "$zmx_dir/$session" 2>/dev/null || echo 0)"
+        echo $(( now - mtime ))
+    else
+        echo 2147483647
+    fi
+}
+
+format_age() {
+    local age="$1"
+    if [[ "$age" -lt 60 ]]; then printf '%ss' "$age"
+    elif [[ "$age" -lt 3600 ]]; then printf '%sm' $(( age / 60 ))
+    elif [[ "$age" -lt 86400 ]]; then printf '%sh' $(( age / 3600 ))
+    else printf '%sd' $(( age / 86400 )); fi
+}
+
+session_recent_history() {
+    local session="$1" lines="$2"
+    if [[ "$lines" -eq 0 ]]; then
+        return 0
+    fi
+    zmx history "$session" 2>/dev/null | tail -n "$lines"
+}
+
+visible_snippet() {
+    local text="$1"
+    printf '%s' "$text" | sed '/^[[:space:]]*$/d' | tail -1 | tr '\t\r\n' '   ' | cut -c1-60
+}
+
+visible_path_hint() {
+    local text="$1"
+    printf '%s\n' "$text" |
+        grep -oE '((~|/)[^[:space:]]*/[^[:space:]]+)' 2>/dev/null |
+        sed 's#[,;:.)\]}]+$##' |
+        tail -1
+}
+
+project_from_path() {
+    [[ -n "${1:-}" ]] || return 0
+    basename "${1%/}"
+}
+
+parse_recent_filter() {
+    local raw="$1"
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        printf 'count:%s\n' "$raw"
+        return 0
+    fi
+
+    if [[ "$raw" =~ ^([0-9]+)([smhd])$ ]]; then
+        local value="${BASH_REMATCH[1]}"
+        local unit="${BASH_REMATCH[2]}"
+        local seconds="$value"
+        case "$unit" in
+            s) ;;
+            m) seconds=$(( value * 60 )) ;;
+            h) seconds=$(( value * 3600 )) ;;
+            d) seconds=$(( value * 86400 )) ;;
+        esac
+        printf 'age:%s\n' "$seconds"
+        return 0
+    fi
+
+    die "'$raw' is not a valid recent filter (use N or Ns/Nm/Nh/Nd)"
 }
 
 update_watermark() {
@@ -349,6 +611,16 @@ ensure_bridge() {
     sleep 1
 }
 
+session_effective_clients() {
+    local session="$1"
+    local clients
+    clients="$(session_clients "$session" 2>/dev/null || echo 0)"
+    if bridge_exists "$session" && [[ "${clients:-0}" -gt 0 ]]; then
+        clients=$((clients - 1))
+    fi
+    echo "${clients:-0}"
+}
+
 # --- subcommands ---
 
 cmd_list() {
@@ -359,6 +631,36 @@ cmd_list() {
     done < <(_session_names)
 }
 
+cmd_stale() {
+    check_deps
+    local older_than_hours=24
+    local filter=""
+    local limit=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --older-than) [[ $# -ge 2 ]] || die "--older-than requires an hour count"; require_hours "$2"; older_than_hours="$2"; shift 2 ;;
+            --filter) [[ $# -ge 2 ]] || die "--filter requires a pattern"; filter="$2"; shift 2 ;;
+            --limit) [[ $# -ge 2 ]] || die "--limit requires a count"; require_int "$2"; limit="$2"; shift 2 ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+
+    local rows=""
+    rows="$(stale_candidates "$older_than_hours" "$filter" "$limit")"
+    if [[ -z "$rows" ]]; then
+        echo "no stale sessions older than ${older_than_hours}h"
+        return 0
+    fi
+
+    printf "%-4s %-18s %-42s %s\n" "AGE" "ALIAS" "SESSION" "SNIPPET"
+    while IFS=$'\t' read -r age alias session snippet; do
+        [[ -n "$session" ]] || continue
+        printf "%-4s %-18s %-42s %s\n" "$(format_age_secs "$age")" "$alias" "$session" "$snippet"
+    done <<< "$rows"
+    echo "--- $(printf '%s\n' "$rows" | sed '/^$/d' | wc -l) stale session(s) older than ${older_than_hours}h ---"
+}
+
 cmd_send() {
     check_deps
     [[ $# -ge 1 ]] || die "usage: surrogate send <session> [keys...]"
@@ -367,6 +669,10 @@ cmd_send() {
     shift
     local send_detail="$*"
     local guard_reason=""
+    if ! guard_reason="$(guard_self_target "$session")"; then
+        audit_event "send" "$session" "deny" "$send_detail" "$guard_reason"
+        die "$guard_reason"
+    fi
     if ! guard_reason="$(guard_send_keys "$@")"; then
         audit_event "send" "$session" "deny" "$send_detail" "$guard_reason"
         die "$guard_reason"
@@ -433,6 +739,10 @@ cmd_type() {
     [[ -n "$text" ]] || die "type text must not be empty"
     require_seconds "$SURROGATE_TYPE_ENTER_DELAY_SECS"
     local guard_reason=""
+    if ! guard_reason="$(guard_self_target "$session")"; then
+        audit_event "type" "$session" "deny" "$original_text" "$guard_reason"
+        die "$guard_reason"
+    fi
     if ! guard_reason="$(scan_with_dcg "$text")"; then
         audit_event "type" "$session" "deny" "$original_text" "$guard_reason"
         die "$guard_reason"
@@ -561,46 +871,113 @@ cmd_who() {
     _build_alias_cache
 
     local lines=10
+    local json=0
+    local recent_count=""
+    local recent_age_max=""
+    local project_filter=""
+    local cwd_filter=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            --project) [[ $# -ge 2 ]] || die "--project requires a name"; project_filter="$2"; shift 2 ;;
+            --cwd) [[ $# -ge 2 ]] || die "--cwd requires a path"; cwd_filter="$2"; shift 2 ;;
+            --recent)
+                [[ $# -ge 2 ]] || die "--recent requires a value"
+                local recent_mode
+                recent_mode="$(parse_recent_filter "$2")"
+                case "$recent_mode" in
+                    count:*) recent_count="${recent_mode#count:}" ;;
+                    age:*) recent_age_max="${recent_mode#age:}" ;;
+                esac
+                shift 2
+                ;;
             *)  die "unknown flag: $1" ;;
         esac
     done
 
-    local total=0
+    local records=""
     while IFS= read -r line; do
         local session clients
         session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
         clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
         [[ -z "$session" ]] && continue
+        [[ -z "$clients" ]] && clients=0
 
-        # Socket age
-        local zmx_dir="/run/user/$(id -u)/zmx"
-        local ago="?"
-        if [[ -e "$zmx_dir/$session" ]]; then
-            local now mtime age
-            now="$(date +%s)"
-            mtime="$(stat -c %Y "$zmx_dir/$session" 2>/dev/null || echo 0)"
-            age=$(( now - mtime ))
-            if [[ $age -lt 60 ]]; then ago="${age}s"
-            elif [[ $age -lt 3600 ]]; then ago="$((age / 60))m"
-            elif [[ $age -lt 86400 ]]; then ago="$((age / 3600))h"
-            else ago="$((age / 86400))d"; fi
+        local age_seconds
+        age_seconds="$(session_age_seconds "$session")"
+        if [[ -n "$recent_age_max" && "$age_seconds" -gt "$recent_age_max" ]]; then
+            continue
         fi
+
+        local ago
+        ago="$(format_age "$age_seconds")"
 
         local attached=""
         [[ "$clients" -gt 0 ]] && attached="*"
 
-        # Last N non-blank lines as snippet
-        local snippet
-        snippet="$(zmx history "$session" 2>/dev/null | tail -n "$lines" | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-60)"
+        local history
+        history="$(session_recent_history "$session" "$lines")"
 
-        printf "%-4s %-18s %-42s %s\n" "${ago}${attached}" "${_ALIAS_CACHE[$session]}" "$session" "$snippet"
-        total=$((total + 1))
+        local snippet
+        snippet="$(visible_snippet "$history")"
+
+        local cwd_hint=""
+        cwd_hint="$(visible_path_hint "$history")"
+        local project_hint=""
+        project_hint="$(project_from_path "$cwd_hint")"
+
+        if [[ -n "$cwd_filter" && ( -z "$cwd_hint" || "$cwd_hint" != "$cwd_filter"* ) ]]; then
+            continue
+        fi
+
+        if [[ -n "$project_filter" && "$project_hint" != "$project_filter" ]]; then
+            continue
+        fi
+
+        records+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+            "$age_seconds" "$ago" "$attached" "$clients" "${_ALIAS_CACHE[$session]}" \
+            "$session" "$snippet" "$cwd_hint" "$project_hint")
+        records+=$'\n'
     done < <(zmx list 2>/dev/null)
 
-    echo "── $total sessions (* = attached) ──"
+    local sorted
+    sorted="$(printf '%s' "$records" | sed '/^$/d' | sort -t $'\t' -k1,1n -k6,6)"
+    if [[ -n "$recent_count" ]]; then
+        sorted="$(printf '%s\n' "$sorted" | head -n "$recent_count")"
+    fi
+
+    local total=0
+    [[ -n "$sorted" ]] && total="$(printf '%s\n' "$sorted" | sed '/^$/d' | wc -l)"
+
+    if [[ "$json" -eq 1 ]]; then
+        printf '{"count":%s,"recent_first":true,"sessions":[' "$total"
+        local first=1
+        while IFS=$'\t' read -r age_seconds ago attached clients alias session snippet cwd_hint project_hint; do
+            [[ -z "$session" ]] && continue
+            [[ "$first" -eq 1 ]] || printf ','
+            first=0
+            printf '{"alias":"%s","session":"%s","clients":%s,"attached":%s,"age":"%s","age_seconds":%s,"snippet":"%s","cwd_hint":%s,"project_hint":%s}' \
+                "$(json_escape "$alias")" \
+                "$(json_escape "$session")" \
+                "$clients" \
+                "$([[ -n "$attached" ]] && printf 'true' || printf 'false')" \
+                "$(json_escape "$ago")" \
+                "$age_seconds" \
+                "$(json_escape "$snippet")" \
+                "$(json_or_null "$cwd_hint")" \
+                "$(json_or_null "$project_hint")"
+        done <<< "$sorted"
+        echo ']}'
+        return 0
+    fi
+
+    while IFS=$'\t' read -r _age_seconds ago attached _clients alias session snippet _cwd_hint _project_hint; do
+        [[ -z "$session" ]] && continue
+        printf "%-4s %-18s %-42s %s\n" "${ago}${attached}" "$alias" "$session" "$snippet"
+    done <<< "$sorted"
+
+    echo "── $total sessions (* = attached, newest first) ──"
 }
 
 cmd_active() {
@@ -761,6 +1138,76 @@ cmd_rename() {
     echo "renamed: $old_alias -> $new_alias  ($session)"
 }
 
+cmd_cull() {
+    check_deps
+    local mode="explicit"
+    local older_than_hours=24
+    local filter=""
+    local limit=0
+    local dry_run=0
+    local -a requested=()
+    local -a targets=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --stale) mode="stale"; shift ;;
+            --older-than) [[ $# -ge 2 ]] || die "--older-than requires an hour count"; require_hours "$2"; older_than_hours="$2"; shift 2 ;;
+            --filter) [[ $# -ge 2 ]] || die "--filter requires a pattern"; filter="$2"; shift 2 ;;
+            --limit) [[ $# -ge 2 ]] || die "--limit requires a count"; require_int "$2"; limit="$2"; shift 2 ;;
+            --dry-run) dry_run=1; shift ;;
+            -*) die "unknown flag: $1" ;;
+            *) requested+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ "$mode" == "stale" && "${#requested[@]}" -gt 0 ]]; then
+        die "cannot mix explicit sessions with --stale"
+    fi
+    if [[ "$mode" == "explicit" && "${#requested[@]}" -eq 0 ]]; then
+        die "usage: surrogate cull <session>... | surrogate cull --stale [--older-than HOURS] [--filter PATTERN] [--dry-run]"
+    fi
+
+    if [[ "$mode" == "stale" ]]; then
+        local rows=""
+        rows="$(stale_candidates "$older_than_hours" "$filter" "$limit")"
+        if [[ -z "$rows" ]]; then
+            echo "no stale sessions to cull"
+            return 0
+        fi
+        while IFS=$'\t' read -r _age _alias session _snippet; do
+            [[ -n "$session" ]] || continue
+            targets+=("$session")
+        done <<< "$rows"
+    else
+        local input session guard_reason
+        for input in "${requested[@]}"; do
+            session="$(resolve_session "$input")"
+            if ! guard_reason="$(ensure_cullable_session "$session")"; then
+                die "$guard_reason"
+            fi
+            targets+=("$session")
+        done
+    fi
+
+    if [[ "${#targets[@]}" -eq 0 ]]; then
+        echo "no sessions to cull"
+        return 0
+    fi
+
+    _build_alias_cache
+    local session alias age_label
+    for session in "${targets[@]}"; do
+        alias="${_ALIAS_CACHE[$session]:-$(session_alias "$session")}"
+        age_label="$(format_age_secs "$(session_age_secs "$session" 2>/dev/null || echo 0)")"
+        if [[ "$dry_run" -eq 1 ]]; then
+            echo "would cull: $alias  $session  age=$age_label"
+            continue
+        fi
+        cull_session "$session"
+        echo "culled: $alias  $session  age=$age_label"
+    done
+}
+
 cmd_bridge() {
     check_deps
     [[ $# -ge 1 ]] || die "usage: surrogate bridge <session>"
@@ -835,6 +1282,7 @@ cmd_status() {
 
 case "${1}" in
     list)    shift; cmd_list "$@" ;;
+    stale)   shift; cmd_stale "$@" ;;
     send)    shift; cmd_send "$@" ;;
     submit)  shift; cmd_submit "$@" ;;
     type)    shift; cmd_type "$@" ;;
@@ -847,6 +1295,7 @@ case "${1}" in
     alias)   shift; cmd_alias "$@" ;;
     whoami)  shift; cmd_whoami "$@" ;;
     rename)  shift; cmd_rename "$@" ;;
+    cull)    shift; cmd_cull "$@" ;;
     bridge)  shift; cmd_bridge "$@" ;;
     cleanup) shift; cmd_cleanup "$@" ;;
     status)  shift; cmd_status "$@" ;;

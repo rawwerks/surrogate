@@ -10,6 +10,7 @@
 #   - Per-test timeout (default 30s, override with TEST_TIMEOUT=N)
 #   - Per-test timing (shows elapsed seconds)
 #   - Concurrent-run safe (all resources scoped to PID)
+#   - Interrupted-run safe (reaps stale test artifacts from dead harness PIDs)
 #   - Fails gracefully on timeout without blocking the suite
 #
 set -euo pipefail
@@ -18,12 +19,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SURROGATE="${SURROGATE:-$(dirname "$SCRIPT_DIR")/bin/surrogate}"
 TEST_SESSION="test-surrogate-$$"
 TEST_TIMEOUT="${TEST_TIMEOUT:-30}"  # per-test timeout in seconds
+TEST_PROFILE="${SURROGATE_TEST_PROFILE:-smoke}"
+TEST_SECTIONS="${SURROGATE_TEST_SECTIONS:-}"
+TEST_POLL_INTERVAL_SECS="${TEST_POLL_INTERVAL_SECS:-0.2}"
 RESULTS_DIR="$(mktemp -d)"
 RESULTS_FILE="$RESULTS_DIR/results"
 TIMING_FILE="$RESULTS_DIR/timing"
 touch "$RESULTS_FILE" "$TIMING_FILE"
 SUITE_START="$(date +%s)"
 SECURITY_METRICS_OUTPUT=""
+CLEANUP_DONE=0
+TEST_SESSION_NAME_RE='^(test-surrogate|surr-dead-test|surr-cleanup-all-test|surr-rename-test|surr-prose-crlf-test|surr-prose-test|surr-coll-a|surr-coll-b|surr-stale-test|surr-cull-test|surr-cull-batch-test|surr-cull-keep-test)-[0-9]+$'
 
 # Export variables needed by subshell test runners
 export RESULTS_FILE TIMING_FILE SURROGATE TEST_SESSION TEST_TIMEOUT
@@ -33,6 +39,100 @@ pass() { echo "PASS" >> "$RESULTS_FILE"; echo "  PASS: $1"; }
 fail() { echo "FAIL: $1" >> "$RESULTS_FILE"; echo "  FAIL: $1"; }
 
 now_ns() { date +%s%N; }
+
+usage() {
+  cat <<'EOF'
+Usage: bash tests/test_surrogate_e2e.sh [--smoke|--full] [--sections LIST]
+
+Options:
+  --smoke          Run the fast default sections only
+  --full           Run the entire suite
+  --sections LIST  Run a comma-separated subset of sections
+                   Available: core, identity, aliases, behavior, design, search, labels, invariants
+EOF
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --smoke)
+        TEST_PROFILE="smoke"
+        shift
+        ;;
+      --full)
+        TEST_PROFILE="full"
+        shift
+        ;;
+      --sections)
+        [[ $# -ge 2 ]] || { echo "FATAL: --sections requires a value" >&2; usage; exit 1; }
+        TEST_SECTIONS="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "FATAL: unknown arg '$1'" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+parse_args "$@"
+
+wait_until() {
+  local timeout_secs="$1"
+  shift
+  local deadline_ns=$(( $(now_ns) + timeout_secs * 1000000000 ))
+  while (( $(now_ns) < deadline_ns )); do
+    if "$@"; then
+      return 0
+    fi
+    sleep "$TEST_POLL_INTERVAL_SECS"
+  done
+  "$@"
+}
+
+wait_for_output() {
+  local session="$1"
+  local pattern="$2"
+  local timeout="${3:-5}"
+  "$SURROGATE" wait "$session" "$pattern" -t "$timeout" >/dev/null 2>&1
+}
+
+STALE_OUTPUT_CACHE=""
+
+stale_output_matches() {
+  local session="$1"
+  STALE_OUTPUT_CACHE=$("$SURROGATE" stale --older-than 0 --filter "$session" 2>&1)
+  echo "$STALE_OUTPUT_CACHE" | grep -q "$session" &&
+    echo "$STALE_OUTPUT_CACHE" | grep -q 'stale session'
+}
+
+read_matches_pattern() {
+  local session="$1"
+  local pattern="$2"
+  "$SURROGATE" read "$session" -n 100 2>/dev/null | grep -Eq -- "$pattern"
+}
+
+wait_for_read_match() {
+  local session="$1"
+  local pattern="$2"
+  local timeout="${3:-5}"
+  wait_until "$timeout" read_matches_pattern "$session" "$pattern"
+}
+
+csv_has_value() {
+  local csv="$1"
+  local value="$2"
+  case ",$csv," in
+    *,"$value",*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 build_bench_path() {
   local mode="$1"
@@ -104,9 +204,10 @@ EOF
 run_test() {
   local func="$1"
   local timeout="${2:-$TEST_TIMEOUT}"
-  local start elapsed
+  local start elapsed deadline_ns
 
   start="$(date +%s)"
+  deadline_ns=$(( $(now_ns) + timeout * 1000000000 ))
 
   # Run the test in a subshell with timeout
   # We use a subshell so a timeout kills only the test, not the suite
@@ -118,10 +219,8 @@ run_test() {
   local test_pid=$!
 
   # Wait with timeout
-  local waited=0
-  while kill -0 "$test_pid" 2>/dev/null && [[ $waited -lt $timeout ]]; do
-    sleep 1
-    waited=$((waited + 1))
+  while kill -0 "$test_pid" 2>/dev/null && (( $(now_ns) < deadline_ns )); do
+    sleep "$TEST_POLL_INTERVAL_SECS"
   done
 
   if kill -0 "$test_pid" 2>/dev/null; then
@@ -151,35 +250,167 @@ run_test() {
   fi
 }
 
+section_selected() {
+  local section="$1"
+  local default_profile="$2"
+
+  if [[ -n "$TEST_SECTIONS" ]]; then
+    csv_has_value "$TEST_SECTIONS" "all" || csv_has_value "$TEST_SECTIONS" "$section"
+    return
+  fi
+
+  case "$TEST_PROFILE" in
+    smoke) [[ "$default_profile" == "smoke" ]] ;;
+    full) return 0 ;;
+    *)
+      echo "FATAL: unknown test profile '$TEST_PROFILE'" >&2
+      exit 1
+      ;;
+  esac
+}
+
+run_section() {
+  local section="$1"
+  local default_profile="$2"
+  shift 2
+
+  section_selected "$section" "$default_profile" || return 0
+
+  echo ""
+  echo "--- ${section} tests ---"
+  echo ""
+  for test_name in "$@"; do
+    run_test "$test_name"
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Setup / Teardown
 # ---------------------------------------------------------------------------
 
+is_test_session_name() {
+  [[ "$1" =~ $TEST_SESSION_NAME_RE ]]
+}
+
+test_session_owner_pid() {
+  local session="$1"
+  [[ "$session" =~ -([0-9]+)$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+test_harness_pid_live() {
+  local pid="$1"
+  local args=""
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+  [[ "$args" == *test_surrogate_e2e.sh* ]]
+}
+
+zmx_session_exists() {
+  zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p' | grep -Fx -- "$1" >/dev/null
+}
+
+zmx_session_absent() {
+  ! zmx_session_exists "$1"
+}
+
+tmux_session_absent() {
+  ! tmux has-session -t "$1" 2>/dev/null
+}
+
+should_cleanup_test_session() {
+  local session="$1"
+  local mode="$2"
+  local owner_pid=""
+
+  is_test_session_name "$session" || return 1
+  owner_pid="$(test_session_owner_pid "$session" || true)"
+  [[ -n "$owner_pid" ]] || return 1
+
+  case "$mode" in
+    current) [[ "$owner_pid" == "$$" ]] ;;
+    stale) ! test_harness_pid_live "$owner_pid" ;;
+    *) return 1 ;;
+  esac
+}
+
+cleanup_test_zmx_sessions() {
+  local mode="$1"
+  local session=""
+
+  while IFS= read -r session; do
+    [[ -z "$session" ]] && continue
+    should_cleanup_test_session "$session" "$mode" || continue
+    zmx kill "$session" >/dev/null 2>&1 && echo "killed session $session" || true
+  done < <(zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p')
+}
+
+cleanup_test_bridges() {
+  local mode="$1"
+  local bridge="" session=""
+
+  while IFS= read -r bridge; do
+    [[ -z "$bridge" ]] && continue
+    session="${bridge#_surr_}"
+    should_cleanup_test_session "$session" "$mode" || continue
+    tmux kill-session -t "$bridge" 2>/dev/null && echo "killed bridge $bridge" || true
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_" || true)
+}
+
+cleanup_test_aliases() {
+  local mode="$1"
+  local alias_file="/tmp/surrogate-aliases"
+  local temp_file="" line="" session=""
+
+  [[ -f "$alias_file" ]] || return 0
+  temp_file="$(mktemp)"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    session="${line%%=*}"
+    if should_cleanup_test_session "$session" "$mode"; then
+      echo "removed alias $session"
+      continue
+    fi
+    if [[ "$mode" == "stale" ]] && is_test_session_name "$session" && ! zmx_session_exists "$session"; then
+      echo "removed stale alias $session"
+      continue
+    fi
+    printf '%s\n' "$line" >> "$temp_file"
+  done < "$alias_file"
+
+  mv "$temp_file" "$alias_file"
+}
+
+cleanup_test_artifacts() {
+  local mode="$1"
+  cleanup_test_zmx_sessions "$mode"
+  cleanup_test_bridges "$mode"
+  cleanup_test_aliases "$mode"
+}
+
 cleanup() {
+  [[ "$CLEANUP_DONE" -eq 0 ]] || return 0
+  CLEANUP_DONE=1
   echo ""
   echo "--- cleanup ---"
-  # Kill test zmx sessions scoped to THIS run's PID
-  local my_pid="$$"
-  while IFS= read -r sess; do
-    [[ -z "$sess" ]] && continue
-    zmx kill "$sess" 2>/dev/null && echo "killed session $sess" || true
-  done < <(zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p' | grep -F -- "-${my_pid}" || true)
-  # Kill bridges scoped to THIS run's PID only
-  while IFS= read -r s; do
-    [[ -z "$s" ]] && continue
-    tmux kill-session -t "$s" 2>/dev/null && echo "killed bridge $s" || true
-  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^_surr_" | grep -F -- "-${my_pid}" || true)
-  # Clean up custom aliases from this run
-  sed -i "/-${my_pid}=/d" /tmp/surrogate-aliases 2>/dev/null || true
+  cleanup_test_artifacts current
+  cleanup_test_artifacts stale
   rm -rf "$RESULTS_DIR" 2>/dev/null || true
   echo "cleanup done"
 }
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 echo "=== surrogate end-to-end tests ==="
 echo "surrogate: $SURROGATE"
 echo "test session: $TEST_SESSION"
 echo "test timeout: ${TEST_TIMEOUT}s per test"
+echo "test profile: ${TEST_PROFILE}"
+if [[ -n "$TEST_SECTIONS" ]]; then
+  echo "test sections: ${TEST_SECTIONS}"
+fi
 echo ""
 
 # Preflight
@@ -193,11 +424,12 @@ if ! command -v zmx &>/dev/null; then
   exit 1
 fi
 
+cleanup_test_artifacts stale
+
 # Create a test zmx session running bash
 zmx run "$TEST_SESSION" bash &
-sleep 2
 
-if ! zmx list 2>/dev/null | grep -q "$TEST_SESSION"; then
+if ! wait_until 5 zmx_session_exists "$TEST_SESSION"; then
   echo "FATAL: failed to create test zmx session '$TEST_SESSION'"
   exit 1
 fi
@@ -238,7 +470,7 @@ test_type_and_read() {
   local marker="BANANA_TEST_$$"
 
   "$SURROGATE" type "$TEST_SESSION" "echo $marker"
-  sleep 1
+  wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
   local output
   output=$("$SURROGATE" read "$TEST_SESSION" 2>&1)
@@ -260,7 +492,7 @@ test_send_enter_key() {
   local marker="SEND_ENTER_$$"
 
   "$SURROGATE" send "$TEST_SESSION" "echo $marker" Enter
-  sleep 1
+  wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
   local output
   output=$("$SURROGATE" read "$TEST_SESSION" 2>&1)
@@ -282,7 +514,7 @@ test_submit_enters_staged_prompt() {
 
   "$SURROGATE" send "$TEST_SESSION" "echo $marker"
   "$SURROGATE" submit "$TEST_SESSION"
-  sleep 1
+  wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
   local output
   output=$("$SURROGATE" read "$TEST_SESSION" 2>&1)
@@ -323,7 +555,6 @@ test_bridge_reuse() {
   before=$(tmux list-sessions 2>/dev/null | grep "_surr_" | sort)
 
   "$SURROGATE" type "$TEST_SESSION" "echo bridge_reuse_check"
-  sleep 1
 
   after=$(tmux list-sessions 2>/dev/null | grep "_surr_" | sort)
 
@@ -377,7 +608,7 @@ test_read_line_limit() {
   for i in 1 2 3 4 5 6 7 8; do
     "$SURROGATE" type "$TEST_SESSION" "echo LINE_LIMIT_$i"
   done
-  sleep 1
+  wait_for_output "$TEST_SESSION" "LINE_LIMIT_8" 5 || true
 
   local output line_count
   output=$("$SURROGATE" read "$TEST_SESSION" -n 3 2>&1)
@@ -417,14 +648,16 @@ test_cleanup_dead() {
   local tmp_session="surr-dead-test-$$"
   zmx run "$tmp_session" bash &
   local tmp_pid=$!
-  sleep 2
+  wait_until 5 zmx_session_exists "$tmp_session" || {
+    fail "${FUNCNAME[0]} — failed to create temp zmx session"
+    return
+  }
 
   "$SURROGATE" type "$tmp_session" "echo hello"
-  sleep 1
+  wait_for_output "$tmp_session" "hello" 5 || true
 
   zmx kill "$tmp_session" 2>/dev/null || true
   wait "$tmp_pid" 2>/dev/null || true
-  sleep 1
 
   "$SURROGATE" cleanup --dead
 
@@ -449,10 +682,13 @@ test_cleanup_all() {
   local iso_session="surr-cleanup-all-test-$$"
   zmx run "$iso_session" bash &
   local iso_pid=$!
-  sleep 2
+  wait_until 5 zmx_session_exists "$iso_session" || {
+    fail "${FUNCNAME[0]} — failed to create isolated zmx session"
+    return
+  }
 
   "$SURROGATE" type "$iso_session" "echo cleanup_all_test"
-  sleep 1
+  wait_for_output "$iso_session" "cleanup_all_test" 5 || true
 
   # Verify bridge exists before cleanup
   local bridge="_surr_${iso_session}"
@@ -477,6 +713,163 @@ test_cleanup_all() {
   wait "$iso_pid" 2>/dev/null || true
 }
 
+test_cleanup_reaps_stale_test_artifacts() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local stale_session="test-surrogate-99999999"
+  local stale_bridge="_surr_${stale_session}"
+  local stale_alias="stale-alias-99999999"
+
+  zmx kill "$stale_session" 2>/dev/null || true
+  tmux kill-session -t "$stale_bridge" 2>/dev/null || true
+  sed -i "/^${stale_session}=/d" /tmp/surrogate-aliases 2>/dev/null || true
+
+  zmx run "$stale_session" bash &
+  local stale_pid=$!
+  wait_until 5 zmx_session_exists "$stale_session" || {
+    fail "${FUNCNAME[0]} — failed to create stale-session fixture"
+    return
+  }
+
+  "$SURROGATE" type "$stale_session" "echo stale_cleanup_test"
+  wait_for_output "$stale_session" "stale_cleanup_test" 5 || true
+  echo "${stale_session}=${stale_alias}" >> /tmp/surrogate-aliases
+
+  cleanup_test_artifacts stale
+  wait "$stale_pid" 2>/dev/null || true
+
+  if ! wait_until 5 zmx_session_absent "$stale_session"; then
+    fail "${FUNCNAME[0]} — stale zmx session was not reaped"
+    return
+  fi
+
+  if ! wait_until 5 tmux_session_absent "$stale_bridge"; then
+    fail "${FUNCNAME[0]} — stale bridge was not reaped"
+    return
+  fi
+
+  if grep -q "^${stale_session}=" /tmp/surrogate-aliases 2>/dev/null; then
+    fail "${FUNCNAME[0]} — stale alias was not removed"
+    return
+  fi
+
+  pass "${FUNCNAME[0]}"
+}
+
+test_stale_lists_detached_sessions() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local stale_session="surr-stale-test-$$"
+  local stale_marker="STALE_LIST_$$"
+  zmx run "$stale_session" bash &
+  local stale_pid=$!
+  wait_until 5 zmx_session_exists "$stale_session" || {
+    fail "${FUNCNAME[0]} — failed to create stale listing fixture"
+    return
+  }
+
+  "$SURROGATE" type "$stale_session" "echo $stale_marker"
+  wait_for_output "$stale_session" "$stale_marker" 5 || true
+
+  local output
+  if wait_until 5 stale_output_matches "$stale_session"; then
+    output="$STALE_OUTPUT_CACHE"
+  else
+    output="$STALE_OUTPUT_CACHE"
+  fi
+
+  zmx kill "$stale_session" 2>/dev/null || true
+  wait "$stale_pid" 2>/dev/null || true
+
+  if echo "$output" | grep -q "$stale_session" && echo "$output" | grep -q 'stale session'; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — stale output did not include the detached session: $output"
+  fi
+}
+
+test_cull_explicit_session() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local cull_session="surr-cull-test-$$"
+  local cull_alias="cull-alias-$$"
+  local cull_marker="CULL_EXPLICIT_$$"
+  local bridge="_surr_${cull_session}"
+  local lock_file="/tmp/surrogate-${cull_session}.lock"
+  local watermark_file="/tmp/surrogate-${cull_session}.watermark"
+  zmx run "$cull_session" bash &
+  local cull_pid=$!
+  wait_until 5 zmx_session_exists "$cull_session" || {
+    fail "${FUNCNAME[0]} — failed to create explicit cull fixture"
+    return
+  }
+
+  "$SURROGATE" type "$cull_session" "echo $cull_marker"
+  wait_for_output "$cull_session" "$cull_marker" 5 || true
+  "$SURROGATE" rename "$cull_session" "$cull_alias" >/dev/null
+
+  local output
+  output=$("$SURROGATE" cull "$cull_alias" 2>&1)
+  wait "$cull_pid" 2>/dev/null || true
+
+  if echo "$output" | grep -q "culled: .*${cull_session}" &&
+     wait_until 5 zmx_session_absent "$cull_session" &&
+     wait_until 5 tmux_session_absent "$bridge" &&
+     [[ ! -e "$lock_file" ]] &&
+     [[ ! -e "$watermark_file" ]] &&
+     ! grep -q "^${cull_session}=" /tmp/surrogate-aliases 2>/dev/null; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — explicit cull did not remove session plumbing cleanly: $output"
+  fi
+}
+
+test_cull_stale_batch_filtered() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local target_session="surr-cull-batch-test-$$"
+  local keep_session="surr-cull-keep-test-$$"
+  zmx run "$target_session" bash &
+  local target_pid=$!
+  zmx run "$keep_session" bash &
+  local keep_pid=$!
+  wait_until 5 zmx_session_exists "$target_session" || {
+    fail "${FUNCNAME[0]} — failed to create batch cull target"
+    return
+  }
+  wait_until 5 zmx_session_exists "$keep_session" || {
+    fail "${FUNCNAME[0]} — failed to create batch cull survivor"
+    return
+  }
+
+  if ! wait_until 5 stale_output_matches "$target_session"; then
+    wait "$target_pid" 2>/dev/null || true
+    zmx kill "$keep_session" 2>/dev/null || true
+    wait "$keep_pid" 2>/dev/null || true
+    fail "${FUNCNAME[0]} — target session never appeared in stale output: $STALE_OUTPUT_CACHE"
+    return
+  fi
+
+  local output
+  output=$("$SURROGATE" cull --stale --older-than 0 --filter "$target_session" 2>&1)
+  wait "$target_pid" 2>/dev/null || true
+
+  if echo "$output" | grep -q "$target_session" &&
+     wait_until 5 zmx_session_absent "$target_session" &&
+     zmx_session_exists "$keep_session"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — batch stale cull did not target only the filtered session: $output"
+  fi
+
+  zmx kill "$keep_session" 2>/dev/null || true
+  wait "$keep_pid" 2>/dev/null || true
+}
+
 test_status() {
   # plumb:req-3a11209c
   # plumb:req-a727036c
@@ -485,7 +878,6 @@ test_status() {
   TESTS_RUN=$((TESTS_RUN + 1))
 
   "$SURROGATE" type "$TEST_SESSION" "echo status_check"
-  sleep 1
 
   local output
   output=$("$SURROGATE" status 2>&1)
@@ -514,7 +906,8 @@ test_concurrent_serialization() {
 
   wait "$pid_a" 2>/dev/null
   wait "$pid_b" 2>/dev/null
-  sleep 2
+  wait_for_read_match "$TEST_SESSION" "$marker_a" 5 || true
+  wait_for_read_match "$TEST_SESSION" "$marker_b" 5 || true
 
   local output
   output=$("$SURROGATE" read "$TEST_SESSION" 2>&1)
@@ -814,24 +1207,25 @@ test_release_helper_reinstalls_real_binaries() {
 echo "--- running tests ---"
 echo ""
 
-run_test test_list
-run_test test_type_and_read
-run_test test_send_enter_key
-run_test test_submit_enters_staged_prompt
-run_test test_bridge_creation
-run_test test_bridge_reuse
-run_test test_wait_success
-run_test test_wait_timeout
-run_test test_read_line_limit
-run_test test_dead_session_error
-run_test test_cleanup_dead
-run_test test_cleanup_all
-run_test test_status
-run_test test_concurrent_serialization
-
-echo ""
-echo "--- alias + search tests ---"
-echo ""
+run_section core smoke \
+  test_list \
+  test_type_and_read \
+  test_send_enter_key \
+  test_submit_enters_staged_prompt \
+  test_bridge_creation \
+  test_bridge_reuse \
+  test_wait_success \
+  test_wait_timeout \
+  test_read_line_limit \
+  test_dead_session_error \
+  test_cleanup_dead \
+  test_cleanup_all \
+  test_cleanup_reaps_stale_test_artifacts \
+  test_stale_lists_detached_sessions \
+  test_cull_explicit_session \
+  test_cull_stale_batch_filtered \
+  test_status \
+  test_concurrent_serialization
 
 test_find() {
   # plumb:req-c789f866
@@ -908,6 +1302,51 @@ test_find_with_context() {
   fi
 }
 
+setup_mock_who_env() {
+  MOCK_WHO_TMPBIN="$(mktemp -d)"
+  MOCK_WHO_OLD_SESSION="mock-who-old-$$"
+  MOCK_WHO_NEW_SESSION="mock-who-new-$$"
+  MOCK_WHO_ZMX_DIR="/run/user/$(id -u)/zmx"
+
+  mkdir -p "$MOCK_WHO_ZMX_DIR"
+  : > "$MOCK_WHO_ZMX_DIR/$MOCK_WHO_OLD_SESSION"
+  : > "$MOCK_WHO_ZMX_DIR/$MOCK_WHO_NEW_SESSION"
+  touch -d '2 hours ago' "$MOCK_WHO_ZMX_DIR/$MOCK_WHO_OLD_SESSION"
+  touch -d '10 seconds ago' "$MOCK_WHO_ZMX_DIR/$MOCK_WHO_NEW_SESSION"
+
+  cat > "$MOCK_WHO_TMPBIN/zmx" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  list)
+    printf 'session_name=%s\tclients=0\n' "$MOCK_WHO_OLD_SESSION"
+    printf 'session_name=%s\tclients=1\n' "$MOCK_WHO_NEW_SESSION"
+    ;;
+  history)
+    case "\${2:-}" in
+      "$MOCK_WHO_OLD_SESSION")
+        printf 'prompt\n/home/raw/Documents/GitHub/older\n'
+        ;;
+      "$MOCK_WHO_NEW_SESSION")
+        printf 'prompt\n/home/raw/Documents/GitHub/surrogate\n'
+        ;;
+    esac
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$MOCK_WHO_TMPBIN/zmx"
+
+  ln -sf "$(command -v tmux)" "$MOCK_WHO_TMPBIN/tmux"
+}
+
+cleanup_mock_who_env() {
+  rm -f "$MOCK_WHO_ZMX_DIR/$MOCK_WHO_OLD_SESSION" "$MOCK_WHO_ZMX_DIR/$MOCK_WHO_NEW_SESSION" 2>/dev/null || true
+  rm -rf "$MOCK_WHO_TMPBIN" 2>/dev/null || true
+}
+
 test_who() {
   # plumb:req-851ca449
   # plumb:req-251007fd
@@ -924,6 +1363,104 @@ test_who() {
     echo "    expected test session in who output:"
     echo "$output" | sed 's/^/    /'
     fail "${FUNCNAME[0]} — test session not in who output"
+  fi
+}
+
+test_who_recent_first() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output first_line
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who 2>&1)
+  first_line="$(echo "$output" | sed '/^── /d' | sed -n '1p')"
+  cleanup_mock_who_env
+
+  if echo "$first_line" | grep -q "$MOCK_WHO_NEW_SESSION"; then
+    pass "${FUNCNAME[0]} — who sorts newest sessions first"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — newest session not listed first"
+  fi
+}
+
+test_who_recent_duration_filter() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who --recent 1h 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -q "$MOCK_WHO_NEW_SESSION" &&
+     ! echo "$output" | grep -q "$MOCK_WHO_OLD_SESSION"; then
+    pass "${FUNCNAME[0]} — who --recent filters by age"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — who --recent age filter incorrect"
+  fi
+}
+
+test_who_project_filter() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who --project surrogate 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -q "$MOCK_WHO_NEW_SESSION" &&
+     ! echo "$output" | grep -q "$MOCK_WHO_OLD_SESSION"; then
+    pass "${FUNCNAME[0]} — who --project filters by visible project path"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — who --project filter incorrect"
+  fi
+}
+
+test_who_cwd_filter() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who --cwd /home/raw/Documents/GitHub/surrogate 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -q "$MOCK_WHO_NEW_SESSION" &&
+     ! echo "$output" | grep -q "$MOCK_WHO_OLD_SESSION"; then
+    pass "${FUNCNAME[0]} — who --cwd filters by visible path prefix"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — who --cwd filter incorrect"
+  fi
+}
+
+test_who_json_output() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who --json --recent 1h 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -q '"count":1' &&
+     echo "$output" | grep -q '"recent_first":true' &&
+     echo "$output" | grep -q "\"session\":\"$MOCK_WHO_NEW_SESSION\"" &&
+     echo "$output" | grep -q '"cwd_hint":"/home/raw/Documents/GitHub/surrogate"' &&
+     echo "$output" | grep -q '"project_hint":"surrogate"'; then
+    pass "${FUNCNAME[0]} — who --json exposes deterministic session metadata"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — who --json output incorrect"
   fi
 }
 
@@ -1170,10 +1707,10 @@ test_label_on() {
 
   local marker="LABEL_ON_$$"
   SURROGATE_LABEL=on "$SURROGATE" type "$TEST_SESSION" "$marker"
-  sleep 1
+  wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
   local output
-  output=$("$SURROGATE" read "$TEST_SESSION" -n 5 2>&1)
+  output=$("$SURROGATE" read "$TEST_SESSION" -n 10 2>&1)
   if echo "$output" | grep -q '\[SURROGATE.*\].*'"$marker"; then
     pass "${FUNCNAME[0]}"
   else
@@ -1189,10 +1726,10 @@ test_label_off() {
 
   local marker="LABEL_OFF_$$"
   SURROGATE_LABEL=off "$SURROGATE" type "$TEST_SESSION" "$marker"
-  sleep 1
+  wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
   local output
-  output=$("$SURROGATE" read "$TEST_SESSION" -n 5 2>&1)
+  output=$("$SURROGATE" read "$TEST_SESSION" -n 10 2>&1)
   # Should NOT have [SURROGATE] prefix
   if echo "$output" | grep -q '\[SURROGATE\].*'"$marker"; then
     fail "${FUNCNAME[0]} — label should not appear with SURROGATE_LABEL=off"
@@ -1209,10 +1746,10 @@ test_label_verbose() {
 
   local marker="LABEL_VERBOSE_$$"
   SURROGATE_LABEL=verbose "$SURROGATE" type "$TEST_SESSION" "$marker"
-  sleep 1
+  wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
   local output
-  output=$("$SURROGATE" read "$TEST_SESSION" -n 5 2>&1)
+  output=$("$SURROGATE" read "$TEST_SESSION" -n 20 2>&1)
   if echo "$output" | tr -d '\n' | grep -q '\[SURROGATE.*PID:.*\].*'"$marker"; then
     pass "${FUNCNAME[0]}"
   else
@@ -1432,6 +1969,74 @@ test_whoami_no_session() {
     fail "${FUNCNAME[0]} — whoami should fail without ZMX_SESSION"
   else
     pass "${FUNCNAME[0]}"
+  fi
+}
+
+test_type_rejects_self_target() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local alias_name output
+  alias_name="$("$SURROGATE" alias "$TEST_SESSION")"
+  output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" type "$TEST_SESSION" "hello from self" 2>&1 || true)
+
+  if echo "$output" | grep -q 'refusing to message your own live session' &&
+     echo "$output" | grep -q "$alias_name" &&
+     echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]} — self-target type is blocked with identity context"
+  else
+    fail "${FUNCNAME[0]} — self-target type was not explained clearly: $output"
+  fi
+}
+
+test_send_rejects_self_target() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local alias_name output
+  alias_name="$("$SURROGATE" alias "$TEST_SESSION")"
+  output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" send "$TEST_SESSION" Enter 2>&1 || true)
+
+  if echo "$output" | grep -q 'refusing to message your own live session' &&
+     echo "$output" | grep -q "$alias_name" &&
+     echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]} — self-target send is blocked with identity context"
+  else
+    fail "${FUNCNAME[0]} — self-target send was not explained clearly: $output"
+  fi
+}
+
+test_submit_rejects_self_target() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local alias_name output
+  alias_name="$("$SURROGATE" alias "$TEST_SESSION")"
+  output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" submit "$TEST_SESSION" 2>&1 || true)
+
+  if echo "$output" | grep -q 'refusing to message your own live session' &&
+     echo "$output" | grep -q "$alias_name" &&
+     echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]} — self-target submit is blocked with identity context"
+  else
+    fail "${FUNCNAME[0]} — self-target submit was not explained clearly: $output"
+  fi
+}
+
+test_cull_rejects_current_live_session() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local alias_name output
+  alias_name="$("$SURROGATE" alias "$TEST_SESSION")"
+  output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" cull "$TEST_SESSION" 2>&1 || true)
+
+  if echo "$output" | grep -q 'refusing to cull your own live session' &&
+     echo "$output" | grep -q "$alias_name" &&
+     echo "$output" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]} — self-target cull is blocked with identity context"
+  else
+    fail "${FUNCNAME[0]} — self-target cull was not explained clearly: $output"
   fi
 }
 
@@ -1889,25 +2494,34 @@ test_audit_logs_allowed_type() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local audit_file marker target_alias
+  local audit_file marker target_alias actor_session actor_pid actor_alias
   audit_file="$(mktemp)"
   marker="AUDIT_ALLOW_${$}"
   target_alias=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+  actor_session="surr-audit-actor-allow-$$"
+
+  zmx run "$actor_session" cat &
+  actor_pid=$!
+  sleep 2
+  actor_alias=$("$SURROGATE" alias "$actor_session" 2>&1)
 
   SURROGATE_AUDIT_FILE="$audit_file" \
   SURROGATE_LABEL=off \
   SURROGATE_WORK_ID="work-allow-${$}" \
   SURROGATE_REASON="audit metadata test" \
-  ZMX_SESSION="$TEST_SESSION" \
+  ZMX_SESSION="$actor_session" \
   "$SURROGATE" type "$TEST_SESSION" "echo $marker"
   sleep 1
+
+  zmx kill "$actor_session" 2>/dev/null || true
+  wait "$actor_pid" 2>/dev/null || true
 
   if grep -q '"action":"type"' "$audit_file" &&
      grep -q '"decision":"allow"' "$audit_file" &&
      grep -q "$TEST_SESSION" "$audit_file" &&
      grep -q "\"target_alias\":\"${target_alias}\"" "$audit_file" &&
-     grep -q "\"actor_session\":\"${TEST_SESSION}\"" "$audit_file" &&
-     grep -q "\"actor_alias\":\"${target_alias}\"" "$audit_file" &&
+     grep -q "\"actor_session\":\"${actor_session}\"" "$audit_file" &&
+     grep -q "\"actor_alias\":\"${actor_alias}\"" "$audit_file" &&
      grep -q '"work_id":"work-allow-' "$audit_file" &&
      grep -q '"intent_reason":"audit metadata test"' "$audit_file" &&
      grep -q '"repo":"surrogate"' "$audit_file" &&
@@ -1924,24 +2538,34 @@ test_audit_logs_blocked_send() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local audit_file output target_alias
+  local audit_file output target_alias actor_session actor_pid actor_alias
   audit_file="$(mktemp)"
   target_alias=$("$SURROGATE" alias "$TEST_SESSION" 2>&1)
+  actor_session="surr-audit-actor-deny-$$"
+
+  zmx run "$actor_session" cat &
+  actor_pid=$!
+  sleep 2
+  actor_alias=$("$SURROGATE" alias "$actor_session" 2>&1)
+
   output=$(
     SURROGATE_AUDIT_FILE="$audit_file" \
     SURROGATE_WORK_ID="work-deny-${$}" \
     SURROGATE_REASON="blocked send metadata test" \
-    ZMX_SESSION="$TEST_SESSION" \
+    ZMX_SESSION="$actor_session" \
     "$SURROGATE" send "$TEST_SESSION" C-c 2>&1 || true
   )
+
+  zmx kill "$actor_session" 2>/dev/null || true
+  wait "$actor_pid" 2>/dev/null || true
 
   if grep -q '"action":"send"' "$audit_file" &&
      grep -q '"decision":"deny"' "$audit_file" &&
      grep -q "$TEST_SESSION" "$audit_file" &&
      grep -q '"detail":"C-c"' "$audit_file" &&
      grep -q "\"target_alias\":\"${target_alias}\"" "$audit_file" &&
-     grep -q "\"actor_session\":\"${TEST_SESSION}\"" "$audit_file" &&
-     grep -q "\"actor_alias\":\"${target_alias}\"" "$audit_file" &&
+     grep -q "\"actor_session\":\"${actor_session}\"" "$audit_file" &&
+     grep -q "\"actor_alias\":\"${actor_alias}\"" "$audit_file" &&
      grep -q '"work_id":"work-deny-' "$audit_file" &&
      grep -q '"intent_reason":"blocked send metadata test"' "$audit_file" &&
      grep -q '"repo":"surrogate"' "$audit_file" &&
@@ -2445,117 +3069,127 @@ test_read_validates_n() {
   fi
 }
 
-# Alias tests that need TEST_SESSION (write operations)
-run_test test_alias_resolve
-run_test test_alias_rename_shows_aliases
+run_section identity smoke \
+  test_whoami \
+  test_whoami_help \
+  test_whoami_rejects_extra_args \
+  test_whoami_rejects_stale_env_session \
+  test_whoami_no_session \
+  test_type_rejects_self_target \
+  test_send_rejects_self_target \
+  test_submit_rejects_self_target \
+  test_cull_rejects_current_live_session
 
-# Alias system (Tier 1)
-run_test test_alias_deterministic
-run_test test_alias_100_adjectives_100_nouns
-run_test test_alias_collision_suffix
-run_test test_alias_cache_built_once
-run_test test_list_shows_aliases
-run_test test_who_shows_aliases
-run_test test_session_resolution_by_alias
-run_test test_whoami
-run_test test_whoami_help
-run_test test_whoami_rejects_extra_args
-run_test test_whoami_rejects_stale_env_session
-run_test test_whoami_no_session
+run_section aliases full \
+  test_alias_resolve \
+  test_alias_rename_shows_aliases \
+  test_alias_deterministic \
+  test_alias_100_adjectives_100_nouns \
+  test_alias_collision_suffix \
+  test_alias_cache_built_once \
+  test_list_shows_aliases \
+  test_who_shows_aliases \
+  test_session_resolution_by_alias
 
-# Behavioral defaults (Tier 2)
-run_test test_find_case_insensitive
-run_test test_find_grouped_output
-run_test test_find_uses_rg_or_grep
-run_test test_who_age_and_attached
-run_test test_who_attached_marker
-run_test test_active_default_attached_only
-run_test test_active_all_includes_detached
-run_test test_peek_count_at_end
-run_test test_read_default_20_lines
-run_test test_wait_default_30s
-run_test test_find_default_200_lines_1_context
-run_test test_who_default_10_lines
-run_test test_peek_default_5_lines
+run_section behavior full \
+  test_find_case_insensitive \
+  test_find_grouped_output \
+  test_find_uses_rg_or_grep \
+  test_who_age_and_attached \
+  test_who_attached_marker \
+  test_who_recent_first \
+  test_who_recent_duration_filter \
+  test_who_project_filter \
+  test_who_cwd_filter \
+  test_who_json_output \
+  test_active_default_attached_only \
+  test_active_all_includes_detached \
+  test_peek_count_at_end \
+  test_read_default_20_lines \
+  test_wait_default_30s \
+  test_find_default_200_lines_1_context \
+  test_who_default_10_lines \
+  test_peek_default_5_lines
 
-# Bridge, error handling, design (Tier 3)
-run_test test_bridge_naming_convention
-run_test test_bridge_stale_recreate
-run_test test_error_prefix
-run_test test_error_missing_session
-run_test test_security_model_section_exists
-run_test test_type_normalizes_multiline_prose
-run_test test_type_rejects_empty_after_normalization
-run_test test_type_normalizes_tabs_and_crlf
-run_test test_send_rejects_dangerous_control_keys
-run_test test_dcg_blocks_type_when_available
-run_test test_dcg_blocks_normalized_multiline_type
-run_test test_audit_logs_allowed_type
-run_test test_audit_logs_blocked_send
-run_test test_type_waits_before_enter_for_tui_like_targets
-run_test test_type_no_allow_audit_if_enter_fails_after_text_send
-run_test test_type_implementation_uses_fixed_submit_pause
-run_test test_type_rejects_invalid_enter_delay_config
-run_test test_error_missing_zmx
-run_test test_error_missing_tmux
-run_test test_rename_kills_bridge
-run_test test_list_delegates_to_zmx
-run_test test_no_agent_detection
-run_test test_no_heuristics_no_ml
-run_test test_no_global_guard_disable
-run_test test_no_persistent_unsafe_mode
-run_test test_bridge_command
-run_test test_cleanup_default_is_dead
-run_test test_status_shows_health
-run_test test_send_creates_bridge_lazily
-run_test test_type_creates_bridge_lazily
-run_test test_send_updates_watermark
-run_test test_type_updates_watermark
-run_test test_send_serializes_via_flock
-run_test test_type_serializes_via_flock
-run_test test_wait_validates_timeout
-run_test test_read_validates_n
+run_section design full \
+  test_bridge_naming_convention \
+  test_bridge_stale_recreate \
+  test_error_prefix \
+  test_error_missing_session \
+  test_security_model_section_exists \
+  test_type_normalizes_multiline_prose \
+  test_type_rejects_empty_after_normalization \
+  test_type_normalizes_tabs_and_crlf \
+  test_send_rejects_dangerous_control_keys \
+  test_dcg_blocks_type_when_available \
+  test_dcg_blocks_normalized_multiline_type \
+  test_audit_logs_allowed_type \
+  test_audit_logs_blocked_send \
+  test_type_waits_before_enter_for_tui_like_targets \
+  test_type_no_allow_audit_if_enter_fails_after_text_send \
+  test_type_implementation_uses_fixed_submit_pause \
+  test_type_rejects_invalid_enter_delay_config \
+  test_error_missing_zmx \
+  test_error_missing_tmux \
+  test_rename_kills_bridge \
+  test_list_delegates_to_zmx \
+  test_no_agent_detection \
+  test_no_heuristics_no_ml \
+  test_no_global_guard_disable \
+  test_no_persistent_unsafe_mode \
+  test_bridge_command \
+  test_cleanup_default_is_dead \
+  test_status_shows_health \
+  test_send_creates_bridge_lazily \
+  test_type_creates_bridge_lazily \
+  test_send_updates_watermark \
+  test_type_updates_watermark \
+  test_send_serializes_via_flock \
+  test_type_serializes_via_flock \
+  test_wait_validates_timeout \
+  test_read_validates_n
 
-# Search/filter tests
-run_test test_find
-run_test test_find_empty_query
-run_test test_find_no_match
-run_test test_find_with_context
-run_test test_who
-run_test test_who_n_zero
-run_test test_active
-run_test test_peek
-run_test test_peek_no_filter_match
-run_test test_rename
-run_test test_rename_nonexistent
-run_test test_rename_collision
-run_test test_require_int
+run_section search full \
+  test_find \
+  test_find_empty_query \
+  test_find_no_match \
+  test_find_with_context \
+  test_who \
+  test_who_n_zero \
+  test_active \
+  test_peek \
+  test_peek_no_filter_match \
+  test_rename \
+  test_rename_nonexistent \
+  test_rename_collision \
+  test_require_int
 
-# Label tests
-run_test test_label_on
-run_test test_label_off
-run_test test_label_verbose
+run_section labels full \
+  test_label_on \
+  test_label_off \
+  test_label_verbose
 
-echo ""
-echo "--- design invariant tests ---"
-echo ""
-
-run_test test_invariant_snippet_always_prints_message
-run_test test_invariant_snippet_all_shells
-run_test test_invariant_no_terminal_specific_code
-run_test test_invariant_surrogate_cli_terminal_agnostic
-run_test test_invariant_zmx_full_path
-run_test test_invariant_parent_check_not_env_var
-run_test test_invariant_unsets_zmx_session_before_attach
-run_test test_invariant_installed_matches_repo
-run_test test_install_replaces_dev_link_with_real_copy
-run_test test_release_helper_reinstalls_real_binaries
+run_section invariants full \
+  test_invariant_snippet_always_prints_message \
+  test_invariant_snippet_all_shells \
+  test_invariant_no_terminal_specific_code \
+  test_invariant_surrogate_cli_terminal_agnostic \
+  test_invariant_zmx_full_path \
+  test_invariant_parent_check_not_env_var \
+  test_invariant_unsets_zmx_session_before_attach \
+  test_invariant_installed_matches_repo \
+  test_install_replaces_dev_link_with_real_copy \
+  test_release_helper_reinstalls_real_binaries
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
-measure_security_overhead
+if [[ -z "$TEST_SECTIONS" && "$TEST_PROFILE" == "full" ]]; then
+  measure_security_overhead
+else
+  SECURITY_METRICS_OUTPUT="  security overhead: skipped (run with --full to benchmark)"
+fi
 
 echo ""
 PASS_COUNT=$(grep -c "^PASS$" "$RESULTS_FILE" 2>/dev/null) || PASS_COUNT=0

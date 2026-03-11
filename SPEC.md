@@ -38,7 +38,7 @@ Surrogate safety has two layers:
 
 The following rules are part of surrogate itself and must apply even when DCG is absent:
 
-1. The `type` command must reject multiline payloads.
+1. The `type` command must normalize embedded newlines to spaces and submit once.
 2. The `send` command must reject dangerous control keys: `C-c`, `C-d`, and `C-z`.
 3. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
 4. Surrogate must not implement a persistent unsafe mode.

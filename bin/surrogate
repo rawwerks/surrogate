@@ -38,15 +38,8 @@ _search() {
     fi
 }
 
-contains_multiline() {
-    [[ "$1" == *$'\n'* ]]
-}
-
-guard_type_text() {
-    local text="$1"
-    contains_multiline "$text" || return 0
-    echo "multiline payloads are reserved for direct human control"
-    return 1
+normalize_type_text() {
+    printf '%s' "$1" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
 }
 
 guard_send_keys() {
@@ -395,14 +388,13 @@ cmd_type() {
     [[ $# -ge 2 ]] || die "usage: surrogate type <session> <text>"
     local session
     session="$(resolve_session "$1")"
-    local text="$2"
+    local original_text="$2"
+    local text
+    text="$(normalize_type_text "$original_text")"
+    [[ -n "$text" ]] || die "type text must not be empty"
     local guard_reason=""
-    if ! guard_reason="$(guard_type_text "$text")"; then
-        audit_event "type" "$session" "deny" "$text" "$guard_reason"
-        die "$guard_reason"
-    fi
     if ! guard_reason="$(scan_with_dcg "$text")"; then
-        audit_event "type" "$session" "deny" "$text" "$guard_reason"
+        audit_event "type" "$session" "deny" "$original_text" "$guard_reason"
         die "$guard_reason"
     fi
 

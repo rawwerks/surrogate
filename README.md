@@ -95,7 +95,7 @@ Surrogate stays ambiently available, but it no longer treats that as unlimited a
 
 Current built-in structural guardrails:
 
-- `type` rejects multiline payloads
+- `type` normalizes embedded newlines to spaces and submits once
 - `send` rejects `C-c`, `C-d`, and `C-z`
 - there is no global "disable guards" switch
 - there is no persistent unsafe mode
@@ -202,7 +202,7 @@ The most common operation. Types literal text and presses Enter.
 surrogate type <session> "echo hello world"
 ```
 
-`type` is single-line only. Multiline/script payloads are reserved for direct human control.
+`type` auto-handles long prose by flattening embedded newlines into spaces and submitting once. This keeps long messages ergonomic without turning one `type` call into multiple submits.
 
 ### Send special keys
 
@@ -314,7 +314,7 @@ These are enforced by automated tests and must hold for every change:
 | **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
 | **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no heuristics, no agent-type guessing |
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
-| **Security floor** | `type` rejects multiline payloads, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
+| **Security floor** | `type` normalizes embedded newlines to spaces and submits once, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
 | **Security overhead tracked** | The test harness reports baseline vs guarded `type` latency as a metric, not a pass/fail gate |
 | **Audit trail** | `type` and `send` append JSONL audit records for both allowed and blocked actions |
 

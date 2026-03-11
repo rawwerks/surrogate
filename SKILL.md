@@ -19,7 +19,7 @@ Surrogate is intentionally deterministic and does not offer unlimited authority 
 
 Current built-in guardrails:
 
-- `surrogate type` rejects multiline payloads
+- `surrogate type` normalizes embedded newlines to spaces and submits once
 - `surrogate send` rejects `C-c`, `C-d`, and `C-z`
 - there is no global guard-disable mode
 - there is no persistent unsafe mode

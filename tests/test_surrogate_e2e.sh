@@ -1661,17 +1661,30 @@ test_security_model_section_exists() {
   fi
 }
 
-test_type_rejects_multiline() {
+test_type_normalizes_multiline_prose() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local output
-  output=$("$SURROGATE" type "$TEST_SESSION" $'echo one\necho two' 2>&1 || true)
+  local prose_session prose_pid output
+  prose_session="surr-prose-test-$$"
+  zmx run "$prose_session" cat &
+  prose_pid=$!
+  sleep 2
 
-  if echo "$output" | grep -qi 'multiline'; then
-    pass "${FUNCNAME[0]} — multiline type blocked"
+  SURROGATE_LABEL=off "$SURROGATE" type "$prose_session" $'hello there\nthis is long prose'
+  sleep 1
+
+  output=$(SURROGATE_LABEL=off "$SURROGATE" read "$prose_session" -n 5 2>&1 || true)
+
+  zmx kill "$prose_session" 2>/dev/null || true
+  wait "$prose_pid" 2>/dev/null || true
+
+  if echo "$output" | grep -q '^hello there this is long prose$'; then
+    pass "${FUNCNAME[0]} — multiline prose normalized and submitted once"
   else
-    fail "${FUNCNAME[0]} — multiline type was not blocked: $output"
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — expected multiline prose to be flattened into one submitted line"
   fi
 }
 
@@ -2162,7 +2175,7 @@ run_test test_bridge_stale_recreate
 run_test test_error_prefix
 run_test test_error_missing_session
 run_test test_security_model_section_exists
-run_test test_type_rejects_multiline
+run_test test_type_normalizes_multiline_prose
 run_test test_send_rejects_dangerous_control_keys
 run_test test_dcg_blocks_type_when_available
 run_test test_audit_logs_allowed_type

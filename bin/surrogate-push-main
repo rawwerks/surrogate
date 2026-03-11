@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+
+info() { echo "surrogate-push-main: $*"; }
+
+remove_repo_dev_links() {
+  local bin path target
+  for bin in surrogate surrogate-shell-setup surrogate-doctor; do
+    path="$INSTALL_DIR/$bin"
+    if [[ -L "$path" ]]; then
+      target="$(readlink -f "$path" 2>/dev/null || true)"
+      if [[ "$target" == "$REPO_DIR/bin/$bin" ]]; then
+        rm "$path"
+        info "removed dev-link $path"
+      fi
+    fi
+  done
+}
+
+info "pushing main with safe-push"
+safe-push origin main
+
+info "reinstalling real copied binaries"
+remove_repo_dev_links
+bash "$REPO_DIR/install.sh"
+
+info "verifying install"
+"$INSTALL_DIR/surrogate-doctor"
+
+info "done"

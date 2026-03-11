@@ -274,6 +274,28 @@ test_send_enter_key() {
   fi
 }
 
+test_submit_enters_staged_prompt() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="SUBMIT_MARKER_$$"
+
+  "$SURROGATE" send "$TEST_SESSION" "echo $marker"
+  "$SURROGATE" submit "$TEST_SESSION"
+  sleep 1
+
+  local output
+  output=$("$SURROGATE" read "$TEST_SESSION" 2>&1)
+
+  if echo "$output" | grep -q "$marker"; then
+    pass "${FUNCNAME[0]} — submit sends Enter for staged prompt"
+  else
+    echo "    expected '$marker' after submit:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — staged prompt not submitted"
+  fi
+}
+
 test_bridge_creation() {
   # plumb:req-b6f97f4e
   # plumb:req-5b4577ce
@@ -721,6 +743,70 @@ test_invariant_installed_matches_repo() {
   fi
 }
 
+test_install_replaces_dev_link_with_real_copy() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmp_install
+  tmp_install="$(mktemp -d)"
+
+  INSTALL_DIR="$tmp_install" bash "$SCRIPT_DIR/../install.sh" --dev-link >/dev/null
+
+  if [[ ! -L "$tmp_install/surrogate" ]]; then
+    echo "    expected dev-link install to create symlink"
+    fail "${FUNCNAME[0]} — dev-link install did not create symlink"
+    return
+  fi
+
+  INSTALL_DIR="$tmp_install" SURROGATE_SKIP_DCG=1 bash "$SCRIPT_DIR/../install.sh" >/dev/null
+
+  if [[ -L "$tmp_install/surrogate" ]]; then
+    echo "    expected plain install to replace symlink with copied binary"
+    fail "${FUNCNAME[0]} — plain install left surrogate as symlink"
+    return
+  fi
+
+  if diff -q "$SCRIPT_DIR/../bin/surrogate" "$tmp_install/surrogate" >/dev/null; then
+    pass "${FUNCNAME[0]} — plain install replaces dev-link with copied binary"
+  else
+    echo "    copied surrogate differs from repo"
+    fail "${FUNCNAME[0]} — copied surrogate does not match repo"
+  fi
+}
+
+test_release_helper_reinstalls_real_binaries() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local helper="$SCRIPT_DIR/../bin/surrogate-push-main"
+
+  if [[ ! -x "$helper" ]]; then
+    echo "    helper missing or not executable: $helper"
+    fail "${FUNCNAME[0]} — release helper missing or not executable"
+    return
+  fi
+
+  if ! grep -q 'safe-push origin main' "$helper"; then
+    echo "    helper does not safe-push main"
+    fail "${FUNCNAME[0]} — release helper missing safe-push"
+    return
+  fi
+
+  if ! grep -q 'bash "\$REPO_DIR/install.sh"' "$helper"; then
+    echo "    helper does not reinstall from repo checkout"
+    fail "${FUNCNAME[0]} — release helper missing reinstall"
+    return
+  fi
+
+  if ! grep -q 'surrogate-doctor' "$helper"; then
+    echo "    helper does not verify install with surrogate-doctor"
+    fail "${FUNCNAME[0]} — release helper missing doctor verification"
+    return
+  fi
+
+  pass "${FUNCNAME[0]} — release helper safe-pushes, reinstalls, and verifies"
+}
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -731,6 +817,7 @@ echo ""
 run_test test_list
 run_test test_type_and_read
 run_test test_send_enter_key
+run_test test_submit_enters_staged_prompt
 run_test test_bridge_creation
 run_test test_bridge_reuse
 run_test test_wait_success
@@ -1844,7 +1931,108 @@ test_audit_logs_blocked_send() {
   fi
 }
 
-test_type_uses_single_tmux_invocation_for_text_and_enter() {
+test_type_waits_before_enter_for_tui_like_targets() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmpbin audit_file tmux_log sleep_log sleep_marker output
+  tmpbin="$(mktemp -d)"
+  audit_file="$(mktemp)"
+  tmux_log="$(mktemp)"
+  sleep_log="$(mktemp)"
+  sleep_marker="$(mktemp)"
+  rm -f "$sleep_marker"
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  list)
+    printf 'session_name=test-surrogate-mock\tattached=true\tcreated_at=0\n'
+    ;;
+  history)
+    printf 'line one\nline two\n'
+    ;;
+  attach)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/tmux" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+log_file="$tmux_log"
+sleep_marker="$sleep_marker"
+case "\${1:-}" in
+  has-session)
+    exit 1
+    ;;
+  new-session)
+    exit 0
+    ;;
+  display-message)
+    printf 'zmx\n'
+    exit 0
+    ;;
+  send-keys)
+    printf '%s\n' "\$*" >> "\$log_file"
+    if [[ "\$*" == *" -l "* ]]; then
+      rm -f "\$sleep_marker"
+      exit 0
+    fi
+    if [[ "\$*" == *" Enter" ]]; then
+      [[ -f "\$sleep_marker" ]] || exit 1
+      exit 0
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/tmux"
+
+  cat > "$tmpbin/sleep" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\${1:-}" >> "$sleep_log"
+touch "$sleep_marker"
+EOF
+  chmod +x "$tmpbin/sleep"
+
+  output=$(
+    PATH="$tmpbin:/usr/bin:/bin" \
+    SURROGATE_AUDIT_FILE="$audit_file" \
+    SURROGATE_LABEL=off \
+    "$SURROGATE" type test-surrogate-mock "hello from test" 2>&1 || true
+  )
+
+  if [[ "$(wc -l < "$tmux_log")" -eq 2 ]] &&
+     grep -Fq 'send-keys -t _surr_test-surrogate-mock -l hello from test' "$tmux_log" &&
+     grep -Fq 'send-keys -t _surr_test-surrogate-mock Enter' "$tmux_log" &&
+     grep -Fxq '0.02' "$sleep_log" &&
+     grep -q '"decision":"allow"' "$audit_file"; then
+    pass "${FUNCNAME[0]} — type waits before Enter so TUI-like targets accept submission"
+  else
+    echo "    surrogate output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    tmux log:"
+    sed 's/^/    /' "$tmux_log" 2>/dev/null || true
+    echo "    sleep log:"
+    sed 's/^/    /' "$sleep_log" 2>/dev/null || true
+    echo "    audit log:"
+    sed 's/^/    /' "$audit_file" 2>/dev/null || true
+    fail "${FUNCNAME[0]} — expected text send, fixed submit pause, Enter, and allow audit"
+  fi
+}
+
+test_type_no_allow_audit_if_enter_fails_after_text_send() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1902,6 +2090,13 @@ esac
 EOF
   chmod +x "$tmpbin/tmux"
 
+  cat > "$tmpbin/sleep" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+EOF
+  chmod +x "$tmpbin/sleep"
+
   output=$(
     PATH="$tmpbin:/usr/bin:/bin" \
     SURROGATE_AUDIT_FILE="$audit_file" \
@@ -1909,10 +2104,12 @@ EOF
     "$SURROGATE" type test-surrogate-mock "hello from test" 2>&1 || true
   )
 
-  if [[ "$(wc -l < "$tmux_log")" -eq 1 ]] &&
-     grep -Fq 'send-keys -t _surr_test-surrogate-mock -l hello from test ; send-keys -t _surr_test-surrogate-mock Enter' "$tmux_log" &&
+  if [[ "$(wc -l < "$tmux_log")" -eq 2 ]] &&
+     grep -Fq 'send-keys -t _surr_test-surrogate-mock -l hello from test' "$tmux_log" &&
+     grep -Fq 'send-keys -t _surr_test-surrogate-mock Enter' "$tmux_log" &&
+     echo "$output" | grep -Fq 'surrogate submit test-surrogate-mock' &&
      ! grep -q '"decision":"allow"' "$audit_file"; then
-    pass "${FUNCNAME[0]} — type uses one tmux invocation for text plus Enter and avoids false allow audit on failure"
+    pass "${FUNCNAME[0]} — type avoids false allow audit and points to submit recovery"
   else
     echo "    surrogate output:"
     echo "$output" | sed 's/^/    /'
@@ -1920,25 +2117,42 @@ EOF
     sed 's/^/    /' "$tmux_log" 2>/dev/null || true
     echo "    audit log:"
     sed 's/^/    /' "$audit_file" 2>/dev/null || true
-    fail "${FUNCNAME[0]} — expected single tmux invocation for text plus Enter with no allow audit on failure"
+    fail "${FUNCNAME[0]} — expected no allow audit and explicit submit recovery"
   fi
 }
 
-test_type_implementation_is_single_tmux_command_sequence() {
+test_type_implementation_uses_fixed_submit_pause() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local cmd_type_block tmux_count
+  local cmd_type_block
   cmd_type_block="$(sed -n '/^cmd_type()/,/^cmd_[a-z_].*()/p' "$SURROGATE")"
-  tmux_count="$(printf '%s\n' "$cmd_type_block" | grep -c 'tmux send-keys' || true)"
 
-  if [[ "$tmux_count" -eq 1 ]] &&
-     printf '%s\n' "$cmd_type_block" | grep -Fq 'tmux send-keys -t "$bridge" -l "$text" \; send-keys -t "$bridge" Enter'; then
-    pass "${FUNCNAME[0]} — cmd_type uses a single tmux command sequence"
+  if grep -Fq 'SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-0.02}"' "$SURROGATE" &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'tmux send-keys -t "$bridge" -l "$text"' &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'sleep "$SURROGATE_TYPE_ENTER_DELAY_SECS"' &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'tmux send-keys -t "$bridge" Enter'; then
+    pass "${FUNCNAME[0]} — cmd_type uses deterministic fixed submit pause before Enter"
   else
     echo "    cmd_type block:"
     printf '%s\n' "$cmd_type_block" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — cmd_type must not split text and Enter across separate tmux calls"
+    fail "${FUNCNAME[0]} — cmd_type must keep the fixed submit pause delivery path"
+  fi
+}
+
+test_type_rejects_invalid_enter_delay_config() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$(SURROGATE_TYPE_ENTER_DELAY_SECS=banana "$SURROGATE" type "$TEST_SESSION" "echo nope" 2>&1 || true)
+
+  if echo "$output" | grep -Fq "is not a valid seconds value"; then
+    pass "${FUNCNAME[0]} — invalid enter delay config rejected"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — invalid enter delay config not rejected"
   fi
 }
 
@@ -2253,8 +2467,10 @@ run_test test_dcg_blocks_type_when_available
 run_test test_dcg_blocks_normalized_multiline_type
 run_test test_audit_logs_allowed_type
 run_test test_audit_logs_blocked_send
-run_test test_type_uses_single_tmux_invocation_for_text_and_enter
-run_test test_type_implementation_is_single_tmux_command_sequence
+run_test test_type_waits_before_enter_for_tui_like_targets
+run_test test_type_no_allow_audit_if_enter_fails_after_text_send
+run_test test_type_implementation_uses_fixed_submit_pause
+run_test test_type_rejects_invalid_enter_delay_config
 run_test test_error_missing_zmx
 run_test test_error_missing_tmux
 run_test test_rename_kills_bridge
@@ -2307,6 +2523,8 @@ run_test test_invariant_zmx_full_path
 run_test test_invariant_parent_check_not_env_var
 run_test test_invariant_unsets_zmx_session_before_attach
 run_test test_invariant_installed_matches_repo
+run_test test_install_replaces_dev_link_with_real_copy
+run_test test_release_helper_reinstalls_real_binaries
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -107,6 +107,10 @@ install_binary() {
   if [[ "$DEV_LINK_MODE" == "1" ]]; then
     ln -sfn "$src" "$dest"
   else
+    # Replace dev-link symlinks with real copied binaries when switching back.
+    if [[ -L "$dest" ]]; then
+      rm -f "$dest"
+    fi
     cp "$src" "$dest"
     chmod +x "$dest"
   fi

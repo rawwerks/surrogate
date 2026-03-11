@@ -58,6 +58,14 @@ bash install.sh --dev-link
 
 This symlinks the installed binaries to the current checkout instead of copying them.
 
+When publishing to `main`, use the helper below instead of `safe-push` directly:
+
+```bash
+bash bin/surrogate-push-main
+```
+
+It safe-pushes `main`, converts any repo dev-links back to real copied binaries, reinstalls, and runs `surrogate-doctor`.
+
 ### Agent skill (for Claude Code)
 
 To teach Claude Code how to use surrogate, install the skill:
@@ -95,7 +103,7 @@ Surrogate stays ambiently available, but it no longer treats that as unlimited a
 
 Current built-in structural guardrails:
 
-- `type` normalizes embedded newlines to spaces and submits once
+- `type` normalizes embedded newlines to spaces and must actually submit, not just stage text in the target input
 - `send` rejects `C-c`, `C-d`, and `C-z`
 - there is no global "disable guards" switch
 - there is no persistent unsafe mode
@@ -202,7 +210,19 @@ The most common operation. Types literal text and presses Enter.
 surrogate type <session> "echo hello world"
 ```
 
-`type` auto-handles long prose by flattening embedded newlines into spaces and submitting once. This keeps long messages ergonomic without turning one `type` call into multiple submits.
+`type` auto-handles long prose by flattening embedded newlines into spaces and submitting once. A successful `type` means the text was actually submitted, not just left sitting in the target input buffer.
+
+The submit pause is configurable:
+
+```bash
+SURROGATE_TYPE_ENTER_DELAY_SECS=0.02 surrogate type my-session "hello"
+```
+
+If a prompt is visibly staged and just needs the missing Enter, the obvious repair path is:
+
+```bash
+surrogate submit my-session
+```
 
 ### Send special keys
 
@@ -277,6 +297,7 @@ sleep 1
 surrogate send my-session "i"                   # insert mode
 surrogate send my-session "// TODO: fix this"
 surrogate send my-session Escape ":wq" Enter    # save and quit
+surrogate submit my-session                     # submit staged prompt
 ```
 
 ### Agent self-talk (strange loop)
@@ -314,7 +335,7 @@ These are enforced by automated tests and must hold for every change:
 | **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
 | **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no heuristics, no agent-type guessing |
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
-| **Security floor** | `type` normalizes embedded newlines to spaces and submits once, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
+| **Security floor** | `type` normalizes embedded newlines to spaces and must actually submit, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
 | **Security overhead tracked** | The test harness reports baseline vs guarded `type` latency as a metric, not a pass/fail gate |
 | **Audit trail** | `type` and `send` append JSONL audit records for both allowed and blocked actions |
 

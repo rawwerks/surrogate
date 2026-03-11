@@ -19,7 +19,7 @@ Surrogate is intentionally deterministic and does not offer unlimited authority 
 
 Current built-in guardrails:
 
-- `surrogate type` normalizes embedded newlines to spaces and submits once
+- `surrogate type` normalizes embedded newlines to spaces and must actually submit, not just stage text
 - `surrogate send` rejects `C-c`, `C-d`, and `C-z`
 - there is no global guard-disable mode
 - there is no persistent unsafe mode
@@ -105,7 +105,15 @@ surrogate type <session> "some text"
 # <session> can be an alias: surrogate type robo-quokka "some text"
 ```
 
-Keep `type` payloads single-line. Multiline/script payloads are reserved for direct human control.
+Keep `type` payloads single-line. Multiline/script payloads are reserved for direct human control. A successful `type` should correspond to an actual submitted prompt, not staged input.
+
+If the target TUI needs a slightly different cadence, `type` uses a fixed submit pause that can be configured via `SURROGATE_TYPE_ENTER_DELAY_SECS`.
+
+If text is visibly staged and only the missing Enter is needed, use:
+
+```bash
+surrogate submit my-session
+```
 
 ### Send special keys (tmux send-keys syntax)
 

@@ -52,6 +52,11 @@ bash install.sh                     # deployed binary matches repo
 aplumb status                       # no new drift introduced
 ```
 
+**When publishing to `main`:**
+```bash
+bash bin/surrogate-push-main       # safe-push + real reinstall + doctor
+```
+
 ### Design Constraints
 
 - **Deterministic only.** No heuristics, no agent-type detection, no ML.

@@ -6,6 +6,7 @@ BRIDGE_PREFIX="_surr_"
 ALIAS_FILE="${SURROGATE_TMP}/surrogate-aliases"
 AUDIT_FILE="${SURROGATE_AUDIT_FILE:-${SURROGATE_TMP}/surrogate-audit.jsonl}"
 SURROGATE_LABEL="${SURROGATE_LABEL:-on}"  # on | off | verbose
+SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-0.02}"
 
 # --- helpers (needed early) ---
 
@@ -14,6 +15,10 @@ die() { echo "surrogate: error: $*" >&2; exit 1; }
 require_int() {
     # Validate that $1 is a non-negative integer
     [[ "$1" =~ ^[0-9]+$ ]] || die "'$1' is not a valid number"
+}
+
+require_seconds() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "'$1' is not a valid seconds value"
 }
 
 check_deps() {
@@ -229,6 +234,7 @@ Usage: surrogate <command> [args]
 Commands:
   list                          List available zmx sessions (with aliases)
   send  <session> [keys...]     Send tmux send-keys style keystrokes
+  submit <session>              Press Enter for a staged prompt
   type  <session> <text>        Type literal text followed by Enter
   read  <session> [-n LINES]    Read recent output (default: 20 lines)
   wait  <session> <pattern> [-t TIMEOUT]
@@ -253,6 +259,8 @@ Environment:
   SURROGATE_LABEL=off      No prefix
   SURROGATE_LABEL=verbose  Include process name, cwd, PID in prefix
   SURROGATE_AUDIT_FILE     Audit log path (default: /tmp/surrogate-audit.jsonl)
+  SURROGATE_TYPE_ENTER_DELAY_SECS
+                          Fixed pause before Enter in `type` (default: 0.02)
 
 Special keys (for send):
   Enter Escape Tab Space BSpace
@@ -261,6 +269,7 @@ Special keys (for send):
 
 Examples:
   surrogate list
+  surrogate submit lazy-sheep
   surrogate type lazy-sheep "echo hello"
   surrogate type 2026-03-08_15-07-15_EDT-132628 "echo hello"
   surrogate send my-session Escape ":wq" Enter
@@ -354,6 +363,11 @@ cmd_send() {
     audit_event "send" "$session" "allow" "$send_detail"
 }
 
+cmd_submit() {
+    [[ $# -eq 1 ]] || die "usage: surrogate submit <session>"
+    cmd_send "$1" Enter
+}
+
 _surrogate_prefix() {
     # Build the [SURROGATE ...] prefix based on SURROGATE_LABEL mode
     case "$SURROGATE_LABEL" in
@@ -386,12 +400,14 @@ _surrogate_prefix() {
 cmd_type() {
     check_deps
     [[ $# -ge 2 ]] || die "usage: surrogate type <session> <text>"
+    local requested_session="$1"
     local session
-    session="$(resolve_session "$1")"
+    session="$(resolve_session "$requested_session")"
     local original_text="$2"
     local text
     text="$(normalize_type_text "$original_text")"
     [[ -n "$text" ]] || die "type text must not be empty"
+    require_seconds "$SURROGATE_TYPE_ENTER_DELAY_SECS"
     local guard_reason=""
     if ! guard_reason="$(scan_with_dcg "$text")"; then
         audit_event "type" "$session" "deny" "$original_text" "$guard_reason"
@@ -413,10 +429,14 @@ cmd_type() {
     local lock
     lock="$(lock_file "$session")"
 
-    (
+    if ! (
         flock 9
-        tmux send-keys -t "$bridge" -l "$text" \; send-keys -t "$bridge" Enter
-    ) 9>"$lock"
+        tmux send-keys -t "$bridge" -l "$text"
+        sleep "$SURROGATE_TYPE_ENTER_DELAY_SECS"
+        tmux send-keys -t "$bridge" Enter
+    ) 9>"$lock"; then
+        die "type delivery failed; if the text is already staged, run: surrogate submit $requested_session"
+    fi
     audit_event "type" "$session" "allow" "$text"
 }
 
@@ -792,6 +812,7 @@ cmd_status() {
 case "${1}" in
     list)    shift; cmd_list "$@" ;;
     send)    shift; cmd_send "$@" ;;
+    submit)  shift; cmd_submit "$@" ;;
     type)    shift; cmd_type "$@" ;;
     read)    shift; cmd_read "$@" ;;
     wait)    shift; cmd_wait "$@" ;;

@@ -38,7 +38,9 @@ Surrogate safety has two layers:
 
 The following rules are part of surrogate itself and must apply even when DCG is absent:
 
-1. The `type` command must normalize embedded newlines to spaces and submit once.
+1. The `type` command must normalize embedded newlines to spaces and submit once. A successful `type` must mean the prompt was actually submitted to the target application, not merely staged in the input field.
+2. The `type` delivery path must include a configurable fixed submit pause with a sensible default so Enter lands reliably in agent TUIs without introducing heuristics.
+3. If `type` transport fails after staging text, surrogate must provide one obvious repair path that agents can invoke directly.
 2. The `send` command must reject dangerous control keys: `C-c`, `C-d`, and `C-z`.
 3. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
 4. Surrogate must not implement a persistent unsafe mode.
@@ -119,7 +121,9 @@ The `send` command must accept a session name and one or more tmux send-keys arg
 
 ### type
 
-The `type` command must accept a session name and a text string. It must type the literal text followed by Enter. It must create a bridge lazily, update the watermark, and serialize via flock.
+The `type` command must accept a session name and a text string. It must type the literal text followed by Enter. A successful `type` must correspond to an actual submission, not a staged-but-unentered prompt. The delivery path must remain deterministic and include any fixed submit pause needed to make Enter land reliably in agent TUIs. The submit pause must be configurable with a sensible default. If transport fails after the text may already be staged, the error must point to a single obvious recovery command. It must create a bridge lazily, update the watermark, and serialize via flock.
+
+The `submit` command must accept a session name (or alias) and press Enter for a staged prompt. It exists as the deterministic one-command repair path if a prompt is visibly staged and needs to be submitted.
 
 ### read
 

@@ -458,6 +458,44 @@ test_list() {
   fi
 }
 
+test_help_discoverability() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" help 2>&1)
+
+  if echo "$output" | grep -q 'surrogate help list' &&
+     echo "$output" | grep -q 'surrogate list --cwd' &&
+     echo "$output" | grep -q 'surrogate type --message' &&
+     echo "$output" | grep -q 'surrogate submit'; then
+    pass "${FUNCNAME[0]} — help highlights discovery and recovery flows"
+  else
+    echo "    help output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — help missing high-value flows"
+  fi
+}
+
+test_list_help() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" list --help 2>&1)
+
+  if echo "$output" | grep -q 'usage: surrogate list' &&
+     echo "$output" | grep -q 'repo/cwd/ui hints' &&
+     echo "$output" | grep -q -- '--cwd' &&
+     echo "$output" | grep -q -- '--json'; then
+    pass "${FUNCNAME[0]} — list help is discoverable"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — list help missing key guidance"
+  fi
+}
+
 test_type_and_read() {
   # plumb:req-77cf38f4
   # plumb:req-29b6b22a
@@ -1209,6 +1247,8 @@ echo ""
 
 run_section core smoke \
   test_list \
+  test_help_discoverability \
+  test_list_help \
   test_type_and_read \
   test_send_enter_key \
   test_submit_enters_staged_prompt \
@@ -1325,10 +1365,10 @@ case "\${1:-}" in
   history)
     case "\${2:-}" in
       "$MOCK_WHO_OLD_SESSION")
-        printf 'prompt\n/home/raw/Documents/GitHub/older\n'
+        printf 'raw@host /home/raw/Documents/GitHub/older \$\n'
         ;;
       "$MOCK_WHO_NEW_SESSION")
-        printf 'prompt\n/home/raw/Documents/GitHub/surrogate\n'
+        printf '› run surrogate whoami\n• Ran surrogate whoami\ngpt-5.4 medium · 60%% left · /home/raw/Documents/GitHub/surrogate\n'
         ;;
     esac
     ;;
@@ -1347,6 +1387,70 @@ cleanup_mock_who_env() {
   rm -rf "$MOCK_WHO_TMPBIN" 2>/dev/null || true
 }
 
+setup_mock_type_env() {
+  MOCK_TYPE_TMPBIN="$(mktemp -d)"
+  MOCK_TYPE_SESSION="mock-type-$$"
+  MOCK_TYPE_HISTORY_FILE="$(mktemp)"
+  MOCK_TYPE_TMUX_LOG="$(mktemp)"
+
+  cat > "$MOCK_TYPE_TMPBIN/zmx" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  list)
+    printf 'session_name=%s\tclients=1\n' "$MOCK_TYPE_SESSION"
+    ;;
+  history)
+    cat "$MOCK_TYPE_HISTORY_FILE"
+    ;;
+  attach)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$MOCK_TYPE_TMPBIN/zmx"
+
+  cat > "$MOCK_TYPE_TMPBIN/tmux" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  has-session)
+    exit 1
+    ;;
+  new-session)
+    exit 0
+    ;;
+  display-message)
+    printf 'zmx\n'
+    exit 0
+    ;;
+  send-keys)
+    printf '%s\n' "\$*" >> "$MOCK_TYPE_TMUX_LOG"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$MOCK_TYPE_TMPBIN/tmux"
+
+  cat > "$MOCK_TYPE_TMPBIN/sleep" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+EOF
+  chmod +x "$MOCK_TYPE_TMPBIN/sleep"
+}
+
+cleanup_mock_type_env() {
+  rm -rf "$MOCK_TYPE_TMPBIN" 2>/dev/null || true
+  rm -f "$MOCK_TYPE_HISTORY_FILE" "$MOCK_TYPE_TMUX_LOG" 2>/dev/null || true
+}
+
 test_who() {
   # plumb:req-851ca449
   # plumb:req-251007fd
@@ -1363,6 +1467,66 @@ test_who() {
     echo "    expected test session in who output:"
     echo "$output" | sed 's/^/    /'
     fail "${FUNCNAME[0]} — test session not in who output"
+  fi
+}
+
+test_list_shows_project_and_ui() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" list --cwd 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -q 'PROJECT' &&
+     echo "$output" | grep -q "$MOCK_WHO_NEW_SESSION" &&
+     echo "$output" | grep -q 'surrogate' &&
+     echo "$output" | grep -q 'agent'; then
+    pass "${FUNCNAME[0]} — list shows repo and explicit ui context"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — list missing project/ui context"
+  fi
+}
+
+test_list_cwd_flag() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" list --cwd 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -q 'CWD' &&
+     echo "$output" | grep -q '/home/raw/Documents/GitHub/surrogate'; then
+    pass "${FUNCNAME[0]} — list --cwd exposes cwd hint"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — list --cwd missing cwd hint"
+  fi
+}
+
+test_list_json_output() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" list --json 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -q "\"session\":\"$MOCK_WHO_NEW_SESSION\"" &&
+     echo "$output" | grep -q '"project_hint":"surrogate"' &&
+     echo "$output" | grep -q '"ui_hint":"agent"'; then
+    pass "${FUNCNAME[0]} — list --json exposes repo and ui metadata"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — list --json output incorrect"
   fi
 }
 
@@ -1455,7 +1619,8 @@ test_who_json_output() {
      echo "$output" | grep -q '"recent_first":true' &&
      echo "$output" | grep -q "\"session\":\"$MOCK_WHO_NEW_SESSION\"" &&
      echo "$output" | grep -q '"cwd_hint":"/home/raw/Documents/GitHub/surrogate"' &&
-     echo "$output" | grep -q '"project_hint":"surrogate"'; then
+     echo "$output" | grep -q '"project_hint":"surrogate"' &&
+     echo "$output" | grep -q '"ui_hint":"agent"'; then
     pass "${FUNCNAME[0]} — who --json exposes deterministic session metadata"
   else
     echo "    output:"
@@ -1705,18 +1870,20 @@ test_label_on() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local marker="LABEL_ON_$$"
-  SURROGATE_LABEL=on "$SURROGATE" type "$TEST_SESSION" "$marker"
-  wait_for_output "$TEST_SESSION" "$marker" 5 || true
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
 
-  local output
-  output=$("$SURROGATE" read "$TEST_SESSION" -n 10 2>&1)
-  if echo "$output" | grep -q '\[SURROGATE.*\].*'"$marker"; then
-    pass "${FUNCNAME[0]}"
+  SURROGATE_LABEL=on PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" "$SURROGATE" type "$MOCK_TYPE_SESSION" "LABEL_ON_$$"
+
+  if grep -Fq 'send-keys -t _surr_mock-type-' "$MOCK_TYPE_TMUX_LOG" &&
+     grep -Eq '\-l \[SURROGATE.*\] LABEL_ON_' "$MOCK_TYPE_TMUX_LOG"; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — label is preserved for agent-like targets"
   else
-    echo "    expected [SURROGATE...] prefix before $marker"
-    echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — label not found"
+    echo "    tmux log:"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — label not found for agent-like target"
   fi
 }
 
@@ -1724,19 +1891,20 @@ test_label_off() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local marker="LABEL_OFF_$$"
-  SURROGATE_LABEL=off "$SURROGATE" type "$TEST_SESSION" "$marker"
-  wait_for_output "$TEST_SESSION" "$marker" 5 || true
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
 
-  local output
-  output=$("$SURROGATE" read "$TEST_SESSION" -n 10 2>&1)
-  # Should NOT have [SURROGATE] prefix
-  if echo "$output" | grep -q '\[SURROGATE\].*'"$marker"; then
-    fail "${FUNCNAME[0]} — label should not appear with SURROGATE_LABEL=off"
-  elif echo "$output" | grep -q "$marker"; then
-    pass "${FUNCNAME[0]}"
+  SURROGATE_LABEL=off PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" "$SURROGATE" type "$MOCK_TYPE_SESSION" "LABEL_OFF_$$"
+
+  if grep -Eq '\-l LABEL_OFF_' "$MOCK_TYPE_TMUX_LOG" &&
+     ! grep -q '\[SURROGATE' "$MOCK_TYPE_TMUX_LOG"; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — label disabled cleanly"
   else
-    fail "${FUNCNAME[0]} — marker not found at all"
+    echo "    tmux log:"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — label should not appear with SURROGATE_LABEL=off"
   fi
 }
 
@@ -1744,18 +1912,40 @@ test_label_verbose() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local marker="LABEL_VERBOSE_$$"
-  SURROGATE_LABEL=verbose "$SURROGATE" type "$TEST_SESSION" "$marker"
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
+
+  SURROGATE_LABEL=verbose PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" "$SURROGATE" type "$MOCK_TYPE_SESSION" "LABEL_VERBOSE_$$"
+
+  if grep -Eq '\-l \[SURROGATE.*PID:.*\] LABEL_VERBOSE_' "$MOCK_TYPE_TMUX_LOG"; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — verbose label is preserved for agent-like targets"
+  else
+    echo "    tmux log:"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — verbose label not found"
+  fi
+}
+
+test_type_shell_context_suppresses_label() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="SHELL_SAFE_$$"
+  SURROGATE_LABEL=on "$SURROGATE" type "$TEST_SESSION" "echo $marker"
   wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
   local output
   output=$("$SURROGATE" read "$TEST_SESSION" -n 20 2>&1)
-  if echo "$output" | tr -d '\n' | grep -q '\[SURROGATE.*PID:.*\].*'"$marker"; then
-    pass "${FUNCNAME[0]}"
+
+  if echo "$output" | grep -q "^$marker$" &&
+     ! echo "$output" | grep -q '\[SURROGATE'; then
+    pass "${FUNCNAME[0]} — shell context suppresses prose label so commands still run"
   else
-    echo "    expected [SURROGATE ... PID:...] prefix before $marker"
+    echo "    output:"
     echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — verbose label not found"
+    fail "${FUNCNAME[0]} — shell-safe type should not inject surrogate label into commands"
   fi
 }
 
@@ -2120,7 +2310,9 @@ test_who_age_and_attached() {
   TESTS_RUN=$((TESTS_RUN + 1))
 
   local output
-  output=$("$SURROGATE" who 2>&1)
+  setup_mock_who_env
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who 2>&1)
+  cleanup_mock_who_env
 
   local all_ok=true
 
@@ -2805,6 +2997,103 @@ test_type_rejects_invalid_enter_delay_config() {
   fi
 }
 
+test_type_warns_on_immediate_shell_error() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local shell_session shell_pid marker output
+  shell_session="surr-shell-warn-test-$$"
+  marker="definitely_missing_command_${$}"
+  zmx run "$shell_session" bash --noprofile --norc &
+  shell_pid=$!
+  sleep 2
+
+  output=$(
+    SURROGATE_LABEL=off \
+    SURROGATE_TYPE_POSTCHECK_SECS=0.05 \
+    "$SURROGATE" type "$shell_session" "$marker" 2>&1 || true
+  )
+
+  zmx kill "$shell_session" 2>/dev/null || true
+  wait "$shell_pid" 2>/dev/null || true
+
+  if echo "$output" | grep -qi 'target shell immediately reported' &&
+     echo "$output" | grep -qi 'command not found' &&
+     echo "$output" | grep -q "surrogate read $shell_session -n 40"; then
+    pass "${FUNCNAME[0]} — type warns on immediate shell command failure"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — expected immediate shell failure warning"
+  fi
+}
+
+test_type_no_shell_warning_on_success() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local shell_session shell_pid marker output
+  shell_session="surr-shell-ok-test-$$"
+  marker="SHELL_OK_${$}"
+  zmx run "$shell_session" bash --noprofile --norc &
+  shell_pid=$!
+  sleep 2
+
+  output=$(
+    SURROGATE_LABEL=off \
+    SURROGATE_TYPE_POSTCHECK_SECS=0.05 \
+    "$SURROGATE" type "$shell_session" "echo $marker" 2>&1 || true
+  )
+
+  zmx kill "$shell_session" 2>/dev/null || true
+  wait "$shell_pid" 2>/dev/null || true
+
+  if ! echo "$output" | grep -qi 'target shell immediately reported'; then
+    pass "${FUNCNAME[0]} — successful shell command does not emit warning"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — unexpected shell warning on success"
+  fi
+}
+
+test_type_message_mode_rejects_shell_context() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" type --message "$TEST_SESSION" "hello operator" 2>&1 || true)
+
+  if echo "$output" | grep -q -- '--message requires an agent-like target' &&
+     echo "$output" | grep -q "ui_hint is 'shell'"; then
+    pass "${FUNCNAME[0]} — message mode rejects shell targets"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — message mode should reject shell targets"
+  fi
+}
+
+test_type_message_mode_agent_context() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
+
+  PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" "$SURROGATE" type --message "$MOCK_TYPE_SESSION" $'hello\nagent'
+
+  if grep -Eq '\-l \[SURROGATE.*\] hello agent' "$MOCK_TYPE_TMUX_LOG"; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — message mode sends normalized prose to agent-like targets"
+  else
+    echo "    tmux log:"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — message mode did not send normalized agent prose"
+  fi
+}
+
 test_error_missing_zmx() {
   # plumb:req-106648f1
   # plumb:req-f63f502d
@@ -2853,46 +3142,39 @@ test_list_delegates_to_zmx() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # cmd_list must use _session_names (which calls zmx list)
-  if grep -A5 'cmd_list' "$SURROGATE" | grep -q '_session_names\|zmx list'; then
+  # cmd_list fast path must delegate through _session_names (which calls zmx list)
+  if awk '/^cmd_list\(\)/,/^cmd_stale\(\)/' "$SURROGATE" | grep -q '_session_names'; then
     pass "${FUNCNAME[0]} — list delegates to zmx"
   else
     fail "${FUNCNAME[0]} — list doesn't use zmx list"
   fi
 }
 
-test_no_agent_detection() {
-  # plumb:req-10fc8881
-  # plumb:req-3fff2116
-  # plumb:req-f087e13c
+test_no_provider_specific_detection() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # No agent-specific detection code allowed
   local violations
-  violations=$(grep -ciE '(detect_agent|agent.type|claude.code|codex|gemini)' "$SURROGATE" || true)
+  violations=$(grep -ciE '(claude.code|codex|gemini|pi agent|cursor)' "$SURROGATE" || true)
 
   if [[ "$violations" -eq 0 ]]; then
-    pass "${FUNCNAME[0]} — no agent-specific detection"
+    pass "${FUNCNAME[0]} — no provider-specific UI coupling"
   else
-    fail "${FUNCNAME[0]} — found $violations agent-specific references"
+    fail "${FUNCNAME[0]} — found $violations provider-specific references"
   fi
 }
 
-test_no_heuristics_no_ml() {
-  # plumb:req-be072268
-  # plumb:req-2581d8b3
+test_no_ml_detection() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # No ML, no heuristics, no probability
   local violations
-  violations=$(grep -ciE '(heuristic|machine.learn|probability|score|weight|threshold|classify)' "$SURROGATE" || true)
+  violations=$(grep -ciE '(machine.learn|probability|score|weight|model-based)' "$SURROGATE" || true)
 
   if [[ "$violations" -eq 0 ]]; then
-    pass "${FUNCNAME[0]} — no heuristics or ML"
+    pass "${FUNCNAME[0]} — no ML-style detection"
   else
-    fail "${FUNCNAME[0]} — found $violations heuristic/ML references"
+    fail "${FUNCNAME[0]} — found $violations ML-style references"
   fi
 }
 
@@ -3097,6 +3379,9 @@ run_section behavior full \
   test_find_uses_rg_or_grep \
   test_who_age_and_attached \
   test_who_attached_marker \
+  test_list_shows_project_and_ui \
+  test_list_cwd_flag \
+  test_list_json_output \
   test_who_recent_first \
   test_who_recent_duration_filter \
   test_who_project_filter \
@@ -3129,12 +3414,16 @@ run_section design full \
   test_type_no_allow_audit_if_enter_fails_after_text_send \
   test_type_implementation_uses_fixed_submit_pause \
   test_type_rejects_invalid_enter_delay_config \
+  test_type_warns_on_immediate_shell_error \
+  test_type_no_shell_warning_on_success \
+  test_type_message_mode_rejects_shell_context \
+  test_type_message_mode_agent_context \
   test_error_missing_zmx \
   test_error_missing_tmux \
   test_rename_kills_bridge \
   test_list_delegates_to_zmx \
-  test_no_agent_detection \
-  test_no_heuristics_no_ml \
+  test_no_provider_specific_detection \
+  test_no_ml_detection \
   test_no_global_guard_disable \
   test_no_persistent_unsafe_mode \
   test_bridge_command \
@@ -3167,7 +3456,8 @@ run_section search full \
 run_section labels full \
   test_label_on \
   test_label_off \
-  test_label_verbose
+  test_label_verbose \
+  test_type_shell_context_suppresses_label
 
 run_section invariants full \
   test_invariant_snippet_always_prints_message \

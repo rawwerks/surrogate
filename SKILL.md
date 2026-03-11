@@ -47,8 +47,13 @@ surrogate alias 2026-03-08_20-44-12_EDT-539343    # → shiny-dolphin
 ### Discover sessions
 
 ```bash
+surrogate help list
 surrogate list
-# Shows alias + full session name for every session
+# Fast alias + full session name for every session
+surrogate list --cwd
+# Adds repo, cwd, and ui_hint (shell/agent/unknown)
+surrogate list --json
+# Machine-readable repo/cwd/ui metadata
 ```
 
 ### Search across all sessions
@@ -64,7 +69,7 @@ surrogate find "TODO" -n 500 -C 3
 
 ```bash
 surrogate who [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
-# Newest first, with age, session name, last visible line, and optional filters
+# Newest 20 first by default, with age, ui_hint, session name, repo, and optional filters
 surrogate who
 surrogate who --recent 20
 surrogate who --project surrogate
@@ -72,6 +77,8 @@ surrogate who --cwd /home/raw/Documents/GitHub/surrogate
 surrogate who --json
 surrogate who -n 20   # inspect more history for snippet and path hints
 ```
+
+`ui_hint` is deterministic and generic: `shell`, `agent`, or `unknown`. It is derived from visible output only.
 
 ### Show attached sessions
 
@@ -133,6 +140,16 @@ surrogate type <session> "some text"
 ```
 
 `type` auto-normalizes long prose by flattening embedded newlines to spaces and then submitting once. This is meant for conversational prompts, not scripts. A successful `type` should correspond to an actual submitted prompt, not staged input.
+
+Default `type` is shell-safe. If the target looks like a shell, Surrogate suppresses the prose prefix so commands still execute normally, then warns if the shell immediately reports `command not found` or a syntax error.
+
+For long conversational prompts into agent TUIs, use message mode:
+
+```bash
+surrogate type --message <session> "Please review the patch plan above."
+```
+
+`--message` is safer than plain `type` for prose because it requires an `agent` ui_hint and refuses `shell` or `unknown` targets.
 
 If the target TUI needs a slightly different cadence, `type` uses a fixed submit pause that can be configured via `SURROGATE_TYPE_ENTER_DELAY_SECS`.
 

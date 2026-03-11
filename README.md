@@ -166,7 +166,10 @@ All commands that take a `<session>` argument accept either the full zmx name or
 ### List available sessions
 
 ```bash
-surrogate list                           # shows alias + full name
+surrogate help list                      # discoverable list help + flags
+surrogate list                           # fast alias + full name view
+surrogate list --cwd                     # repo, cwd, and shell/agent hint
+surrogate list --json                    # machine-readable repo/cwd/ui metadata
 ```
 
 ### Search all sessions
@@ -179,7 +182,7 @@ surrogate find "TODO" -n 500 -C 3       # deeper search with context lines
 ### Show sessions with snippets
 
 ```bash
-surrogate who                            # newest first: age, session name, last visible line
+surrogate who                            # newest 20 first: age, ui, session, repo, last visible line
 surrogate who --recent 20                # show the 20 most recent sessions
 surrogate who --recent 2h                # only sessions seen in the last 2 hours
 surrogate who --project surrogate        # filter by visible repo basename hint
@@ -188,7 +191,7 @@ surrogate who --json                     # machine-readable output for agents/sc
 surrogate who -n 20                      # inspect more recent history for snippet/hints
 ```
 
-`--project` and `--cwd` are deterministic visibility filters derived from recent visible output. They are convenient hints, not authoritative process cwd introspection.
+`--project`, `--cwd`, and the shell-vs-agent UI hint are deterministic visibility hints derived from recent visible output. They are convenient hints, not authoritative process introspection.
 
 ### Show attached sessions
 
@@ -244,6 +247,20 @@ surrogate type <session> "echo hello world"
 ```
 
 `type` auto-handles long prose by flattening embedded newlines into spaces and submitting once. A successful `type` means the text was actually submitted, not just left sitting in the target input buffer.
+
+Default `type` is now shell-safe:
+
+- if the target looks like a shell, surrogate suppresses the `[SURROGATE ...]` prose prefix so commands still execute normally
+- after submission, surrogate checks fresh shell output and warns on immediate failures like `command not found` or syntax errors
+- the warning points you to `surrogate read <session> -n 40`
+
+For agent-to-agent prose, use the explicit message mode:
+
+```bash
+surrogate type --message <session> "Long conversational prompt..."
+```
+
+`--message` requires an agent-like target and refuses shell or unknown contexts. Use it when you want safer long-form prose delivery into a coding-agent TUI.
 
 The submit pause is configurable:
 
@@ -370,7 +387,7 @@ These are enforced by automated tests and must hold for every change:
 | **Full path to zmx** | Snippet uses `$HOME/.local/bin/zmx`, not `command -v zmx` (PATH isn't set when rc files run) |
 | **Parent process check** | Double-wrap prevention checks parent process name (`ps -o comm= -p $PPID`), not `$ZMX_SESSION` env var (which leaks through window managers to all children) |
 | **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
-| **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no heuristics, no agent-type guessing |
+| **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no provider-specific parsing or ML |
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |
 | **Security floor** | `type` normalizes embedded newlines to spaces and must actually submit, self-targeted `type`/`send`/`submit` are rejected with identity context, `send` rejects `C-c`/`C-d`/`C-z`, and DCG denials block `type` when DCG is installed |
 | **Security overhead tracked** | The test harness reports baseline vs guarded `type` latency as a metric, not a pass/fail gate |

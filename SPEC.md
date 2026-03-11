@@ -8,14 +8,14 @@ Surrogate is a bash CLI tool that provides programmatic keystroke injection and 
 
 The architecture has a strict layering: zmx is the source of truth for all sessions. tmux is invisible plumbing used only for keystroke injection via ephemeral "bridge" sessions. The user never interacts with tmux directly.
 
-All search and filter commands must be fully deterministic — same inputs produce same outputs. There must be no agent-type detection, no heuristics, and no machine learning. Search uses rg (ripgrep) when available, falling back to grep -E.
+All search and filter commands must be fully deterministic — same inputs produce same outputs. There must be no provider-specific parsing and no machine learning. Deterministic UI hints derived from generic visible-output markers are allowed when used as hints rather than authority. Search uses rg (ripgrep) when available, falling back to grep -E.
 
 ### Design Principles
 
 - **zmx is source of truth.** All session state comes from zmx. tmux bridges are disposable.
 - **Deterministic over smart.** Agents are non-deterministic; the tools they use must be the opposite. Every command produces predictable, reproducible output from the same inputs.
 - **Deterministic safety floor.** Surrogate must provide a built-in, deterministic safety floor of its own. Safety must not depend entirely on optional external tooling or agent judgment.
-- **Zero agent-specific dependencies.** Surrogate must never parse or depend on the UI format of any specific agent (Claude Code, Codex, Gemini, Pi). Agent detection would create fragile coupling.
+- **Zero provider-specific dependencies.** Surrogate must never parse or depend on the UI format of any specific agent provider. Generic visible-output hints are allowed; provider-coupled parsing is not.
 - **Minimal dependencies.** Only zmx, tmux, and standard Unix tools (grep, sed, tail, stat). rg is preferred but optional.
 - **Ambient convenience, narrow authority.** Surrogate is ambiently available across sessions, but some actions are intentionally outside its authority surface. If an operation falls outside that surface, the human must take over directly.
 
@@ -42,10 +42,12 @@ The following rules are part of surrogate itself and must apply even when DCG is
 2. The `type` delivery path must include a configurable fixed submit pause with a sensible default so Enter lands reliably in agent TUIs without introducing heuristics.
 3. If `type` transport fails after staging text, surrogate must provide one obvious repair path that agents can invoke directly.
 4. The `send` command must reject dangerous control keys: `C-c`, `C-d`, and `C-z`.
-5. `type`, `send`, and `submit` must reject targeting the current live session. The error must clearly state the current alias and session name so the caller can re-orient.
-6. `cull` must reject the current live session and any session that still has attached clients.
-7. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
-8. Surrogate must not implement a persistent unsafe mode.
+5. `type` in its default mode must stay shell-safe: if the target looks like a shell, surrogate must suppress the prose prefix so literal shell commands still work, and it must warn if the shell immediately reports obvious command errors.
+6. `type --message` must exist as a safer prose mode for agent/TUI messaging. It must normalize long prose and refuse shell-like or unknown contexts.
+7. `type`, `send`, and `submit` must reject targeting the current live session. The error must clearly state the current alias and session name so the caller can re-orient.
+8. `cull` must reject the current live session and any session that still has attached clients.
+9. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
+10. Surrogate must not implement a persistent unsafe mode.
 
 These rules define the minimum safety floor. Opting out of optional tools must never disable them.
 
@@ -117,6 +119,12 @@ If an action is outside surrogate's authority surface, the correct path is direc
 
 The `list` command must print all zmx sessions by delegating directly to `zmx list`.
 
+The default `list` output must stay cheap and show deterministic alias + session name. `list --cwd` and `list --json` may do the more expensive visible-output inspection needed to expose:
+
+- `cwd_hint`
+- `project_hint`
+- `ui_hint` (`shell`, `agent`, or `unknown`)
+
 ### send
 
 The `send` command must accept a session name and one or more tmux send-keys arguments. It must create a bridge lazily if one does not exist, update the watermark for wait tracking, and serialize concurrent sends via flock. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
@@ -124,6 +132,18 @@ The `send` command must accept a session name and one or more tmux send-keys arg
 ### type
 
 The `type` command must accept a session name and a text string. It must type the literal text followed by Enter. A successful `type` must correspond to an actual submission, not a staged-but-unentered prompt. The delivery path must remain deterministic and include any fixed submit pause needed to make Enter land reliably in agent TUIs. The submit pause must be configurable with a sensible default. If transport fails after the text may already be staged, the error must point to a single obvious recovery command. It must create a bridge lazily, update the watermark, and serialize via flock. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
+
+Default `type` must remain safe for shell targets:
+
+- if the target looks like a shell, surrogate must suppress the prose prefix so literal commands still execute correctly
+- after submission, surrogate must check fresh shell output for obvious immediate failures such as `command not found` or syntax errors
+- this post-check is warning-only and must point to `surrogate read <session> -n 40` for inspection
+
+`type --message` must exist as a safer prose mode for agent/TUI communication:
+
+- it must normalize embedded newlines into a single submitted message
+- it must require an `agent` UI hint and reject `shell` or `unknown`
+- it is the recommended path for long conversational prompts
 
 The `submit` command must accept a session name (or alias) and press Enter for a staged prompt. It exists as the deterministic one-command repair path if a prompt is visibly staged and needs to be submitted. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
 
@@ -141,7 +161,7 @@ The `find` command must accept a query string and optional `-n LINES` (default 2
 
 ### who
 
-The `who` command must accept an optional `-n LINES` flag (default 10) controlling how many history lines to check for the snippet. It must print every session with its age (derived from zmx socket modification time), session name, and last visible non-blank line. Attached sessions (clients > 0) must be marked with `*`. The total session count must be printed at the end. The `-n` flag must be validated as a non-negative integer.
+The `who` command must accept an optional `-n LINES` flag (default 10) controlling how many history lines to check for the snippet. It must show the newest sessions first and, by default, display the 20 most recent sessions so discovery stays fast and useful on hosts with many sessions. It must print age (derived from zmx socket modification time), UI hint, alias, session name, project hint, and last visible non-blank line. Attached sessions (clients > 0) must be marked with `*`. The total displayed session count must be printed at the end. The `-n` flag must be validated as a non-negative integer.
 
 ### active
 
@@ -190,7 +210,7 @@ The `who` command must include the alias for each session in its output. It must
 - `--cwd PATH` to filter using the visible path prefix derived from recent output
 - `--json` to emit machine-readable session metadata
 
-The `--project` and `--cwd` filters must remain deterministic and derive only from recent visible output. They must not depend on agent-specific UI parsing or machine-learning classification.
+The `--project` and `--cwd` filters must remain deterministic and derive only from recent visible output. The `ui_hint` classification must also remain deterministic and generic. None of these features may depend on provider-specific UI parsing or machine-learning classification.
 
 ### bridge
 

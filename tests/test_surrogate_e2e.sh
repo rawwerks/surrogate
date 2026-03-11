@@ -1688,6 +1688,49 @@ test_type_normalizes_multiline_prose() {
   fi
 }
 
+test_type_rejects_empty_after_normalization() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$(SURROGATE_LABEL=off "$SURROGATE" type "$TEST_SESSION" $'\n \t \r\n' 2>&1 || true)
+
+  if echo "$output" | grep -q 'type text must not be empty'; then
+    pass "${FUNCNAME[0]} — whitespace-only prose rejected after normalization"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — expected whitespace-only prose to be rejected"
+  fi
+}
+
+test_type_normalizes_tabs_and_crlf() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local prose_session prose_pid output
+  prose_session="surr-prose-crlf-test-$$"
+  zmx run "$prose_session" cat &
+  prose_pid=$!
+  sleep 2
+
+  SURROGATE_LABEL=off "$SURROGATE" type "$prose_session" $'hello\tthere\r\nfriend'
+  sleep 1
+
+  output=$(SURROGATE_LABEL=off "$SURROGATE" read "$prose_session" -n 5 2>&1 || true)
+
+  zmx kill "$prose_session" 2>/dev/null || true
+  wait "$prose_pid" 2>/dev/null || true
+
+  if echo "$output" | grep -q '^hello there friend$'; then
+    pass "${FUNCNAME[0]} — tabs and CRLF normalized into one submitted line"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — expected tabs and CRLF to be normalized"
+  fi
+}
+
 test_send_rejects_dangerous_control_keys() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -1725,6 +1768,33 @@ EOF
     pass "${FUNCNAME[0]} — dcg denial respected"
   else
     fail "${FUNCNAME[0]} — dcg denial not surfaced: $output"
+  fi
+}
+
+test_dcg_blocks_normalized_multiline_type() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmpbin output
+  tmpbin="$(mktemp -d)"
+  cat > "$tmpbin/dcg" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "--robot" && "$2" == "test" && "$3" == *"git reset --hard HEAD~1"* ]]; then
+  echo '{"decision":"deny","reason":"blocked by mock dcg after normalization"}'
+  exit 1
+fi
+exit 0
+EOF
+  chmod +x "$tmpbin/dcg"
+
+  output=$(PATH="$tmpbin:$PATH" "$SURROGATE" type "$TEST_SESSION" $'git reset --hard\nHEAD~1' 2>&1 || true)
+
+  if echo "$output" | grep -qi 'dcg denied payload'; then
+    pass "${FUNCNAME[0]} — dcg denial respected after multiline normalization"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — expected dcg to deny normalized multiline type"
   fi
 }
 
@@ -2176,8 +2246,11 @@ run_test test_error_prefix
 run_test test_error_missing_session
 run_test test_security_model_section_exists
 run_test test_type_normalizes_multiline_prose
+run_test test_type_rejects_empty_after_normalization
+run_test test_type_normalizes_tabs_and_crlf
 run_test test_send_rejects_dangerous_control_keys
 run_test test_dcg_blocks_type_when_available
+run_test test_dcg_blocks_normalized_multiline_type
 run_test test_audit_logs_allowed_type
 run_test test_audit_logs_blocked_send
 run_test test_type_uses_single_tmux_invocation_for_text_and_enter

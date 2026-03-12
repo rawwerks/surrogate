@@ -49,6 +49,7 @@ snippet_for() {
 # INVARIANT: Always prints "surrogate:" status line, regardless of terminal app.
 if [[ -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]]; then
   _surr_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
+  _surr_surrogate="${SURROGATE_BIN:-$HOME/.local/bin/surrogate}"
   if [[ -x "$_surr_zmx" ]]; then
     _surr_parent="$(ps -o comm= -p $PPID 2>/dev/null)"
     if [[ "$_surr_parent" != "zmx" ]]; then
@@ -57,9 +58,18 @@ if [[ -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]]; then
       unset ZMX_SESSION
       exec "$_surr_zmx" attach "$_surr_name"
     else
-      echo "surrogate: zmx session ${ZMX_SESSION:-inherited}"
+      _surr_alias=""
+      _surr_path="$(dirname "$_surr_surrogate"):$(dirname "$_surr_zmx"):${PATH:-/usr/bin:/bin}"
+      if [[ -n "${ZMX_SESSION:-}" && -x "$_surr_surrogate" ]]; then
+        _surr_alias="$(PATH="$_surr_path" "$_surr_surrogate" alias "$ZMX_SESSION" 2>/dev/null || true)"
+      fi
+      if [[ -n "$_surr_alias" ]]; then
+        echo "surrogate: zmx session ${ZMX_SESSION:-inherited} alias $_surr_alias"
+      else
+        echo "surrogate: zmx session ${ZMX_SESSION:-inherited}"
+      fi
     fi
-    unset _surr_parent _surr_zmx
+    unset _surr_alias _surr_parent _surr_path _surr_surrogate _surr_zmx
   fi
 fi
 # surrogate:zmx:end
@@ -72,6 +82,7 @@ SNIPPET
 # INVARIANT: Always prints "surrogate:" status line, regardless of terminal app.
 if not set -q SURROGATE_NO_ZMX; and status is-interactive
   set -l _surr_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
+  set -l _surr_surrogate (set -q SURROGATE_BIN; and echo $SURROGATE_BIN; or echo $HOME/.local/bin/surrogate)
   if test -x "$_surr_zmx"
     set -l _surr_parent (ps -o comm= -p %self 2>/dev/null)
     if test "$_surr_parent" != "zmx"
@@ -80,7 +91,17 @@ if not set -q SURROGATE_NO_ZMX; and status is-interactive
       set -e ZMX_SESSION
       exec $_surr_zmx attach $_surr_name
     else
-      echo "surrogate: zmx session "(set -q ZMX_SESSION; and echo $ZMX_SESSION; or echo "inherited")
+      set -l _surr_session (set -q ZMX_SESSION; and echo $ZMX_SESSION; or echo "inherited")
+      set -l _surr_alias ""
+      set -l _surr_path (dirname "$_surr_surrogate")":"(dirname "$_surr_zmx")":"(string join ":" $PATH)
+      if set -q ZMX_SESSION; and test -x "$_surr_surrogate"
+        set _surr_alias (env PATH="$_surr_path" $_surr_surrogate alias "$ZMX_SESSION" 2>/dev/null)
+      end
+      if test -n "$_surr_alias"
+        echo "surrogate: zmx session $_surr_session alias $_surr_alias"
+      else
+        echo "surrogate: zmx session $_surr_session"
+      end
     end
   end
 end

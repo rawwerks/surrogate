@@ -48,7 +48,7 @@ surrogate-shell-setup --install
 surrogate-doctor
 ```
 
-This installs `surrogate`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`. It also tries to install [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) by default as a recommended safety guard. If dcg install fails, surrogate still installs and works.
+This installs `surrogate`, `surrogate-brief`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`. `surrogate-brief` is optional and only used for OpenRouter-backed remote summaries; core `surrogate` session control does not require any API key. It also tries to install [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) by default as a recommended safety guard. If dcg install fails, surrogate still installs and works.
 
 For contributors working from a checkout, use dev-link mode so the installed CLI never drifts from the repo:
 
@@ -199,6 +199,56 @@ surrogate who -n 20                      # inspect more recent history for snipp
 surrogate active                         # only sessions with clients attached
 surrogate active --all                   # include non-empty detached sessions
 ```
+
+### Remote operator briefs with OpenRouter
+
+This path is optional and requires an OpenRouter API key. Core `surrogate` usage remains local and has no API cost.
+
+If `OPENROUTER_API_KEY` is set, you can summarize active windows with one API call per zmx session. By default it uses model `z-ai/glm-4.7` with preferred provider `cerebras`.
+
+Recommended entrypoint:
+
+```bash
+surrogate brief --recent 15
+surrogate brief 15
+surrogate brief silly-pixel
+```
+
+`surrogate brief` reuses the existing activity-ranked session selection logic from `surrogate active --recent ...`, so it filters by recent activity, not recent spawn time.
+
+Lower-level helper:
+
+```bash
+surrogate-brief                          # all attached sessions, 500 lines each
+surrogate-brief glossy-hedgehog          # one session by alias
+surrogate-brief -n 800 --max-completion-tokens 1800 silly-pixel
+surrogate-brief --openrouter-model openai/gpt-4.1-mini --inference-provider openai silly-pixel
+surrogate-brief --show-config
+```
+
+Each session summary includes:
+- `STATUS`
+- `LAST COMPLETED`
+- `PROPOSED NEXT STEPS`
+- `USER INPUT NEEDED`
+- `BLOCKERS`
+
+Defaults:
+- Scrollback window: `500` lines
+- Completion budget: `1200` tokens per session
+- OpenRouter model: `z-ai/glm-4.7`
+- Preferred inference provider: `cerebras`
+
+Config file:
+
+```bash
+mkdir -p ~/.config/surrogate
+cp surrogate-brief.conf.example ~/.config/surrogate/brief.conf
+```
+
+CLI flags override config values.
+
+If the key is missing, `surrogate-brief` prints the exact setup steps needed to enable it.
 
 ### Show stale detached sessions
 
@@ -382,9 +432,11 @@ These are enforced by automated tests and must hold for every change:
 | Invariant | Description |
 |-----------|-------------|
 | **Always prints status** | Every terminal session prints `surrogate:` on startup, whether zmx was wrapped by the snippet or inherited from the terminal emulator |
+| **Inherited status shows alias** | When a shell starts inside an existing zmx session, the startup line includes both the zmx session name and the surrogate alias when lookup succeeds |
 | **All shells supported** | bash, zsh, and fish snippets all have both wrap and inherit code paths |
 | **Terminal-agnostic** | Zero references to specific terminal emulators in snippets or CLI |
 | **Full path to zmx** | Snippet uses `$HOME/.local/bin/zmx`, not `command -v zmx` (PATH isn't set when rc files run) |
+| **Full path to surrogate** | Snippet uses `$HOME/.local/bin/surrogate` for inherited-session alias lookup, not `command -v surrogate`, and seeds a minimal `PATH` so lookup works before shell init finishes |
 | **Parent process check** | Double-wrap prevention checks parent process name (`ps -o comm= -p $PPID`), not `$ZMX_SESSION` env var (which leaks through window managers to all children) |
 | **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
 | **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no provider-specific parsing or ML |
@@ -409,5 +461,5 @@ The default smoke run covers the core end-to-end paths and safety regressions qu
 surrogate-shell-setup --uninstall
 
 # Remove binaries
-rm ~/.local/bin/surrogate ~/.local/bin/surrogate-shell-setup
+rm ~/.local/bin/surrogate ~/.local/bin/surrogate-brief ~/.local/bin/surrogate-shell-setup
 ```

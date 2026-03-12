@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+die() { echo "surrogate-brief: error: $*" >&2; exit 1; }
+require_int() { [[ "$1" =~ ^[0-9]+$ ]] || die "'$1' is not a valid number"; }
+require_float() { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "'$1' is not a valid float"; }
+
+key_setup_help() {
+    local config_path="$1"
+    cat >&2 <<EOF
+surrogate-brief: error: OPENROUTER_API_KEY is not set and was not found in ~/.profile
+
+To enable remote briefs:
+  1. Add your OpenRouter key to ~/.profile:
+     export OPENROUTER_API_KEY="sk-or-v1-..."
+  2. Reload your shell:
+     source ~/.profile
+  3. Optional: create a defaults file at:
+     $config_path
+  4. Inspect effective settings:
+     surrogate-brief --show-config
+  5. Run a single-session test:
+     surrogate-brief silly-pixel
+
+One-shot alternative:
+  OPENROUTER_API_KEY="sk-or-v1-..." surrogate-brief silly-pixel
+EOF
+    exit 1
+}
+
+load_profile_api_key() {
+    [[ -n "${OPENROUTER_API_KEY:-}" ]] && return 0
+    [[ -r "$HOME/.profile" ]] || return 0
+
+    # shellcheck disable=SC1090
+    (
+        set +u
+        . "$HOME/.profile" >/dev/null 2>&1 || true
+        printf '%s' "${OPENROUTER_API_KEY:-}"
+    )
+}
+
+load_config_file() {
+    local path="$1"
+    [[ -n "$path" ]] || return 0
+    [[ -e "$path" ]] || return 0
+    [[ -r "$path" ]] || die "config file '$path' is not readable"
+
+    # shellcheck disable=SC1090
+    set +u
+    . "$path"
+    set -u
+}
+
+usage() {
+    cat <<'EOF'
+usage: surrogate-brief [options] [session|alias ...]
+
+Summarize zmx session history with one OpenRouter API call per target session.
+
+This helper is optional. Core surrogate usage remains local and has no API cost.
+
+If no session or alias is provided, attached zmx sessions are summarized.
+
+Options:
+  --config PATH                 Config file (default: ~/.config/surrogate/brief.conf)
+  --no-config                   Ignore config files
+  -n LINES                      History lines per session (default: 500)
+  --model MODEL                 Model override
+  --openrouter-model MODEL      OpenRouter model override
+  --llm-model MODEL             Alias for --openrouter-model
+  --provider PROVIDER           Provider override
+  --inference-provider PROVIDER OpenRouter inference provider override
+  --no-fallbacks                Restrict routing to the preferred provider only
+  --temperature FLOAT           Sampling temperature (default: 0.1)
+  --max-completion-tokens N     Completion budget per session (default: 1200)
+  --api-url URL                 Override chat completions endpoint
+  --show-config                 Print effective config and exit
+  -h, --help                    Show this help
+
+Environment:
+  OPENROUTER_API_KEY            API key (loaded from ~/.profile if unset)
+  OPENROUTER_API_URL            Optional API URL override
+  SURROGATE_BRIEF_CONFIG        Optional config file override
+EOF
+}
+
+check_deps() {
+    local config_path="$1"
+    command -v zmx >/dev/null 2>&1 || die "zmx not found"
+    command -v surrogate >/dev/null 2>&1 || die "surrogate not found"
+    command -v curl >/dev/null 2>&1 || die "curl not found"
+    command -v python3 >/dev/null 2>&1 || die "python3 not found"
+
+    if [[ -z "${OPENROUTER_API_KEY:-}" ]]; then
+        OPENROUTER_API_KEY="$(load_profile_api_key)"
+        export OPENROUTER_API_KEY
+    fi
+    [[ -n "${OPENROUTER_API_KEY:-}" ]] || key_setup_help "$config_path"
+}
+
+build_session_maps() {
+    declare -gA SESSION_FROM_ALIAS=()
+    declare -gA ALIAS_FROM_SESSION=()
+
+    local alias session
+    while read -r alias session; do
+        [[ -n "${alias:-}" && -n "${session:-}" ]] || continue
+        SESSION_FROM_ALIAS["$alias"]="$session"
+        ALIAS_FROM_SESSION["$session"]="$alias"
+    done < <(surrogate list)
+}
+
+resolve_session() {
+    local input="$1"
+    if [[ -n "${ALIAS_FROM_SESSION[$input]:-}" ]]; then
+        printf '%s\n' "$input"
+        return 0
+    fi
+    if [[ -n "${SESSION_FROM_ALIAS[$input]:-}" ]]; then
+        printf '%s\n' "${SESSION_FROM_ALIAS[$input]}"
+        return 0
+    fi
+    die "session '$input' not found"
+}
+
+default_sessions() {
+    zmx list 2>/dev/null |
+        sed -n 's/^session_name=\([^\t]*\).*\tclients=\([0-9][0-9]*\)$/\1\t\2/p' |
+        awk -F '\t' '$2 > 0 {print $1}'
+}
+
+session_history() {
+    local session="$1" lines="$2"
+    zmx history "$session" 2>/dev/null | tail -n "$lines"
+}
+
+run_one_summary() {
+    local session="$1" alias="$2" lines="$3" model="$4" provider="$5" allow_fallbacks="$6" temperature="$7" max_completion_tokens="$8" api_url="$9"
+    local history_file payload_file response_file
+
+    history_file="$(mktemp)"
+    payload_file="$(mktemp)"
+    response_file="$(mktemp)"
+
+    session_history "$session" "$lines" > "$history_file"
+
+    python3 - "$session" "$alias" "$lines" "$model" "$provider" "$allow_fallbacks" "$temperature" "$max_completion_tokens" "$history_file" > "$payload_file" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+session, alias, lines, model, provider, allow_fallbacks, temperature, max_completion_tokens, history_path = sys.argv[1:]
+history = Path(history_path).read_text()
+visible = [line for line in history.splitlines() if line.strip()]
+snippet = visible[-1][:160] if visible else ""
+path_matches = re.findall(r'((?:~|/)\S+)', history)
+cwd_hint = path_matches[-1].rstrip('.,;:)]}>') if path_matches else ""
+project_hint = cwd_hint.rstrip('/').split('/')[-1] if cwd_hint else ""
+
+payload = {
+    "model": model,
+    "temperature": float(temperature),
+    "max_completion_tokens": int(max_completion_tokens),
+    "reasoning": {
+        "effort": "none",
+        "exclude": True,
+    },
+    "provider": {
+        "order": [provider],
+        "allow_fallbacks": allow_fallbacks.lower() == "true",
+    },
+    "messages": [
+        {
+            "role": "system",
+            "content": (
+                "You summarize terminal session scrollback for an operator who is away from the computer. "
+                "Use only the provided history. Be concrete, terse, and action-oriented. "
+                "Do not invent facts. If information is missing, say unclear."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Summarize this zmx session so the user can understand exactly where work stopped.\n\n"
+                f"SESSION: {session}\n"
+                f"ALIAS: {alias}\n"
+                f"PROJECT_HINT: {project_hint or 'unclear'}\n"
+                f"CWD_HINT: {cwd_hint or 'unclear'}\n"
+                f"VISIBLE_SNIPPET: {snippet or 'unclear'}\n"
+                f"HISTORY_WINDOW_LINES: {lines}\n\n"
+                "Output exactly these fields in this order:\n"
+                "SESSION:\n"
+                "ALIAS:\n"
+                "REPO/CONTEXT:\n"
+                "STATUS:\n"
+                "LAST COMPLETED:\n"
+                "PROPOSED NEXT STEPS:\n"
+                "USER INPUT NEEDED:\n"
+                "BLOCKERS:\n\n"
+                "Rules:\n"
+                "- PROPOSED NEXT STEPS must be concrete and sequential.\n"
+                "- If the session appears complete, deployed, idle, or awaiting new instruction, write 'No immediate action.'\n"
+                "- USER INPUT NEEDED must be either 'None' or explicit decisions/questions the user needs to answer.\n"
+                "- Do not invent follow-up work that is not visible in the history.\n"
+                "- Prefer repo names, files, commits, commands, tests, URLs, and pending decisions.\n"
+                "- Keep it brief and operational, almost like military communication.\n\n"
+                "SESSION HISTORY:\n"
+                f"{history}"
+            ),
+        },
+    ],
+}
+
+print(json.dumps(payload))
+PY
+
+    curl -sS "$api_url" \
+        -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+        -H "Content-Type: application/json" \
+        -H "HTTP-Referer: https://github.com/rawwerks/surrogate" \
+        -H "X-Title: surrogate-brief" \
+        --data-binary "@$payload_file" > "$response_file"
+
+    python3 - "$session" "$alias" "$response_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+session, alias, response_path = sys.argv[1:]
+obj = json.loads(Path(response_path).read_text())
+if "error" in obj:
+    message = obj["error"].get("message", obj["error"])
+    raise SystemExit(f"surrogate-brief: API error for {alias} ({session}): {message}")
+
+def extract_content(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part).strip()
+    return ""
+
+choice = obj["choices"][0]
+message = choice.get("message") or {}
+content = extract_content(message)
+if not content:
+    provider = obj.get("provider", "unknown")
+    finish_reason = choice.get("finish_reason", "unknown")
+    raise SystemExit(
+        f"surrogate-brief: no assistant content for {alias} ({session}) "
+        f"[provider={provider} finish_reason={finish_reason}]"
+    )
+
+usage = obj.get("usage", {})
+prompt = usage.get("prompt_tokens")
+completion = usage.get("completion_tokens")
+total = usage.get("total_tokens")
+
+print(f"=== {alias} ({session}) ===")
+print(content)
+if prompt is not None and completion is not None and total is not None:
+    print(f"[usage] prompt_tokens={prompt} completion_tokens={completion} total_tokens={total}")
+PY
+
+    rm -f "$history_file" "$payload_file" "$response_file"
+}
+
+main() {
+    local config_path="${SURROGATE_BRIEF_CONFIG:-$HOME/.config/surrogate/brief.conf}"
+    local use_config=1
+    local show_config=0
+    local lines=500
+    local model="z-ai/glm-4.7"
+    local provider="cerebras"
+    local allow_fallbacks=1
+    local temperature="0.1"
+    local max_completion_tokens=1200
+    local api_url="${OPENROUTER_API_URL:-https://openrouter.ai/api/v1/chat/completions}"
+    local -a requested=()
+    local -a sessions=()
+    local -a argv=("$@")
+
+    local i=0
+    while [[ $i -lt ${#argv[@]} ]]; do
+        case "${argv[$i]}" in
+            --config)
+                [[ $((i + 1)) -lt ${#argv[@]} ]] || die "--config requires a value"
+                config_path="${argv[$((i + 1))]}"
+                i=$((i + 2))
+                ;;
+            --no-config)
+                use_config=0
+                i=$((i + 1))
+                ;;
+            *)
+                i=$((i + 1))
+                ;;
+        esac
+    done
+
+    if [[ "$use_config" -eq 1 ]]; then
+        load_config_file "$config_path"
+        lines="${SURROGATE_BRIEF_LINES:-$lines}"
+        model="${OPENROUTER_MODEL:-$model}"
+        provider="${OPENROUTER_PROVIDER:-$provider}"
+        allow_fallbacks="${OPENROUTER_ALLOW_FALLBACKS:-$allow_fallbacks}"
+        temperature="${SURROGATE_BRIEF_TEMPERATURE:-$temperature}"
+        max_completion_tokens="${SURROGATE_BRIEF_MAX_COMPLETION_TOKENS:-$max_completion_tokens}"
+        api_url="${OPENROUTER_API_URL:-$api_url}"
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config)
+                [[ $# -ge 2 ]] || die "--config requires a value"
+                shift 2
+                ;;
+            --no-config)
+                shift
+                ;;
+            -n)
+                [[ $# -ge 2 ]] || die "-n requires a number"
+                require_int "$2"
+                lines="$2"
+                shift 2
+                ;;
+            --model|--openrouter-model|--llm-model)
+                [[ $# -ge 2 ]] || die "--model requires a value"
+                model="$2"
+                shift 2
+                ;;
+            --provider|--inference-provider)
+                [[ $# -ge 2 ]] || die "$1 requires a value"
+                provider="$2"
+                shift 2
+                ;;
+            --no-fallbacks)
+                allow_fallbacks=0
+                shift
+                ;;
+            --show-config)
+                show_config=1
+                shift
+                ;;
+            --temperature)
+                [[ $# -ge 2 ]] || die "--temperature requires a value"
+                require_float "$2"
+                temperature="$2"
+                shift 2
+                ;;
+            --max-completion-tokens)
+                [[ $# -ge 2 ]] || die "--max-completion-tokens requires a number"
+                require_int "$2"
+                max_completion_tokens="$2"
+                shift 2
+                ;;
+            --api-url)
+                [[ $# -ge 2 ]] || die "--api-url requires a value"
+                api_url="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                while [[ $# -gt 0 ]]; do
+                    requested+=("$1")
+                    shift
+                done
+                ;;
+            -*)
+                die "unknown flag: $1"
+                ;;
+            *)
+                requested+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    require_int "$lines"
+    require_float "$temperature"
+    require_int "$max_completion_tokens"
+    require_int "$allow_fallbacks"
+
+    if [[ "$show_config" -eq 1 ]]; then
+        printf 'config_path=%s\n' "$config_path"
+        printf 'use_config=%s\n' "$use_config"
+        printf 'api_url=%s\n' "$api_url"
+        printf 'model=%s\n' "$model"
+        printf 'provider=%s\n' "$provider"
+        printf 'allow_fallbacks=%s\n' "$allow_fallbacks"
+        printf 'reasoning_effort=none\n'
+        printf 'lines=%s\n' "$lines"
+        printf 'temperature=%s\n' "$temperature"
+        printf 'max_completion_tokens=%s\n' "$max_completion_tokens"
+        exit 0
+    fi
+
+    check_deps "$config_path"
+    build_session_maps
+
+    if [[ "${#requested[@]}" -eq 0 ]]; then
+        while IFS= read -r session; do
+            [[ -n "$session" ]] || continue
+            sessions+=("$session")
+        done < <(default_sessions)
+    else
+        local target
+        for target in "${requested[@]}"; do
+            sessions+=("$(resolve_session "$target")")
+        done
+    fi
+
+    [[ "${#sessions[@]}" -gt 0 ]] || die "no sessions selected"
+
+    local session alias first=1
+    for session in "${sessions[@]}"; do
+        alias="${ALIAS_FROM_SESSION[$session]:-unknown}"
+        [[ "$first" -eq 1 ]] || printf '\n'
+        first=0
+        run_one_summary "$session" "$alias" "$lines" "$model" "$provider" "$([[ "$allow_fallbacks" -eq 1 ]] && printf 'true' || printf 'false')" "$temperature" "$max_completion_tokens" "$api_url"
+    done
+}
+
+main "$@"

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 SURROGATE_TMP="/tmp"
 BRIDGE_PREFIX="_surr_"
 ALIAS_FILE="${SURROGATE_TMP}/surrogate-aliases"
@@ -114,7 +116,7 @@ audit_event() {
     target_alias="$(session_alias "$session")"
     actor_session="${ZMX_SESSION:-}"
     actor_alias=""
-    if [[ -n "$actor_session" ]] && session_exists "$actor_session"; then
+    if [[ -n "$actor_session" ]]; then
         actor_alias="$(session_alias "$actor_session")"
     fi
     repo_name="$(current_repo_name)"
@@ -442,6 +444,7 @@ Usage: surrogate <command> [args]
 High-value flows:
   surrogate help list                 Show discoverability-oriented list usage
   surrogate who --recent 20           Find the most recent interesting sessions
+  surrogate brief --recent 15         Brief the 15 most recently active sessions
   surrogate list --cwd                Show repo + cwd hints for every session
   surrogate type --message <session> "long prose"
                                       Safest way to send agent prose
@@ -463,6 +466,8 @@ Commands:
   who   [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
                                 Show sessions with age and last visible line
   active [--all]                Show attached sessions (--all includes non-empty detached)
+  brief [--recent N|2h] [filters] [session...]
+                                Remote operator brief via surrogate-brief / OpenRouter
   peek  [-n LINES] [--filter PATTERN]
                                 Batch read last N lines from all sessions (default: 5)
   alias <session>               Show the alias for a session
@@ -500,6 +505,9 @@ Examples:
   surrogate cull sleepy-otter
   surrogate cull --stale --older-than 48 --filter '2026-03-08' --limit 10
   surrogate who --recent 2h --project surrogate
+  surrogate brief --recent 15
+  surrogate brief 15
+  surrogate brief silly-pixel
   surrogate who --cwd /home/raw/Documents/GitHub/surrogate --json
   surrogate type --message lively-otter "Please review the patch plan above."
   surrogate submit lazy-sheep
@@ -535,8 +543,44 @@ who_usage() {
     cat <<'EOF'
 usage: surrogate who [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
 
-Show the newest sessions first. By default, `who` shows the 20 most recent sessions.
+Show the newest sessions first by session age. By default, `who` shows the 20 most recent sessions.
 Use `--recent N` or `--recent 2h` to widen or narrow the window.
+For activity-ranked discovery, use `surrogate active --recent ...`.
+EOF
+}
+
+active_usage() {
+    cat <<'EOF'
+usage: surrogate active [--all] [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
+
+Show sessions ranked by last observed activity (recent output), not creation time.
+Default mode shows only attached sessions. Use --all to include detached sessions with visible output.
+EOF
+}
+
+brief_usage() {
+    cat <<'EOF'
+usage: surrogate brief [--recent N|2h] [--project NAME] [--cwd PATH] [--all] [brief-flags] [session...]
+
+Summarize sessions with one remote brief per session.
+
+Selection rules:
+  - If you pass explicit session names or aliases, those sessions are briefed.
+  - Otherwise, session selection reuses `surrogate active --json`, which ranks by
+    last observed activity, not spawn time.
+  - `surrogate brief 15` is shorthand for `surrogate brief --recent 15`.
+
+Examples:
+  surrogate brief --recent 15
+  surrogate brief 15
+  surrogate brief --project surrogate --recent 5
+  surrogate brief silly-pixel
+  surrogate brief --openrouter-model openai/gpt-4.1-mini --inference-provider openai silly-pixel
+
+Brief flags are forwarded to `surrogate-brief`, including:
+  --config, --no-config, --show-config, -n, --model, --openrouter-model,
+  --llm-model, --provider, --inference-provider, --no-fallbacks,
+  --temperature, --max-completion-tokens, --api-url
 EOF
 }
 
@@ -580,6 +624,8 @@ cmd_help() {
         ""|-h|--help) usage ;;
         list) list_usage ;;
         who) who_usage ;;
+        active) active_usage ;;
+        brief) brief_usage ;;
         type) type_usage ;;
         send) send_usage ;;
         submit) submit_usage ;;
@@ -587,6 +633,22 @@ cmd_help() {
         cull) echo "usage: surrogate cull <session>... | surrogate cull --stale [--older-than HOURS] [--filter PATTERN] [--limit N] [--dry-run]" ;;
         *) die "unknown help topic: $1" ;;
     esac
+}
+
+brief_cmd_path() {
+    if [[ -n "${SURROGATE_BRIEF_CMD:-}" ]]; then
+        printf '%s\n' "$SURROGATE_BRIEF_CMD"
+        return 0
+    fi
+    if command -v surrogate-brief >/dev/null 2>&1; then
+        command -v surrogate-brief
+        return 0
+    fi
+    if [[ -x "$SCRIPT_DIR/surrogate-brief" ]]; then
+        printf '%s\n' "$SCRIPT_DIR/surrogate-brief"
+        return 0
+    fi
+    die "surrogate-brief not found. Run: bash install.sh"
 }
 
 bridge_name() {
@@ -626,10 +688,41 @@ format_age() {
     else printf '%sd' $(( age / 86400 )); fi
 }
 
+zmx_log_dir() {
+    echo "$(zmx_socket_dir)/logs"
+}
+
+session_log_path() {
+    local session="$1"
+    printf '%s/%s.log\n' "$(zmx_log_dir)" "$session"
+}
+
+session_activity_seconds() {
+    local session="$1"
+    local log_path now mtime
+    log_path="$(session_log_path "$session")"
+    now="$(date +%s)"
+    if [[ -e "$log_path" ]]; then
+        mtime="$(stat -c %Y "$log_path" 2>/dev/null || echo 0)"
+        echo $(( now - mtime ))
+        return 0
+    fi
+    session_age_seconds "$session"
+}
+
 session_recent_history() {
     local session="$1" lines="$2"
+    local log_path history
     if [[ "$lines" -eq 0 ]]; then
         return 0
+    fi
+    log_path="$(session_log_path "$session")"
+    if [[ -r "$log_path" ]]; then
+        history="$({ tail -n "$(( lines * 20 ))" "$log_path" 2>/dev/null | grep -Ev '^\[[0-9]+\] \[(info|debug|trace)\]' || true; } | tail -n "$lines")"
+        if [[ -n "$history" ]]; then
+            printf '%s\n' "$history"
+            return 0
+        fi
     fi
     zmx history "$session" 2>/dev/null | tail -n "$lines"
 }
@@ -637,7 +730,7 @@ session_recent_history() {
 session_base_records() {
     _build_alias_cache
 
-    local line session clients age_seconds ago attached
+    local line session clients age_seconds ago attached activity_seconds active_ago
     while IFS= read -r line; do
         session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
         clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
@@ -645,13 +738,29 @@ session_base_records() {
         [[ -n "$clients" ]] || clients=0
 
         age_seconds="$(session_age_seconds "$session")"
+        activity_seconds="$(session_activity_seconds "$session")"
         ago="$(format_age "$age_seconds")"
-        attached=""
-        [[ "$clients" -gt 0 ]] && attached="*"
+        active_ago="$(format_age "$activity_seconds")"
+        attached="detached"
+        [[ "$clients" -gt 0 ]] && attached="attached"
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$age_seconds" "$ago" "$attached" "$clients" "${_ALIAS_CACHE[$session]}" "$session"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$age_seconds" "$ago" "$attached" "$clients" "${_ALIAS_CACHE[$session]:-$(session_alias "$session")}" "$session" "$activity_seconds" "$active_ago"
     done < <(zmx list 2>/dev/null)
+}
+
+session_log_context() {
+    local session="$1" lines="${2:-10}"
+    local log_path history snippet cwd_hint project_hint ui_hint
+    log_path="$(session_log_path "$session")"
+    [[ -r "$log_path" ]] || return 1
+    history="$({ tail -n "$(( lines * 100 ))" "$log_path" 2>/dev/null | grep -Ev '^\[[0-9]+\] \[(info|debug|trace)\]' || true; } | tail -n "$lines")"
+    snippet="$(visible_snippet "$history")"
+    cwd_hint="$(visible_path_hint "$history")"
+    project_hint="$(project_from_path "$cwd_hint")"
+    ui_hint="$(ui_hint_from_history "$history")"
+    printf '%s	%s	%s	%s
+' "$snippet" "$cwd_hint" "$project_hint" "$ui_hint"
 }
 
 session_visible_context() {
@@ -678,9 +787,9 @@ last_visible_line() {
 
 visible_path_hint() {
     local text="$1"
-    printf '%s\n' "$text" |
+    { printf '%s\n' "$text" |
         grep -oE '((~|/)[^[:space:]]*/[^[:space:]]+)' 2>/dev/null |
-        sed 's#[,;:.)\]}]+$##' |
+        sed 's#[,;:.)\]}]+$##' || true; } |
         tail -1
 }
 
@@ -724,18 +833,18 @@ shell_error_reason() {
 session_records() {
     local lines="${1:-10}"
     local base_rows="${2:-}"
-    local age_seconds ago attached clients alias session snippet cwd_hint project_hint ui_hint
+    local age_seconds ago attached clients alias session activity_seconds active_ago snippet cwd_hint project_hint ui_hint
 
     if [[ -z "$base_rows" ]]; then
         base_rows="$(session_base_records)"
     fi
 
-    while IFS=$'\t' read -r age_seconds ago attached clients alias session; do
+    while IFS=$'\t' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
         [[ -n "$session" ]] || continue
         IFS=$'\t' read -r snippet cwd_hint project_hint ui_hint < <(session_visible_context "$session" "$lines")
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$age_seconds" "$ago" "$attached" "$clients" "$alias" \
-            "$session" "$snippet" "$cwd_hint" "$project_hint" "$ui_hint"
+            "$session" "$activity_seconds" "$active_ago" "$snippet" "$cwd_hint" "$project_hint" "$ui_hint"
     done <<< "$base_rows"
 }
 
@@ -836,7 +945,7 @@ cmd_list() {
     if [[ "$json" -eq 1 ]]; then
         printf '{"count":%s,"sessions":[' "$total"
         local first=1
-        while IFS=$'\t' read -r age_seconds ago attached clients alias session snippet cwd_hint project_hint ui_hint; do
+        while IFS=$'\t' read -r age_seconds ago attached clients alias session _activity_seconds _active_ago snippet cwd_hint project_hint ui_hint; do
             [[ -n "$session" ]] || continue
             [[ "$first" -eq 1 ]] || printf ','
             first=0
@@ -847,7 +956,7 @@ cmd_list() {
                 "$(json_or_null "$cwd_hint")" \
                 "$(json_escape "$ui_hint")" \
                 "$clients" \
-                "$([[ -n "$attached" ]] && printf 'true' || printf 'false')"
+                "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')"
         done <<< "$rows"
         echo ']}'
         return 0
@@ -855,13 +964,13 @@ cmd_list() {
 
     if [[ "$show_cwd" -eq 1 ]]; then
         printf "%-18s %-42s %-14s %-8s %s\n" "ALIAS" "SESSION" "PROJECT" "UI" "CWD"
-        while IFS=$'\t' read -r _age_seconds _ago _attached _clients alias session _snippet cwd_hint project_hint ui_hint; do
+        while IFS=$'\t' read -r _age_seconds _ago _attached _clients alias session _activity_seconds _active_ago _snippet cwd_hint project_hint ui_hint; do
             [[ -n "$session" ]] || continue
             printf "%-18s %-42s %-14s %-8s %s\n" "$alias" "$session" "${project_hint:--}" "$ui_hint" "${cwd_hint:--}"
         done <<< "$rows"
     else
         printf "%-18s %-42s %-14s %s\n" "ALIAS" "SESSION" "PROJECT" "UI"
-        while IFS=$'\t' read -r _age_seconds _ago _attached _clients alias session _snippet _cwd_hint project_hint ui_hint; do
+        while IFS=$'\t' read -r _age_seconds _ago _attached _clients alias session _activity_seconds _active_ago _snippet _cwd_hint project_hint ui_hint; do
             [[ -n "$session" ]] || continue
             printf "%-18s %-42s %-14s %s\n" "$alias" "$session" "${project_hint:--}" "$ui_hint"
         done <<< "$rows"
@@ -1204,7 +1313,7 @@ cmd_who() {
     fi
 
     records="$(session_records "$lines" "$selected_base")"
-    while IFS=$'\t' read -r age_seconds ago attached clients alias session snippet cwd_hint project_hint ui_hint; do
+    while IFS=$'\t' read -r age_seconds ago attached clients alias session _activity_seconds _active_ago snippet cwd_hint project_hint ui_hint; do
         [[ -n "$session" ]] || continue
         if [[ -n "$cwd_filter" && ( -z "$cwd_hint" || "$cwd_hint" != "$cwd_filter"* ) ]]; then
             continue
@@ -1232,7 +1341,7 @@ cmd_who() {
     if [[ "$json" -eq 1 ]]; then
         printf '{"count":%s,"recent_first":true,"sessions":[' "$total"
         local first=1
-        while IFS=$'\t' read -r age_seconds ago attached clients alias session snippet cwd_hint project_hint ui_hint; do
+        while IFS=$'\t' read -r age_seconds ago attached clients alias session _activity_seconds _active_ago snippet cwd_hint project_hint ui_hint; do
             [[ -z "$session" ]] && continue
             [[ "$first" -eq 1 ]] || printf ','
             first=0
@@ -1240,7 +1349,7 @@ cmd_who() {
                 "$(json_escape "$alias")" \
                 "$(json_escape "$session")" \
                 "$clients" \
-                "$([[ -n "$attached" ]] && printf 'true' || printf 'false')" \
+                "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')" \
                 "$(json_escape "$ago")" \
                 "$age_seconds" \
                 "$(json_escape "$snippet")" \
@@ -1252,7 +1361,7 @@ cmd_who() {
         return 0
     fi
 
-    while IFS=$'\t' read -r _age_seconds ago attached _clients alias session snippet _cwd_hint project_hint ui_hint; do
+    while IFS=$'\t' read -r _age_seconds ago attached _clients alias session _activity_seconds _active_ago snippet _cwd_hint project_hint ui_hint; do
         [[ -z "$session" ]] && continue
         printf "%-4s %-8s %-18s %-42s %-12s %s\n" "${ago}${attached}" "$ui_hint" "$alias" "$session" "${project_hint:--}" "$snippet"
     done <<< "$sorted"
@@ -1269,42 +1378,235 @@ cmd_active() {
     _build_alias_cache
 
     local mode="attached"
+    local lines=10
+    local json=0
+    local recent_count=20
+    local recent_age_max=""
+    local project_filter=""
+    local cwd_filter=""
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --all)  mode="all"; shift ;;
-            *)      die "unknown flag: $1 (use --all to include detached)" ;;
+            -h|--help) active_usage; return 0 ;;
+            --all) mode="all"; shift ;;
+            -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
+            --json) json=1; shift ;;
+            --project) [[ $# -ge 2 ]] || die "--project requires a name"; project_filter="$2"; shift 2 ;;
+            --cwd) [[ $# -ge 2 ]] || die "--cwd requires a path"; cwd_filter="$2"; shift 2 ;;
+            --recent)
+                [[ $# -ge 2 ]] || die "--recent requires a value"
+                local recent_mode
+                recent_mode="$(parse_recent_filter "$2")"
+                case "$recent_mode" in
+                    count:*) recent_count="${recent_mode#count:}" ;;
+                    age:*) recent_age_max="${recent_mode#age:}" ;;
+                esac
+                shift 2
+                ;;
+            *) die "unknown flag: $1" ;;
         esac
     done
 
-    printf "%-18s %-45s %-8s %s\n" "ALIAS" "SESSION" "CLIENTS" "SNIPPET"
-    printf "%-18s %-45s %-8s %s\n" "-----" "-------" "-------" "-------"
-
-    local found=0
-    while IFS= read -r line; do
-        local session clients
-        session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
-        clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
-        [[ -z "$session" ]] && continue
-
-        # Default: only show attached sessions (clients > 0)
+    local base_records filtered_base sorted_base selected_base total=0
+    base_records="$(session_base_records)"
+    filtered_base=""
+    while IFS=$'	' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
+        [[ -n "$session" ]] || continue
         if [[ "$mode" == "attached" && "$clients" -eq 0 ]]; then
             continue
         fi
-
-        # For --all mode, check if session has any history (non-empty)
         if [[ "$mode" == "all" ]]; then
-            local lc
-            lc="$(zmx history "$session" 2>/dev/null | wc -l)"
-            [[ "$lc" -eq 0 ]] && continue
+            local log_path lc
+            log_path="$(session_log_path "$session")"
+            if [[ -r "$log_path" ]]; then
+                [[ -s "$log_path" ]] || continue
+            else
+                lc="$(zmx history "$session" 2>/dev/null | wc -l)"
+                [[ "$lc" -eq 0 ]] && continue
+            fi
         fi
+        if [[ -n "$recent_age_max" && "$activity_seconds" -gt "$recent_age_max" ]]; then
+            continue
+        fi
+        filtered_base+=$(printf '%s	%s	%s	%s	%s	%s	%s	%s'             "$age_seconds" "$ago" "$attached" "$clients" "$alias" "$session" "$activity_seconds" "$active_ago")
+        filtered_base+=$'
+'
+    done <<< "$base_records"
 
-        local snippet
-        snippet="$(zmx history "$session" 2>/dev/null | tail -n 5 | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-60)"
-        printf "%-18s %-45s %-8s %s\n" "${_ALIAS_CACHE[$session]}" "$session" "$clients" "$snippet"
-        found=$((found + 1))
-    done < <(zmx list 2>/dev/null)
+    sorted_base="$(printf '%s' "$filtered_base" | sed '/^$/d' | sort -t $'	' -k7,7n -k4,4nr -k6,6)"
+    selected_base=""
 
-    echo "--- $found active session(s) ---"
+    if [[ -z "$project_filter" && -z "$cwd_filter" ]]; then
+        selected_base="$(printf '%s
+' "$sorted_base" | head -n "$recent_count")"
+    else
+        local inspected=0 inspect_limit=10 matched=0
+        while IFS=$'	' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
+            [[ -n "$session" ]] || continue
+            inspected=$((inspected + 1))
+            IFS=$'	' read -r snippet cwd_hint project_hint ui_hint < <(session_log_context "$session" "$lines" || true)
+            if [[ -z "$snippet" && -z "$cwd_hint" && -z "$project_hint" ]]; then
+                continue
+            fi
+            if [[ "$inspected" -gt "$inspect_limit" && "$matched" -eq 0 ]]; then
+                break
+            fi
+            if [[ -n "$cwd_filter" && ( -z "$cwd_hint" || "$cwd_hint" != "$cwd_filter"* ) ]]; then
+                continue
+            fi
+            if [[ -n "$project_filter" && "$project_hint" != "$project_filter" && "$snippet" != *"$project_filter"* ]]; then
+                continue
+            fi
+            selected_base+=$(printf '%s	%s	%s	%s	%s	%s	%s	%s'                 "$age_seconds" "$ago" "$attached" "$clients" "$alias" "$session" "$activity_seconds" "$active_ago")
+            selected_base+=$'
+'
+            matched=$((matched + 1))
+            [[ "$matched" -ge "$recent_count" ]] && break
+        done <<< "$sorted_base"
+    fi
+
+    local records sorted
+    records="$(session_records "$lines" "$selected_base")"
+    sorted="$(printf '%s' "$records" | sed '/^$/d' | sort -t $'	' -k7,7n -k4,4nr -k6,6 | head -n "$recent_count")"
+    [[ -n "$sorted" ]] && total="$(printf '%s
+' "$sorted" | sed '/^$/d' | wc -l)"
+
+    if [[ "$json" -eq 1 ]]; then
+        printf '{"count":%s,"activity_ranked":true,"sessions":[' "$total"
+        local first=1
+        while IFS=$'	' read -r age_seconds ago attached clients alias session activity_seconds active_ago snippet cwd_hint project_hint ui_hint; do
+            [[ -n "$session" ]] || continue
+            [[ "$first" -eq 1 ]] || printf ','
+            first=0
+            printf '{"alias":"%s","session":"%s","clients":%s,"attached":%s,"last_active":"%s","last_active_seconds":%s,"age":"%s","age_seconds":%s,"snippet":"%s","cwd_hint":%s,"project_hint":%s,"ui_hint":"%s"}'                 "$(json_escape "$alias")"                 "$(json_escape "$session")"                 "$clients"                 "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')"                 "$(json_escape "$active_ago")"                 "$activity_seconds"                 "$(json_escape "$ago")"                 "$age_seconds"                 "$(json_escape "$snippet")"                 "$(json_or_null "$cwd_hint")"                 "$(json_or_null "$project_hint")"                 "$(json_escape "$ui_hint")"
+        done <<< "$sorted"
+        echo ']}'
+        return 0
+    fi
+
+    printf "%-6s %-4s %-8s %-18s %-42s %-12s %s
+" "ACTIVE" "AGE" "UI" "ALIAS" "SESSION" "PROJECT" "SNIPPET"
+    while IFS=$'	' read -r _age_seconds ago attached _clients alias session _activity_seconds active_ago snippet _cwd_hint project_hint ui_hint; do
+        [[ -n "$session" ]] || continue
+        local attached_mark=""
+        [[ "$attached" == "attached" ]] && attached_mark="*"
+        printf "%-6s %-4s %-8s %-18s %-42s %-12s %s
+" "${active_ago}${attached_mark}" "$ago" "$ui_hint" "$alias" "$session" "${project_hint:--}" "$snippet"
+    done <<< "$sorted"
+
+    echo "── $total sessions (recent activity first; * = attached) ──"
+}
+
+cmd_brief() {
+    check_deps
+
+    local recent_arg=""
+    local project_filter=""
+    local cwd_filter=""
+    local include_all=0
+    local show_config=0
+    local -a explicit_sessions=()
+    local -a brief_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                brief_usage
+                return 0
+                ;;
+            --recent)
+                [[ $# -ge 2 ]] || die "--recent requires a value"
+                parse_recent_filter "$2" >/dev/null
+                recent_arg="$2"
+                shift 2
+                ;;
+            --project)
+                [[ $# -ge 2 ]] || die "--project requires a name"
+                project_filter="$2"
+                shift 2
+                ;;
+            --cwd)
+                [[ $# -ge 2 ]] || die "--cwd requires a path"
+                cwd_filter="$2"
+                shift 2
+                ;;
+            --all)
+                include_all=1
+                shift
+                ;;
+            --config|--model|--openrouter-model|--llm-model|--provider|--inference-provider|--temperature|--max-completion-tokens|--api-url|-n)
+                [[ $# -ge 2 ]] || die "$1 requires a value"
+                brief_args+=("$1" "$2")
+                shift 2
+                ;;
+            --no-config|--no-fallbacks)
+                brief_args+=("$1")
+                shift
+                ;;
+            --show-config)
+                show_config=1
+                brief_args+=("$1")
+                shift
+                ;;
+            --)
+                shift
+                while [[ $# -gt 0 ]]; do
+                    explicit_sessions+=("$1")
+                    shift
+                done
+                ;;
+            -*)
+                die "unknown flag: $1"
+                ;;
+            *)
+                if [[ -z "$recent_arg" && "${#explicit_sessions[@]}" -eq 0 && "$1" =~ ^[0-9]+([smhd])?$ ]]; then
+                    parse_recent_filter "$1" >/dev/null
+                    recent_arg="$1"
+                else
+                    explicit_sessions+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local brief_bin
+    brief_bin="$(brief_cmd_path)"
+
+    if [[ "${#explicit_sessions[@]}" -gt 0 ]]; then
+        "$brief_bin" "${brief_args[@]}" "${explicit_sessions[@]}"
+        return 0
+    fi
+
+    if [[ "$show_config" -eq 1 ]]; then
+        "$brief_bin" "${brief_args[@]}"
+        return 0
+    fi
+
+    local -a selector_args=("active" "--json")
+    [[ "$include_all" -eq 1 ]] && selector_args+=("--all")
+    [[ -n "$recent_arg" ]] && selector_args+=("--recent" "$recent_arg")
+    [[ -n "$project_filter" ]] && selector_args+=("--project" "$project_filter")
+    [[ -n "$cwd_filter" ]] && selector_args+=("--cwd" "$cwd_filter")
+
+    local selected
+    selected="$("$0" "${selector_args[@]}" | python3 -c 'import json, sys
+obj = json.load(sys.stdin)
+for item in obj.get("sessions", []):
+    session = item.get("session")
+    if session:
+        print(session)
+')"
+
+    [[ -n "$selected" ]] || die "no sessions matched the brief selection"
+
+    local -a selected_sessions=()
+    while IFS= read -r session; do
+        [[ -n "$session" ]] || continue
+        selected_sessions+=("$session")
+    done <<< "$selected"
+
+    "$brief_bin" "${brief_args[@]}" "${selected_sessions[@]}"
 }
 
 cmd_peek() {
@@ -1575,6 +1877,7 @@ case "${1}" in
     find)    shift; cmd_find "$@" ;;
     who)     shift; cmd_who "$@" ;;
     active)  shift; cmd_active "$@" ;;
+    brief)   shift; cmd_brief "$@" ;;
     peek)    shift; cmd_peek "$@" ;;
     alias)   shift; cmd_alias "$@" ;;
     whoami)  shift; cmd_whoami "$@" ;;

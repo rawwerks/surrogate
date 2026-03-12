@@ -147,11 +147,13 @@ info "Installing to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
 install_binary "$SCRIPT_DIR/bin/surrogate" "$INSTALL_DIR/surrogate"
+install_binary "$SCRIPT_DIR/bin/surrogate-brief" "$INSTALL_DIR/surrogate-brief"
 install_binary "$SCRIPT_DIR/bin/surrogate-shell-setup" "$INSTALL_DIR/surrogate-shell-setup"
 install_binary "$SCRIPT_DIR/bin/surrogate-doctor" "$INSTALL_DIR/surrogate-doctor"
 
 info "Installed:"
 info "  $INSTALL_DIR/surrogate"
+info "  $INSTALL_DIR/surrogate-brief"
 info "  $INSTALL_DIR/surrogate-shell-setup"
 info "  $INSTALL_DIR/surrogate-doctor"
 if [[ "$DEV_LINK_MODE" == "1" ]]; then

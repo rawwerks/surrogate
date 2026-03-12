@@ -173,6 +173,21 @@ Use `send` for low-risk key events like `Enter`, `Escape`, arrows, and text lite
 surrogate read <session> [-n N]
 ```
 
+### Optional remote operator briefs
+
+If `OPENROUTER_API_KEY` is configured, you can summarize where sessions left off with one OpenRouter call per zmx session:
+
+```bash
+surrogate brief --recent 15
+surrogate brief 15
+surrogate brief shiny-dolphin
+surrogate-brief shiny-dolphin
+surrogate-brief --show-config
+surrogate-brief --openrouter-model openai/gpt-4.1-mini --inference-provider openai shiny-dolphin
+```
+
+`surrogate brief` reuses the existing activity-ranked filtering logic from `surrogate active`. This path is optional and separate from core surrogate usage. If the key is missing, `surrogate-brief` prints the setup steps needed to enable it.
+
 ### Wait for pattern in output
 
 ```bash

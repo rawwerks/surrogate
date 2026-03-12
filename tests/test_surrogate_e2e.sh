@@ -17,6 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SURROGATE="${SURROGATE:-$(dirname "$SCRIPT_DIR")/bin/surrogate}"
+SURROGATE_BRIEF="${SURROGATE_BRIEF:-$(dirname "$SCRIPT_DIR")/bin/surrogate-brief}"
 TEST_SESSION="test-surrogate-$$"
 TEST_TIMEOUT="${TEST_TIMEOUT:-30}"  # per-test timeout in seconds
 TEST_PROFILE="${SURROGATE_TEST_PROFILE:-smoke}"
@@ -32,7 +33,7 @@ CLEANUP_DONE=0
 TEST_SESSION_NAME_RE='^(test-surrogate|surr-dead-test|surr-cleanup-all-test|surr-rename-test|surr-prose-crlf-test|surr-prose-test|surr-coll-a|surr-coll-b|surr-stale-test|surr-cull-test|surr-cull-batch-test|surr-cull-keep-test)-[0-9]+$'
 
 # Export variables needed by subshell test runners
-export RESULTS_FILE TIMING_FILE SURROGATE TEST_SESSION TEST_TIMEOUT
+export RESULTS_FILE TIMING_FILE SURROGATE SURROGATE_BRIEF TEST_SESSION TEST_TIMEOUT
 export TESTS_RUN=0  # legacy counter (each test increments, but value doesn't survive subshells)
 
 pass() { echo "PASS" >> "$RESULTS_FILE"; echo "  PASS: $1"; }
@@ -1036,6 +1037,31 @@ test_invariant_snippet_all_shells() {
   fi
 }
 
+test_invariant_inherited_status_shows_alias() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+
+  local all_ok=true
+  for shell_name in bash zsh fish; do
+    local snippet
+    snippet=$(SHELL="/bin/$shell_name" "$setup_script" --show 2>&1)
+
+    if ! echo "$snippet" | grep -q 'surrogate: zmx session .*alias'; then
+      echo "    MISSING alias in inherited status for shell: $shell_name"
+      all_ok=false
+    fi
+  done
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]} — inherited status path includes session alias in all shells"
+  else
+    fail "${FUNCNAME[0]} — inherited status path must print session alias"
+  fi
+}
+
 test_invariant_no_terminal_specific_code() {
   # plumb:req-eb9fb624
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -1074,6 +1100,36 @@ test_invariant_surrogate_cli_terminal_agnostic() {
   else
     echo "    found $violations terminal-specific references in surrogate CLI"
     fail "${FUNCNAME[0]} — surrogate CLI must be terminal-agnostic"
+  fi
+}
+
+test_invariant_surrogate_full_path_for_alias_lookup() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+
+  local all_ok=true
+  for shell_name in bash zsh fish; do
+    local snippet
+    snippet=$(SHELL="/bin/$shell_name" "$setup_script" --show 2>&1)
+
+    if ! echo "$snippet" | grep -q '\.local/bin/surrogate'; then
+      echo "    snippet does not use full path fallback for surrogate in shell: $shell_name"
+      all_ok=false
+    fi
+
+    if ! echo "$snippet" | grep -q 'PATH=' && ! echo "$snippet" | grep -q '_surr_path'; then
+      echo "    snippet does not seed PATH for alias lookup in shell: $shell_name"
+      all_ok=false
+    fi
+  done
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]} — snippet uses full path and seeded PATH for alias lookup"
+  else
+    fail "${FUNCNAME[0]} — snippet must use full path and seeded PATH for alias lookup"
   fi
 }
 
@@ -1156,7 +1212,7 @@ test_invariant_installed_matches_repo() {
   repo_dir="$(dirname "$SCRIPT_DIR")/bin"
   local all_match=true
 
-  for file in surrogate surrogate-shell-setup; do
+  for file in surrogate surrogate-brief surrogate-shell-setup; do
     if [[ ! -f "$install_dir/$file" ]]; then
       echo "    $file not installed at $install_dir/$file"
       all_match=false
@@ -1183,7 +1239,7 @@ test_install_replaces_dev_link_with_real_copy() {
 
   INSTALL_DIR="$tmp_install" bash "$SCRIPT_DIR/../install.sh" --dev-link >/dev/null
 
-  if [[ ! -L "$tmp_install/surrogate" ]]; then
+  if [[ ! -L "$tmp_install/surrogate" || ! -L "$tmp_install/surrogate-brief" ]]; then
     echo "    expected dev-link install to create symlink"
     fail "${FUNCNAME[0]} — dev-link install did not create symlink"
     return
@@ -1191,17 +1247,18 @@ test_install_replaces_dev_link_with_real_copy() {
 
   INSTALL_DIR="$tmp_install" SURROGATE_SKIP_DCG=1 bash "$SCRIPT_DIR/../install.sh" >/dev/null
 
-  if [[ -L "$tmp_install/surrogate" ]]; then
-    echo "    expected plain install to replace symlink with copied binary"
-    fail "${FUNCNAME[0]} — plain install left surrogate as symlink"
+  if [[ -L "$tmp_install/surrogate" || -L "$tmp_install/surrogate-brief" ]]; then
+    echo "    expected plain install to replace symlink with copied binaries"
+    fail "${FUNCNAME[0]} — plain install left surrogate binary as symlink"
     return
   fi
 
-  if diff -q "$SCRIPT_DIR/../bin/surrogate" "$tmp_install/surrogate" >/dev/null; then
+  if diff -q "$SCRIPT_DIR/../bin/surrogate" "$tmp_install/surrogate" >/dev/null &&
+     diff -q "$SCRIPT_DIR/../bin/surrogate-brief" "$tmp_install/surrogate-brief" >/dev/null; then
     pass "${FUNCNAME[0]} — plain install replaces dev-link with copied binary"
   else
-    echo "    copied surrogate differs from repo"
-    fail "${FUNCNAME[0]} — copied surrogate does not match repo"
+    echo "    copied installed binaries differ from repo"
+    fail "${FUNCNAME[0]} — copied installed binaries do not match repo"
   fi
 }
 
@@ -1236,6 +1293,128 @@ test_release_helper_reinstalls_real_binaries() {
   fi
 
   pass "${FUNCNAME[0]} — release helper safe-pushes, reinstalls, and verifies"
+}
+
+test_surrogate_brief_show_config_defaults() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE_BRIEF" --show-config 2>&1)
+
+  if echo "$output" | grep -q 'model=z-ai/glm-4.7' &&
+     echo "$output" | grep -q 'provider=cerebras' &&
+     echo "$output" | grep -q 'lines=500' &&
+     echo "$output" | grep -q 'max_completion_tokens=1200'; then
+    pass "${FUNCNAME[0]} — brief defaults are self-documenting"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — brief defaults missing from show-config"
+  fi
+}
+
+test_surrogate_brief_show_config_overrides() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local cfg output
+  cfg="$(mktemp)"
+  cat > "$cfg" <<'EOF'
+SURROGATE_BRIEF_LINES=321
+SURROGATE_BRIEF_TEMPERATURE=0.2
+SURROGATE_BRIEF_MAX_COMPLETION_TOKENS=777
+OPENROUTER_MODEL="openai/gpt-4.1-mini"
+OPENROUTER_PROVIDER="openai"
+OPENROUTER_ALLOW_FALLBACKS=0
+EOF
+
+  output=$("$SURROGATE_BRIEF" --config "$cfg" --show-config 2>&1)
+  rm -f "$cfg"
+
+  if echo "$output" | grep -q 'model=openai/gpt-4.1-mini' &&
+     echo "$output" | grep -q 'provider=openai' &&
+     echo "$output" | grep -q 'allow_fallbacks=0' &&
+     echo "$output" | grep -q 'lines=321' &&
+     echo "$output" | grep -q 'max_completion_tokens=777'; then
+    pass "${FUNCNAME[0]} — brief config file overrides defaults"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — brief config overrides not applied"
+  fi
+}
+
+test_surrogate_brief_missing_key_help() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$(env -u OPENROUTER_API_KEY HOME=/tmp PATH="$PATH" "$SURROGATE_BRIEF" "$TEST_SESSION" 2>&1 || true)
+
+  if echo "$output" | grep -q 'OPENROUTER_API_KEY is not set' &&
+     echo "$output" | grep -q 'export OPENROUTER_API_KEY=' &&
+     echo "$output" | grep -q 'surrogate-brief --show-config'; then
+    pass "${FUNCNAME[0]} — brief missing-key path is self-documenting"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — brief missing-key guidance incomplete"
+  fi
+}
+
+test_brief_help_is_discoverable() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" help brief 2>&1)
+
+  if echo "$output" | grep -q 'usage: surrogate brief' &&
+     echo "$output" | grep -q 'surrogate brief 15' &&
+     echo "$output" | grep -q 'last observed activity'; then
+    pass "${FUNCNAME[0]} — brief help documents activity-ranked selection"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — brief help missing selection guidance"
+  fi
+}
+
+test_brief_explicit_session_passes_to_helper() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local mock output
+  mock="$(mktemp)"
+  cat > "$mock" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@"
+EOF
+  chmod +x "$mock"
+
+  output=$(SURROGATE_BRIEF_CMD="$mock" "$SURROGATE" brief --show-config "$TEST_SESSION" 2>&1)
+  rm -f "$mock"
+
+  if echo "$output" | grep -qx -- '--show-config' &&
+     echo "$output" | grep -qx -- "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]} — brief forwards explicit sessions to helper"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — brief did not forward explicit session/helper args"
+  fi
+}
+
+test_brief_uses_active_json_selection() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -q 'selector_args=("active" "--json")' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — brief reuses active --json selection"
+  else
+    fail "${FUNCNAME[0]} — brief does not reuse active selection path"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -3435,6 +3614,14 @@ run_section design full \
   test_type_updates_watermark \
   test_send_serializes_via_flock \
   test_type_serializes_via_flock \
+  test_invariant_inherited_status_shows_alias \
+  test_invariant_surrogate_full_path_for_alias_lookup \
+  test_brief_help_is_discoverable \
+  test_brief_explicit_session_passes_to_helper \
+  test_brief_uses_active_json_selection \
+  test_surrogate_brief_show_config_defaults \
+  test_surrogate_brief_show_config_overrides \
+  test_surrogate_brief_missing_key_help \
   test_wait_validates_timeout \
   test_read_validates_n
 

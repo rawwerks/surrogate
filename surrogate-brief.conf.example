@@ -1,0 +1,11 @@
+# Copy to ~/.config/surrogate/brief.conf to change default routing/model settings.
+# CLI flags override this file.
+
+SURROGATE_BRIEF_LINES=500
+SURROGATE_BRIEF_TEMPERATURE=0.1
+SURROGATE_BRIEF_MAX_COMPLETION_TOKENS=1200
+
+OPENROUTER_API_URL="https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL="z-ai/glm-4.7"
+OPENROUTER_PROVIDER="cerebras"
+OPENROUTER_ALLOW_FALLBACKS=1

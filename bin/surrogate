@@ -39,16 +39,23 @@ session_exists() {
 }
 
 _session_names() {
-    zmx list 2>/dev/null | sed -n 's/^session_name=\([^\t]*\).*/\1/p'
+    local line session
+    while IFS= read -r line; do
+        session="${line#session_name=}"
+        session="${session%%$'\t'*}"
+        [[ -n "$session" ]] && printf '%s\n' "$session"
+    done < <(zmx list 2>/dev/null)
 }
 
 session_clients() {
     local target="$1"
     local line session clients
     while IFS= read -r line; do
-        session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
+        session="${line#session_name=}"
+        session="${session%%$'\t'*}"
         [[ "$session" == "$target" ]] || continue
-        clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
+        clients="${line##*clients=}"
+        clients="${clients%%$'\t'*}"
         echo "${clients:-0}"
         return 0
     done < <(zmx list 2>/dev/null)
@@ -103,6 +110,22 @@ json_or_null() {
         printf '"%s"' "$(json_escape "$1")"
     else
         printf 'null'
+    fi
+}
+
+record_display_field() {
+    if [[ -n "${1:-}" ]]; then
+        printf '%s' "$1"
+    else
+        printf '%s' '-'
+    fi
+}
+
+record_nullable_field() {
+    if [[ "${1:-}" == "-" ]]; then
+        printf '%s' ""
+    else
+        printf '%s' "${1:-}"
     fi
 }
 
@@ -243,6 +266,49 @@ _build_alias_cache() {
     _ALIAS_CACHE_BUILT=1
 }
 
+session_alias_base() {
+    local name="$1" h=5381 i c
+    for (( i=0; i<${#name}; i++ )); do
+        printf -v c '%d' "'${name:$i:1}"
+        h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
+    done
+    echo "${ADJECTIVES[$((h % 100))]}-${NOUNS[$((h / 100 % 100))]}"
+}
+
+session_alias_single() {
+    local name="$1"
+    if [[ -n "$_ALIAS_CACHE_BUILT" && -n "${_ALIAS_CACHE[$name]:-}" ]]; then
+        echo "${_ALIAS_CACHE[$name]}"
+        return 0
+    fi
+
+    local custom_alias=""
+    if [[ -f "$ALIAS_FILE" ]]; then
+        custom_alias="$(awk -F= -v target="$name" '$1 == target { print $2; exit }' "$ALIAS_FILE" 2>/dev/null || true)"
+        if [[ -n "$custom_alias" ]]; then
+            echo "$custom_alias"
+            return 0
+        fi
+    fi
+
+    local base rank other
+    base="$(session_alias_base "$name")"
+    rank=0
+    while IFS= read -r other; do
+        [[ -n "$other" ]] || continue
+        [[ "$(session_alias_base "$other")" == "$base" ]] || continue
+        if [[ "$other" < "$name" || "$other" == "$name" ]]; then
+            rank=$((rank + 1))
+        fi
+    done < <(_session_names)
+
+    if [[ "$rank" -le 1 ]]; then
+        echo "$base"
+    else
+        echo "${base}-${rank}"
+    fi
+}
+
 session_alias() {
     _build_alias_cache
     if [[ -n "${_ALIAS_CACHE[$1]:-}" ]]; then
@@ -250,13 +316,7 @@ session_alias() {
         return 0
     fi
 
-    local name="$1" h=5381 i c base
-    for (( i=0; i<${#name}; i++ )); do
-        printf -v c '%d' "'${name:$i:1}"
-        h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
-    done
-    base="${ADJECTIVES[$((h % 100))]}-${NOUNS[$((h / 100 % 100))]}"
-    echo "$base"
+    session_alias_single "$1"
 }
 
 resolve_session() {
@@ -278,10 +338,76 @@ resolve_session() {
     die "session '$input' not found (not a name or alias)"
 }
 
+proc_self_pid() {
+    echo "${SURROGATE_SELF_PID:-$$}"
+}
+
+proc_ppid() {
+    local pid="$1"
+    local proc_root="${SURROGATE_PROC_ROOT:-/proc}"
+    [[ -r "$proc_root/$pid/stat" ]] || return 1
+    awk '{print $4}' "$proc_root/$pid/stat"
+}
+
+proc_cmdline() {
+    local pid="$1"
+    local proc_root="${SURROGATE_PROC_ROOT:-/proc}"
+    [[ -r "$proc_root/$pid/cmdline" ]] || return 1
+    tr '\0' ' ' < "$proc_root/$pid/cmdline"
+}
+
+ancestry_zmx_attach_session() {
+    local parent depth=0 cmd session
+    parent="$(proc_ppid "$(proc_self_pid)" 2>/dev/null || true)"
+    while [[ "$depth" -lt 24 && -n "$parent" && "$parent" =~ ^[0-9]+$ && "$parent" -gt 1 ]]; do
+        cmd="$(proc_cmdline "$parent" 2>/dev/null || true)"
+        if [[ "$cmd" == *"zmx attach "* ]]; then
+            session="${cmd##*zmx attach }"
+            session="${session%% *}"
+            [[ -n "$session" ]] && {
+                echo "$session"
+                return 0
+            }
+        fi
+        parent="$(proc_ppid "$parent" 2>/dev/null || true)"
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
+current_session_identity() {
+    local env_session="${ZMX_SESSION:-}"
+    local ancestry_session=""
+
+    if [[ -n "$env_session" ]]; then
+        if session_exists "$env_session"; then
+            printf 'live\t%s\n' "$env_session"
+            return 0
+        fi
+    fi
+
+    ancestry_session="$(ancestry_zmx_attach_session 2>/dev/null || true)"
+    if [[ -n "$ancestry_session" ]]; then
+        if session_exists "$ancestry_session"; then
+            printf 'live\t%s\n' "$ancestry_session"
+        else
+            printf 'ancestry\t%s\n' "$ancestry_session"
+        fi
+        return 0
+    fi
+
+    if [[ -n "$env_session" ]]; then
+        printf 'stale-env\t%s\n' "$env_session"
+        return 0
+    fi
+
+    return 1
+}
+
 current_live_session() {
-    local session="${ZMX_SESSION:-}"
-    [[ -n "$session" ]] || return 1
-    session_exists "$session" || return 1
+    local status session
+    IFS=$'\t' read -r status session < <(current_session_identity 2>/dev/null || true)
+    [[ "$status" == "live" && -n "$session" ]] || return 1
     echo "$session"
 }
 
@@ -306,7 +432,7 @@ guard_self_cull() {
     [[ "$current_session" != "$target_session" ]] || {
         _build_alias_cache
         local current_alias="${_ALIAS_CACHE[$current_session]:-$(session_alias "$current_session")}"
-        echo "refusing to cull your own live session. You are $current_alias ($current_session). Detach or close it first."
+        echo "refusing to prune your own live zmx session. You are $current_alias ($current_session). Detach or close it first."
         return 1
     }
 }
@@ -315,17 +441,56 @@ zmx_socket_dir() {
     echo "/run/user/$(id -u)/zmx"
 }
 
+declare -A _SESSION_SOCKET_MTIME _SESSION_LOG_MTIME
+_SESSION_TIME_CACHE_BUILT=""
+_SESSION_TIME_CACHE_NOW=""
+
+_build_session_time_cache() {
+    [[ -n "$_SESSION_TIME_CACHE_BUILT" ]] && return
+    _SESSION_SOCKET_MTIME=()
+    _SESSION_LOG_MTIME=()
+    _SESSION_TIME_CACHE_NOW="$(date +%s)"
+
+    local socket_dir log_dir nullglob_state path mtime name
+    socket_dir="$(zmx_socket_dir)"
+    log_dir="$(zmx_log_dir)"
+    nullglob_state="$(shopt -p nullglob || true)"
+    shopt -s nullglob
+
+    local -a socket_paths=("$socket_dir"/*)
+    if [[ "${#socket_paths[@]}" -gt 0 ]]; then
+        while IFS=$'\t' read -r path mtime; do
+            [[ -n "$path" ]] || continue
+            [[ -d "$path" ]] && continue
+            name="${path##*/}"
+            _SESSION_SOCKET_MTIME["$name"]="$mtime"
+        done < <(stat -c $'%n\t%Y' "${socket_paths[@]}" 2>/dev/null || true)
+    fi
+
+    local -a log_paths=("$log_dir"/*.log)
+    if [[ "${#log_paths[@]}" -gt 0 ]]; then
+        while IFS=$'\t' read -r path mtime; do
+            [[ -n "$path" ]] || continue
+            name="${path##*/}"
+            name="${name%.log}"
+            _SESSION_LOG_MTIME["$name"]="$mtime"
+        done < <(stat -c $'%n\t%Y' "${log_paths[@]}" 2>/dev/null || true)
+    fi
+
+    eval "$nullglob_state"
+    _SESSION_TIME_CACHE_BUILT=1
+}
+
 session_age_secs() {
     local session="$1"
-    local socket_dir socket_path now mtime
-    socket_dir="$(zmx_socket_dir)"
-    socket_path="$socket_dir/$session"
-    [[ -e "$socket_path" ]] || {
+    local now mtime
+    _build_session_time_cache
+    mtime="${_SESSION_SOCKET_MTIME[$session]:-}"
+    [[ -n "$mtime" ]] || {
         echo 0
         return 0
     }
-    now="$(date +%s)"
-    mtime="$(stat -c %Y "$socket_path" 2>/dev/null || echo "$now")"
+    now="$_SESSION_TIME_CACHE_NOW"
     if [[ "$mtime" -gt "$now" ]]; then
         echo 0
     else
@@ -369,47 +534,232 @@ remove_session_plumbing() {
     remove_custom_alias "$session"
 }
 
+count_rows() {
+    local rows="${1:-}"
+    if [[ -z "$rows" ]]; then
+        echo 0
+    else
+        printf '%s\n' "$rows" | sed '/^$/d' | wc -l
+    fi
+}
+
+take_nonempty_rows() {
+    local limit="$1"
+    awk -v limit="$limit" 'NF { print; count++; if (count >= limit) exit }'
+}
+
+session_review_row() {
+    local session="$1"
+    local age alias snippet
+    age="$(session_age_secs "$session")"
+    _build_alias_cache
+    alias="${_ALIAS_CACHE[$session]:-$(session_alias "$session")}"
+    snippet="$(session_snippet "$session" 5)"
+    printf '%s\t%s\t%s\t%s\n' "$age" "$alias" "$session" "$snippet"
+}
+
+bridge_count_for_rows() {
+    local rows="${1:-}"
+    local count=0
+    local _age _alias session _snippet
+    while IFS=$'\t' read -r _age _alias session _snippet; do
+        [[ -n "$session" ]] || continue
+        if bridge_exists "$session"; then
+            count=$((count + 1))
+        fi
+    done <<< "$rows"
+    echo "$count"
+}
+
 stale_candidates() {
     local older_than_hours="$1"
     local filter="${2:-}"
     local limit="${3:-0}"
     local cutoff_secs=$((older_than_hours * 3600))
     local current_session=""
-    local line session clients age alias snippet
+    local line session clients age alias snippet matched_basic prefer_basic_filter basic_sessions
     local rows=""
 
     current_session="$(current_live_session 2>/dev/null || true)"
-    _build_alias_cache
+    prefer_basic_filter=0
+    basic_sessions=""
 
-    rows="$(
+    if [[ -z "$filter" ]]; then
+        _build_alias_cache
+    else
+        basic_sessions="$(_session_names | _search -i -- "$filter" 2>/dev/null || true)"
+        if [[ -n "$basic_sessions" ]]; then
+            prefer_basic_filter=1
+        else
+            _build_alias_cache
+        fi
+    fi
+
+    if [[ -n "$filter" && "$prefer_basic_filter" -eq 0 ]]; then
         while IFS= read -r line; do
             session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
-            clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
             [[ -n "$session" ]] || continue
-            if bridge_exists "$session" && [[ "${clients:-0}" -gt 0 ]]; then
-                clients=$((clients - 1))
-            fi
-            [[ "${clients:-0}" -eq 0 ]] || continue
-            [[ "$session" != "$current_session" ]] || continue
-            age="$(session_age_secs "$session")"
-            [[ "$age" -ge "$cutoff_secs" ]] || continue
             alias="${_ALIAS_CACHE[$session]:-$(session_alias "$session")}"
-            snippet="$(session_snippet "$session" 5)"
-            if [[ -n "$filter" ]]; then
-                if ! printf '%s\n' "$alias $session $snippet" | _search -qi -- "$filter" 2>/dev/null; then
-                    continue
-                fi
+            if printf '%s\n' "$alias $session" | _search -qi -- "$filter" 2>/dev/null; then
+                prefer_basic_filter=1
+                basic_sessions+="$session"
+                basic_sessions+=$'\n'
             fi
-            printf '%s\t%s\t%s\t%s\n' "$age" "$alias" "$session" "$snippet"
-        done < <(zmx list 2>/dev/null) | sort -rn -k1,1
-    )"
+        done < <(zmx list 2>/dev/null)
+    fi
+
+    if [[ "$prefer_basic_filter" -eq 1 ]]; then
+        rows="$(
+            while IFS= read -r session; do
+                [[ -n "$session" ]] || continue
+                [[ "$session" != "$current_session" ]] || continue
+                clients="$(session_effective_clients "$session")"
+                [[ "${clients:-0}" -eq 0 ]] || continue
+                age="$(session_age_secs "$session")"
+                [[ "$age" -ge "$cutoff_secs" ]] || continue
+                alias="${_ALIAS_CACHE[$session]:-$(session_alias_single "$session")}"
+                snippet="$(session_snippet "$session" 5)"
+                printf '%s\t%s\t%s\t%s\n' "$age" "$alias" "$session" "$snippet"
+            done <<< "$basic_sessions" | sort -rn -k1,1
+        )"
+    else
+        rows="$(
+            while IFS= read -r line; do
+                session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
+                [[ -n "$session" ]] || continue
+                [[ "$session" != "$current_session" ]] || continue
+                clients="$(session_effective_clients "$session")"
+                [[ "${clients:-0}" -eq 0 ]] || continue
+                age="$(session_age_secs "$session")"
+                [[ "$age" -ge "$cutoff_secs" ]] || continue
+                alias="${_ALIAS_CACHE[$session]:-$(session_alias_single "$session")}"
+                snippet=""
+                if [[ -n "$filter" ]]; then
+                    matched_basic=0
+                    if printf '%s\n' "$alias $session" | _search -qi -- "$filter" 2>/dev/null; then
+                        matched_basic=1
+                    fi
+                    if [[ "$matched_basic" -eq 0 ]]; then
+                        snippet="$(session_snippet "$session" 5)"
+                        if ! printf '%s\n' "$snippet" | _search -qi -- "$filter" 2>/dev/null; then
+                            continue
+                        fi
+                    fi
+                fi
+                [[ -n "${snippet:-}" ]] || snippet="$(session_snippet "$session" 5)"
+                printf '%s\t%s\t%s\t%s\n' "$age" "$alias" "$session" "$snippet"
+            done < <(zmx list 2>/dev/null) | sort -rn -k1,1
+        )"
+    fi
 
     [[ -n "$rows" ]] || return 0
     if [[ "$limit" -gt 0 ]]; then
-        printf '%s\n' "$rows" | head -n "$limit"
+        printf '%s\n' "$rows" | take_nonempty_rows "$limit"
     else
         printf '%s\n' "$rows"
     fi
+}
+
+stale_skips() {
+    local older_than_hours="$1"
+    local filter="${2:-}"
+    local cutoff_secs=$((older_than_hours * 3600))
+    local current_session=""
+    local line session clients age alias snippet reason matched_basic prefer_basic_filter basic_sessions
+    local rows=""
+
+    current_session="$(current_live_session 2>/dev/null || true)"
+    prefer_basic_filter=0
+    basic_sessions=""
+
+    if [[ -z "$filter" ]]; then
+        _build_alias_cache
+    else
+        basic_sessions="$(_session_names | _search -i -- "$filter" 2>/dev/null || true)"
+        if [[ -n "$basic_sessions" ]]; then
+            prefer_basic_filter=1
+        else
+            _build_alias_cache
+        fi
+    fi
+
+    if [[ -n "$filter" && "$prefer_basic_filter" -eq 0 ]]; then
+        while IFS= read -r line; do
+            session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
+            [[ -n "$session" ]] || continue
+            alias="${_ALIAS_CACHE[$session]:-$(session_alias "$session")}"
+            if printf '%s\n' "$alias $session" | _search -qi -- "$filter" 2>/dev/null; then
+                prefer_basic_filter=1
+                basic_sessions+="$session"
+                basic_sessions+=$'\n'
+            fi
+        done < <(zmx list 2>/dev/null)
+    fi
+
+    if [[ "$prefer_basic_filter" -eq 1 ]]; then
+        rows="$(
+            while IFS= read -r session; do
+                [[ -n "$session" ]] || continue
+                age="$(session_age_secs "$session")"
+                [[ "$age" -ge "$cutoff_secs" ]] || continue
+                alias="${_ALIAS_CACHE[$session]:-$(session_alias_single "$session")}"
+                snippet="$(session_snippet "$session" 5)"
+
+                reason=""
+                if [[ -n "$current_session" && "$session" == "$current_session" ]]; then
+                    reason="current live session"
+                else
+                    clients="$(session_effective_clients "$session")"
+                    if [[ "${clients:-0}" -gt 0 ]]; then
+                        reason="${clients} attached client(s)"
+                    fi
+                fi
+
+                [[ -n "$reason" ]] || continue
+                printf '%s\t%s\t%s\t%s\t%s\n' "$age" "$alias" "$session" "$reason" "$snippet"
+            done <<< "$basic_sessions" | sort -rn -k1,1
+        )"
+    else
+        rows="$(
+            while IFS= read -r line; do
+                session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
+                [[ -n "$session" ]] || continue
+                age="$(session_age_secs "$session")"
+                [[ "$age" -ge "$cutoff_secs" ]] || continue
+                alias="${_ALIAS_CACHE[$session]:-$(session_alias_single "$session")}"
+                snippet=""
+                if [[ -n "$filter" ]]; then
+                    matched_basic=0
+                    if printf '%s\n' "$alias $session" | _search -qi -- "$filter" 2>/dev/null; then
+                        matched_basic=1
+                    fi
+                    if [[ "$matched_basic" -eq 0 ]]; then
+                        snippet="$(session_snippet "$session" 5)"
+                        if ! printf '%s\n' "$snippet" | _search -qi -- "$filter" 2>/dev/null; then
+                            continue
+                        fi
+                    fi
+                fi
+                [[ -n "${snippet:-}" ]] || snippet="$(session_snippet "$session" 5)"
+
+                reason=""
+                if [[ -n "$current_session" && "$session" == "$current_session" ]]; then
+                    reason="current live session"
+                else
+                    clients="$(session_effective_clients "$session")"
+                    if [[ "${clients:-0}" -gt 0 ]]; then
+                        reason="${clients} attached client(s)"
+                    fi
+                fi
+
+                [[ -n "$reason" ]] || continue
+                printf '%s\t%s\t%s\t%s\t%s\n' "$age" "$alias" "$session" "$reason" "$snippet"
+            done < <(zmx list 2>/dev/null) | sort -rn -k1,1
+        )"
+    fi
+
+    [[ -n "$rows" ]] || return 0
+    printf '%s\n' "$rows"
 }
 
 ensure_cullable_session() {
@@ -422,14 +772,14 @@ ensure_cullable_session() {
     fi
     clients="$(session_effective_clients "$session")"
     if [[ "${clients:-0}" -gt 0 ]]; then
-        echo "session '$session' has ${clients} client(s); detach it before culling"
+        echo "session '$session' has ${clients} client(s); detach it before pruning"
         return 1
     fi
 }
 
-cull_session() {
+prune_session() {
     local session="$1"
-    zmx kill "$session" >/dev/null 2>&1 || die "failed to cull session '$session'"
+    zmx kill "$session" >/dev/null 2>&1 || die "failed to prune session '$session'"
     remove_session_plumbing "$session"
 }
 
@@ -442,9 +792,11 @@ surrogate - deterministic terminal control for zmx sessions
 Usage: surrogate <command> [args]
 
 High-value flows:
+  surrogate live --here              Show the live, actionable sessions for this repo
   surrogate help list                 Show discoverability-oriented list usage
   surrogate who --recent 20           Find the most recent interesting sessions
   surrogate brief --recent 15         Brief the 15 most recently active sessions
+  surrogate sweep --older-than 48     Preview old detached zmx sessions to delete
   surrogate list --cwd                Show repo + cwd hints for every session
   surrogate type --message <session> "long prose"
                                       Safest way to send agent prose
@@ -454,7 +806,7 @@ High-value flows:
 Commands:
   list  [-n LINES] [--cwd] [--json]
                                 List sessions by alias; add --cwd/--json for repo and UI context
-  stale [--older-than HOURS]    List oldest detached stale zmx sessions (default: 24h)
+  stale [--older-than HOURS]    List old detached zmx sessions (default: 24h)
   send  <session> [keys...]     Send tmux send-keys style keystrokes
   submit <session>              Press Enter for a staged prompt
   type  [--message] <session> <text>
@@ -465,18 +817,25 @@ Commands:
   find  <query> [-n LINES]      Search all sessions for text (grep, default: last 200 lines)
   who   [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
                                 Show sessions with age and last visible line
+  live  [-n LINES] [--recent N|2h] [--project NAME|--here] [--cwd PATH] [--all] [--json]
+                                Show only live, messageable sessions with less noise
   active [--all]                Show attached sessions (--all includes non-empty detached)
   brief [--recent N|2h] [filters] [session...]
                                 Remote operator brief via surrogate-brief / OpenRouter
+  sweep [--older-than HOURS] [--filter PATTERN] [--limit N] [--yes]
+                                Preview or delete old detached zmx sessions in one flow
+  prune-sessions <session>... [--dry-run]
+  prune-sessions --stale [options]
+                                Delete zmx sessions and clean their surrogate plumbing
+  prune-bridges [--all|--dead]  Remove surrogate tmux bridges only
   peek  [-n LINES] [--filter PATTERN]
                                 Batch read last N lines from all sessions (default: 5)
   alias <session>               Show the alias for a session
   whoami                        Show current session name and alias
   rename <session> <new-alias>  Set a custom alias (session ID stays the same)
-  cull  <session>...            Cull detached zmx sessions by name or alias
-  cull  --stale [options]       Cull oldest detached stale zmx sessions in batch
+  cull  ...                     Deprecated alias for prune-sessions
   bridge <session>              Pre-create tmux bridge for a zmx session
-  cleanup [--all|--dead]        Remove stale or all bridge sessions
+  cleanup [--all|--dead]        Deprecated alias for prune-bridges
   status                        Show bridge health
 
 Session arguments accept either the full zmx name or the auto-generated alias.
@@ -500,11 +859,17 @@ Special keys (for send):
 Examples:
   surrogate list
   surrogate help list
+  surrogate live --here
   surrogate list --cwd
   surrogate stale --older-than 72 --limit 20
-  surrogate cull sleepy-otter
-  surrogate cull --stale --older-than 48 --filter '2026-03-08' --limit 10
+  surrogate sweep --older-than 48
+  surrogate prune-sessions --stale --older-than 48 --dry-run
+  surrogate prune-sessions --stale --older-than 48 --yes
+  surrogate prune-sessions sleepy-otter
+  surrogate prune-bridges --dead
   surrogate who --recent 2h --project surrogate
+  surrogate live --recent 15
+  surrogate live --here
   surrogate brief --recent 15
   surrogate brief 15
   surrogate brief silly-pixel
@@ -545,7 +910,25 @@ usage: surrogate who [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [-
 
 Show the newest sessions first by session age. By default, `who` shows the 20 most recent sessions.
 Use `--recent N` or `--recent 2h` to widen or narrow the window.
-For activity-ranked discovery, use `surrogate active --recent ...`.
+For lower-noise activity-ranked discovery, use `surrogate live`.
+EOF
+}
+
+live_usage() {
+    cat <<'EOF'
+usage: surrogate live [-n LINES] [--recent N|2h] [--project NAME|--here] [--cwd PATH] [--json]
+
+Show only live, messageable zmx sessions. This is the low-noise discovery view:
+- sessions must be present in `zmx list`
+- sessions must have attached clients
+- results are ranked by recent visible activity, not spawn time
+- default output hides low-signal shell-like lanes with no visible repo/cwd hint
+
+Add `--all` to include every live messageable session, including low-signal lanes.
+
+Use `--here` to filter to the current repo name.
+If the current shell is only ancestry-backed and not present in `zmx list`, `live`
+prints a separate anomaly note instead of pretending that lane is messageable.
 EOF
 }
 
@@ -555,6 +938,7 @@ usage: surrogate active [--all] [-n LINES] [--recent N|2h] [--project NAME] [--c
 
 Show sessions ranked by last observed activity (recent output), not creation time.
 Default mode shows only attached sessions. Use --all to include detached sessions with visible output.
+For a lower-noise, actually messageable view, use `surrogate live`.
 EOF
 }
 
@@ -566,8 +950,8 @@ Summarize sessions with one remote brief per session.
 
 Selection rules:
   - If you pass explicit session names or aliases, those sessions are briefed.
-  - Otherwise, session selection reuses `surrogate active --json`, which ranks by
-    last observed activity, not spawn time.
+  - Otherwise, session selection reuses `surrogate live --json`, which shows only
+    live, messageable sessions ranked by last observed activity.
   - `surrogate brief 15` is shorthand for `surrogate brief --recent 15`.
 
 Examples:
@@ -581,6 +965,52 @@ Brief flags are forwarded to `surrogate-brief`, including:
   --config, --no-config, --show-config, -n, --model, --openrouter-model,
   --llm-model, --provider, --inference-provider, --no-fallbacks,
   --temperature, --max-completion-tokens, --api-url
+EOF
+}
+
+prune_sessions_usage() {
+    cat <<'EOF'
+usage: surrogate prune-sessions <session>... [--dry-run]
+       surrogate prune-sessions --stale [--older-than HOURS] [--filter PATTERN] [--limit N] [--dry-run|--yes]
+
+Delete zmx sessions and clean surrogate plumbing for those same sessions.
+
+Modes:
+  explicit targets  Deletes the named sessions or aliases. Use --dry-run to preview.
+  --stale batch     Selects old detached zmx sessions. Preview is the default.
+                    Re-run with --yes to execute deletion.
+
+Notes:
+  - Batch stale pruning reports old sessions skipped because they are still attached
+    or because they are your current live session.
+  - For bridge-only cleanup, use `surrogate prune-bridges`.
+  - `surrogate cull` is a deprecated alias for this command.
+EOF
+}
+
+prune_bridges_usage() {
+    cat <<'EOF'
+usage: surrogate prune-bridges [--dead|--all]
+
+Remove surrogate tmux bridges only. This does not delete zmx sessions.
+
+Options:
+  --dead   Remove surrogate tmux bridges whose zmx sessions no longer exist (default)
+  --all    Remove all surrogate tmux bridges
+
+Note:
+  `surrogate cleanup` is a deprecated alias for this command.
+EOF
+}
+
+sweep_usage() {
+    cat <<'EOF'
+usage: surrogate sweep [--older-than HOURS] [--filter PATTERN] [--limit N] [--yes]
+
+Preview or delete old detached zmx sessions in one flow.
+
+Default behavior shows what would be deleted and what would be skipped.
+Add --yes to actually delete the zmx sessions and remove their surrogate bridges.
 EOF
 }
 
@@ -625,12 +1055,17 @@ cmd_help() {
         list) list_usage ;;
         who) who_usage ;;
         active) active_usage ;;
+        live) live_usage ;;
         brief) brief_usage ;;
+        prune-sessions) prune_sessions_usage ;;
+        prune-bridges) prune_bridges_usage ;;
+        sweep) sweep_usage ;;
         type) type_usage ;;
         send) send_usage ;;
         submit) submit_usage ;;
         stale) echo "usage: surrogate stale [--older-than HOURS] [--filter PATTERN] [--limit N]" ;;
-        cull) echo "usage: surrogate cull <session>... | surrogate cull --stale [--older-than HOURS] [--filter PATTERN] [--limit N] [--dry-run]" ;;
+        cull) echo "usage: surrogate cull ...  # deprecated alias for prune-sessions" ;;
+        cleanup) echo "usage: surrogate cleanup [--all|--dead]  # deprecated alias for prune-bridges" ;;
         *) die "unknown help topic: $1" ;;
     esac
 }
@@ -669,11 +1104,11 @@ line_count() {
 
 session_age_seconds() {
     local session="$1"
-    local zmx_dir="/run/user/$(id -u)/zmx"
-    if [[ -e "$zmx_dir/$session" ]]; then
-        local now mtime
-        now="$(date +%s)"
-        mtime="$(stat -c %Y "$zmx_dir/$session" 2>/dev/null || echo 0)"
+    local now mtime
+    _build_session_time_cache
+    mtime="${_SESSION_SOCKET_MTIME[$session]:-}"
+    if [[ -n "$mtime" ]]; then
+        now="$_SESSION_TIME_CACHE_NOW"
         echo $(( now - mtime ))
     else
         echo 2147483647
@@ -688,6 +1123,20 @@ format_age() {
     else printf '%sd' $(( age / 86400 )); fi
 }
 
+format_age_into() {
+    local __var_name="$1"
+    local age="$2"
+    if [[ "$age" -lt 60 ]]; then
+        printf -v "$__var_name" '%ss' "$age"
+    elif [[ "$age" -lt 3600 ]]; then
+        printf -v "$__var_name" '%sm' $(( age / 60 ))
+    elif [[ "$age" -lt 86400 ]]; then
+        printf -v "$__var_name" '%sh' $(( age / 3600 ))
+    else
+        printf -v "$__var_name" '%sd' $(( age / 86400 ))
+    fi
+}
+
 zmx_log_dir() {
     echo "$(zmx_socket_dir)/logs"
 }
@@ -699,11 +1148,11 @@ session_log_path() {
 
 session_activity_seconds() {
     local session="$1"
-    local log_path now mtime
-    log_path="$(session_log_path "$session")"
-    now="$(date +%s)"
-    if [[ -e "$log_path" ]]; then
-        mtime="$(stat -c %Y "$log_path" 2>/dev/null || echo 0)"
+    local now mtime
+    _build_session_time_cache
+    now="$_SESSION_TIME_CACHE_NOW"
+    mtime="${_SESSION_LOG_MTIME[$session]:-}"
+    if [[ -n "$mtime" ]]; then
         echo $(( now - mtime ))
         return 0
     fi
@@ -729,18 +1178,35 @@ session_recent_history() {
 
 session_base_records() {
     _build_alias_cache
+    _build_session_time_cache
 
     local line session clients age_seconds ago attached activity_seconds active_ago
+    local now socket_mtime log_mtime
+    now="$_SESSION_TIME_CACHE_NOW"
     while IFS= read -r line; do
-        session="$(echo "$line" | sed -n 's/^session_name=\([^\t]*\).*/\1/p')"
-        clients="$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')"
+        session="${line#session_name=}"
+        session="${session%%$'\t'*}"
+        clients="${line##*clients=}"
+        clients="${clients%%$'\t'*}"
         [[ -n "$session" ]] || continue
         [[ -n "$clients" ]] || clients=0
 
-        age_seconds="$(session_age_seconds "$session")"
-        activity_seconds="$(session_activity_seconds "$session")"
-        ago="$(format_age "$age_seconds")"
-        active_ago="$(format_age "$activity_seconds")"
+        socket_mtime="${_SESSION_SOCKET_MTIME[$session]:-}"
+        if [[ -n "$socket_mtime" ]]; then
+            age_seconds=$(( now - socket_mtime ))
+        else
+            age_seconds=2147483647
+        fi
+
+        log_mtime="${_SESSION_LOG_MTIME[$session]:-}"
+        if [[ -n "$log_mtime" ]]; then
+            activity_seconds=$(( now - log_mtime ))
+        else
+            activity_seconds="$age_seconds"
+        fi
+
+        format_age_into ago "$age_seconds"
+        format_age_into active_ago "$activity_seconds"
         attached="detached"
         [[ "$clients" -gt 0 ]] && attached="attached"
 
@@ -759,8 +1225,11 @@ session_log_context() {
     cwd_hint="$(visible_path_hint "$history")"
     project_hint="$(project_from_path "$cwd_hint")"
     ui_hint="$(ui_hint_from_history "$history")"
-    printf '%s	%s	%s	%s
-' "$snippet" "$cwd_hint" "$project_hint" "$ui_hint"
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(record_display_field "$snippet")" \
+        "$(record_display_field "$cwd_hint")" \
+        "$(record_display_field "$project_hint")" \
+        "$ui_hint"
 }
 
 session_visible_context() {
@@ -773,7 +1242,11 @@ session_visible_context() {
     project_hint="$(project_from_path "$cwd_hint")"
     ui_hint="$(ui_hint_from_history "$history")"
 
-    printf '%s\t%s\t%s\t%s\n' "$snippet" "$cwd_hint" "$project_hint" "$ui_hint"
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(record_display_field "$snippet")" \
+        "$(record_display_field "$cwd_hint")" \
+        "$(record_display_field "$project_hint")" \
+        "$ui_hint"
 }
 
 visible_snippet() {
@@ -846,6 +1319,92 @@ session_records() {
             "$age_seconds" "$ago" "$attached" "$clients" "$alias" \
             "$session" "$activity_seconds" "$active_ago" "$snippet" "$cwd_hint" "$project_hint" "$ui_hint"
     done <<< "$base_rows"
+}
+
+activity_ranked_records() {
+    local mode="$1"
+    local lines="${2:-10}"
+    local recent_count="${3:-20}"
+    local recent_age_max="${4:-}"
+    local project_filter="${5:-}"
+    local cwd_filter="${6:-}"
+    local base_records filtered_base sorted_base selected_base records
+
+    base_records="$(session_base_records)"
+    filtered_base=""
+    while IFS=$'\t' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
+        [[ -n "$session" ]] || continue
+        case "$mode" in
+            live|attached)
+                [[ "$clients" -gt 0 ]] || continue
+                ;;
+            all)
+                local log_path lc
+                log_path="$(session_log_path "$session")"
+                if [[ -r "$log_path" ]]; then
+                    [[ -s "$log_path" ]] || continue
+                else
+                    lc="$(zmx history "$session" 2>/dev/null | wc -l)"
+                    [[ "$lc" -eq 0 ]] && continue
+                fi
+                ;;
+            *)
+                die "unknown activity-ranked mode: $mode"
+                ;;
+        esac
+        if [[ -n "$recent_age_max" && "$activity_seconds" -gt "$recent_age_max" ]]; then
+            continue
+        fi
+        filtered_base+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+            "$age_seconds" "$ago" "$attached" "$clients" "$alias" "$session" "$activity_seconds" "$active_ago")
+        filtered_base+=$'\n'
+    done <<< "$base_records"
+
+    sorted_base="$(printf '%s' "$filtered_base" | sed '/^$/d' | sort -t $'\t' -k7,7n -k4,4nr -k6,6)"
+    selected_base=""
+
+    if [[ -z "$project_filter" && -z "$cwd_filter" ]]; then
+        selected_base="$(printf '%s\n' "$sorted_base" | take_nonempty_rows "$recent_count")"
+    else
+        local inspected=0 inspect_limit=10 matched=0
+        if [[ "$recent_count" -gt "$inspect_limit" ]]; then
+            inspect_limit="$recent_count"
+        fi
+        while IFS=$'\t' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
+            [[ -n "$session" ]] || continue
+            inspected=$((inspected + 1))
+            IFS=$'\t' read -r snippet cwd_hint project_hint ui_hint < <(session_log_context "$session" "$lines" || true)
+            if [[ -z "$snippet" && -z "$cwd_hint" && -z "$project_hint" ]]; then
+                continue
+            fi
+            if [[ "$inspected" -gt "$inspect_limit" && "$matched" -eq 0 ]]; then
+                break
+            fi
+            if [[ -n "$cwd_filter" && ( -z "$cwd_hint" || "$cwd_hint" != "$cwd_filter"* ) ]]; then
+                continue
+            fi
+            if [[ -n "$project_filter" && "$project_hint" != "$project_filter" && "$snippet" != *"$project_filter"* ]]; then
+                continue
+            fi
+            selected_base+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "$age_seconds" "$ago" "$attached" "$clients" "$alias" "$session" "$activity_seconds" "$active_ago")
+            selected_base+=$'\n'
+            matched=$((matched + 1))
+            [[ "$matched" -ge "$recent_count" ]] && break
+        done <<< "$sorted_base"
+    fi
+
+    if [[ -n "$selected_base" ]]; then
+        records="$(session_records "$lines" "$selected_base")"
+        printf '%s' "$records" | sed '/^$/d' | sort -t $'\t' -k7,7n -k4,4nr -k6,6 | take_nonempty_rows "$recent_count"
+    fi
+}
+
+current_shell_anomaly() {
+    local status session
+    IFS=$'\t' read -r status session < <(current_session_identity 2>/dev/null || true)
+    [[ "$status" == "ancestry" && -n "$session" ]] || return 1
+    printf 'GHOST\t%s\t%s\t%s\n' "$(session_alias_base "$session")" "$session" "current shell ancestry-only; not present in zmx list"
 }
 
 parse_recent_filter() {
@@ -952,8 +1511,8 @@ cmd_list() {
             printf '{"alias":"%s","session":"%s","project_hint":%s,"cwd_hint":%s,"ui_hint":"%s","clients":%s,"attached":%s}' \
                 "$(json_escape "$alias")" \
                 "$(json_escape "$session")" \
-                "$(json_or_null "$project_hint")" \
-                "$(json_or_null "$cwd_hint")" \
+                "$(json_or_null "$(record_nullable_field "$project_hint")")" \
+                "$(json_or_null "$(record_nullable_field "$cwd_hint")")" \
                 "$(json_escape "$ui_hint")" \
                 "$clients" \
                 "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')"
@@ -992,19 +1551,41 @@ cmd_stale() {
         esac
     done
 
-    local rows=""
+    local rows="" skips=""
     rows="$(stale_candidates "$older_than_hours" "$filter" "$limit")"
-    if [[ -z "$rows" ]]; then
-        echo "no stale sessions older than ${older_than_hours}h"
+    skips="$(stale_skips "$older_than_hours" "$filter")"
+
+    if [[ -z "$rows" && -z "$skips" ]]; then
+        echo "no detached zmx sessions older than ${older_than_hours}h"
         return 0
     fi
 
-    printf "%-4s %-18s %-42s %s\n" "AGE" "ALIAS" "SESSION" "SNIPPET"
-    while IFS=$'\t' read -r age alias session snippet; do
-        [[ -n "$session" ]] || continue
-        printf "%-4s %-18s %-42s %s\n" "$(format_age_secs "$age")" "$alias" "$session" "$snippet"
-    done <<< "$rows"
-    echo "--- $(printf '%s\n' "$rows" | sed '/^$/d' | wc -l) stale session(s) older than ${older_than_hours}h ---"
+    local candidate_count skip_count
+    candidate_count="$(count_rows "$rows")"
+    skip_count="$(count_rows "$skips")"
+
+    if [[ -n "$rows" ]]; then
+        echo "Detached zmx sessions older than ${older_than_hours}h:"
+        printf "%-4s %-18s %-42s %s\n" "AGE" "ALIAS" "SESSION" "SNIPPET"
+        while IFS=$'\t' read -r age alias session snippet; do
+            [[ -n "$session" ]] || continue
+            printf "%-4s %-18s %-42s %s\n" "$(format_age_secs "$age")" "$alias" "$session" "$snippet"
+        done <<< "$rows"
+    else
+        echo "No detached zmx sessions older than ${older_than_hours}h are eligible to delete."
+    fi
+
+    if [[ -n "$skips" ]]; then
+        echo ""
+        echo "Old zmx sessions skipped:"
+        printf "%-4s %-18s %-42s %-20s %s\n" "AGE" "ALIAS" "SESSION" "WHY" "SNIPPET"
+        while IFS=$'\t' read -r age alias session reason snippet; do
+            [[ -n "$session" ]] || continue
+            printf "%-4s %-18s %-42s %-20s %s\n" "$(format_age_secs "$age")" "$alias" "$session" "$reason" "$snippet"
+        done <<< "$skips"
+    fi
+
+    echo "--- ${candidate_count} detached zmx session(s) older than ${older_than_hours}h; ${skip_count} skipped ---"
 }
 
 cmd_send() {
@@ -1151,7 +1732,7 @@ cmd_type() {
     fi
     audit_event "type" "$session" "allow" "$text"
 
-    if [[ "$ui_hint" == "shell" ]]; then
+    if [[ "$ui_hint" != "agent" ]]; then
         sleep "$SURROGATE_TYPE_POSTCHECK_SECS"
         local new_output shell_reason
         new_output="$(zmx history "$session" 2>/dev/null | tail -n +"$((start_lines + 1))")"
@@ -1308,8 +1889,8 @@ cmd_who() {
     fi
 
     selected_base="$base_records"
-    if [[ "$recent_explicit" -eq 0 && -z "$project_filter" && -z "$cwd_filter" ]]; then
-        selected_base="$(printf '%s\n' "$selected_base" | sed '/^$/d' | head -n "$recent_count")"
+    if [[ -n "$recent_count" && -z "$project_filter" && -z "$cwd_filter" ]]; then
+        selected_base="$(printf '%s\n' "$selected_base" | take_nonempty_rows "$recent_count")"
     fi
 
     records="$(session_records "$lines" "$selected_base")"
@@ -1332,7 +1913,7 @@ cmd_who() {
     local sorted
     sorted="$(printf '%s' "$filtered" | sed '/^$/d')"
     if [[ "$recent_explicit" -eq 1 && -n "$recent_count" ]]; then
-        sorted="$(printf '%s\n' "$sorted" | head -n "$recent_count")"
+        sorted="$(printf '%s\n' "$sorted" | take_nonempty_rows "$recent_count")"
     fi
 
     local total=0
@@ -1341,7 +1922,7 @@ cmd_who() {
     if [[ "$json" -eq 1 ]]; then
         printf '{"count":%s,"recent_first":true,"sessions":[' "$total"
         local first=1
-        while IFS=$'\t' read -r age_seconds ago attached clients alias session _activity_seconds _active_ago snippet cwd_hint project_hint ui_hint; do
+        while IFS=$'\t' read -r age_seconds ago attached clients alias session snippet cwd_hint project_hint ui_hint; do
             [[ -z "$session" ]] && continue
             [[ "$first" -eq 1 ]] || printf ','
             first=0
@@ -1353,17 +1934,19 @@ cmd_who() {
                 "$(json_escape "$ago")" \
                 "$age_seconds" \
                 "$(json_escape "$snippet")" \
-                "$(json_or_null "$cwd_hint")" \
-                "$(json_or_null "$project_hint")" \
+                "$(json_or_null "$(record_nullable_field "$cwd_hint")")" \
+                "$(json_or_null "$(record_nullable_field "$project_hint")")" \
                 "$(json_escape "$ui_hint")"
         done <<< "$sorted"
         echo ']}'
         return 0
     fi
 
-    while IFS=$'\t' read -r _age_seconds ago attached _clients alias session _activity_seconds _active_ago snippet _cwd_hint project_hint ui_hint; do
+    while IFS=$'\t' read -r _age_seconds ago attached _clients alias session snippet _cwd_hint project_hint ui_hint; do
         [[ -z "$session" ]] && continue
-        printf "%-4s %-8s %-18s %-42s %-12s %s\n" "${ago}${attached}" "$ui_hint" "$alias" "$session" "${project_hint:--}" "$snippet"
+        local attached_mark=""
+        [[ "$attached" == "attached" ]] && attached_mark="*"
+        printf "%-4s %-8s %-18s %-42s %-12s %s\n" "${ago}${attached_mark}" "$ui_hint" "$alias" "$session" "${project_hint:--}" "$snippet"
     done <<< "$sorted"
 
     if [[ "$recent_explicit" -eq 0 && -z "$project_filter" && -z "$cwd_filter" ]]; then
@@ -1407,67 +1990,8 @@ cmd_active() {
         esac
     done
 
-    local base_records filtered_base sorted_base selected_base total=0
-    base_records="$(session_base_records)"
-    filtered_base=""
-    while IFS=$'	' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
-        [[ -n "$session" ]] || continue
-        if [[ "$mode" == "attached" && "$clients" -eq 0 ]]; then
-            continue
-        fi
-        if [[ "$mode" == "all" ]]; then
-            local log_path lc
-            log_path="$(session_log_path "$session")"
-            if [[ -r "$log_path" ]]; then
-                [[ -s "$log_path" ]] || continue
-            else
-                lc="$(zmx history "$session" 2>/dev/null | wc -l)"
-                [[ "$lc" -eq 0 ]] && continue
-            fi
-        fi
-        if [[ -n "$recent_age_max" && "$activity_seconds" -gt "$recent_age_max" ]]; then
-            continue
-        fi
-        filtered_base+=$(printf '%s	%s	%s	%s	%s	%s	%s	%s'             "$age_seconds" "$ago" "$attached" "$clients" "$alias" "$session" "$activity_seconds" "$active_ago")
-        filtered_base+=$'
-'
-    done <<< "$base_records"
-
-    sorted_base="$(printf '%s' "$filtered_base" | sed '/^$/d' | sort -t $'	' -k7,7n -k4,4nr -k6,6)"
-    selected_base=""
-
-    if [[ -z "$project_filter" && -z "$cwd_filter" ]]; then
-        selected_base="$(printf '%s
-' "$sorted_base" | head -n "$recent_count")"
-    else
-        local inspected=0 inspect_limit=10 matched=0
-        while IFS=$'	' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
-            [[ -n "$session" ]] || continue
-            inspected=$((inspected + 1))
-            IFS=$'	' read -r snippet cwd_hint project_hint ui_hint < <(session_log_context "$session" "$lines" || true)
-            if [[ -z "$snippet" && -z "$cwd_hint" && -z "$project_hint" ]]; then
-                continue
-            fi
-            if [[ "$inspected" -gt "$inspect_limit" && "$matched" -eq 0 ]]; then
-                break
-            fi
-            if [[ -n "$cwd_filter" && ( -z "$cwd_hint" || "$cwd_hint" != "$cwd_filter"* ) ]]; then
-                continue
-            fi
-            if [[ -n "$project_filter" && "$project_hint" != "$project_filter" && "$snippet" != *"$project_filter"* ]]; then
-                continue
-            fi
-            selected_base+=$(printf '%s	%s	%s	%s	%s	%s	%s	%s'                 "$age_seconds" "$ago" "$attached" "$clients" "$alias" "$session" "$activity_seconds" "$active_ago")
-            selected_base+=$'
-'
-            matched=$((matched + 1))
-            [[ "$matched" -ge "$recent_count" ]] && break
-        done <<< "$sorted_base"
-    fi
-
-    local records sorted
-    records="$(session_records "$lines" "$selected_base")"
-    sorted="$(printf '%s' "$records" | sed '/^$/d' | sort -t $'	' -k7,7n -k4,4nr -k6,6 | head -n "$recent_count")"
+    local sorted total=0
+    sorted="$(activity_ranked_records "$mode" "$lines" "$recent_count" "$recent_age_max" "$project_filter" "$cwd_filter")"
     [[ -n "$sorted" ]] && total="$(printf '%s
 ' "$sorted" | sed '/^$/d' | wc -l)"
 
@@ -1478,7 +2002,19 @@ cmd_active() {
             [[ -n "$session" ]] || continue
             [[ "$first" -eq 1 ]] || printf ','
             first=0
-            printf '{"alias":"%s","session":"%s","clients":%s,"attached":%s,"last_active":"%s","last_active_seconds":%s,"age":"%s","age_seconds":%s,"snippet":"%s","cwd_hint":%s,"project_hint":%s,"ui_hint":"%s"}'                 "$(json_escape "$alias")"                 "$(json_escape "$session")"                 "$clients"                 "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')"                 "$(json_escape "$active_ago")"                 "$activity_seconds"                 "$(json_escape "$ago")"                 "$age_seconds"                 "$(json_escape "$snippet")"                 "$(json_or_null "$cwd_hint")"                 "$(json_or_null "$project_hint")"                 "$(json_escape "$ui_hint")"
+            printf '{"alias":"%s","session":"%s","clients":%s,"attached":%s,"last_active":"%s","last_active_seconds":%s,"age":"%s","age_seconds":%s,"snippet":"%s","cwd_hint":%s,"project_hint":%s,"ui_hint":"%s"}' \
+                "$(json_escape "$alias")" \
+                "$(json_escape "$session")" \
+                "$clients" \
+                "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')" \
+                "$(json_escape "$active_ago")" \
+                "$activity_seconds" \
+                "$(json_escape "$ago")" \
+                "$age_seconds" \
+                "$(json_escape "$snippet")" \
+                "$(json_or_null "$(record_nullable_field "$cwd_hint")")" \
+                "$(json_or_null "$(record_nullable_field "$project_hint")")" \
+                "$(json_escape "$ui_hint")"
         done <<< "$sorted"
         echo ']}'
         return 0
@@ -1495,6 +2031,150 @@ cmd_active() {
     done <<< "$sorted"
 
     echo "── $total sessions (recent activity first; * = attached) ──"
+}
+
+cmd_live() {
+    check_deps
+    _build_alias_cache
+
+    local lines=10
+    local json=0
+    local show_all=0
+    local recent_count=15
+    local recent_age_max=""
+    local project_filter=""
+    local cwd_filter=""
+    local here=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) live_usage; return 0 ;;
+            -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
+            --all) show_all=1; shift ;;
+            --json) json=1; shift ;;
+            --project) [[ $# -ge 2 ]] || die "--project requires a name"; project_filter="$2"; shift 2 ;;
+            --cwd) [[ $# -ge 2 ]] || die "--cwd requires a path"; cwd_filter="$2"; shift 2 ;;
+            --here) here=1; shift ;;
+            --recent)
+                [[ $# -ge 2 ]] || die "--recent requires a value"
+                local recent_mode
+                recent_mode="$(parse_recent_filter "$2")"
+                case "$recent_mode" in
+                    count:*) recent_count="${recent_mode#count:}" ;;
+                    age:*) recent_age_max="${recent_mode#age:}" ;;
+                esac
+                shift 2
+                ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+
+    if [[ "$here" -eq 1 ]]; then
+        [[ -z "$project_filter" ]] || die "cannot combine --here with --project"
+        project_filter="$(current_repo_name)"
+    fi
+
+    local sorted total=0 anomaly=""
+    sorted="$(activity_ranked_records "live" "$lines" "$recent_count" "$recent_age_max" "$project_filter" "$cwd_filter")"
+    [[ -n "$sorted" ]] && total="$(printf '%s\n' "$sorted" | sed '/^$/d' | wc -l)"
+    anomaly="$(current_shell_anomaly || true)"
+
+    local display_rows="$sorted"
+    local display_total="$total"
+    local hidden_low_signal=0
+    local signal_filtered=0
+    if [[ "$show_all" -eq 0 && -z "$project_filter" && -z "$cwd_filter" && -n "$sorted" ]]; then
+        local focused_rows=""
+        while IFS=$'\t' read -r age_seconds ago attached clients alias session activity_seconds active_ago snippet cwd_hint project_hint ui_hint; do
+            [[ -n "$session" ]] || continue
+            if [[ "$project_hint" != "-" || "$cwd_hint" != "-" || "$ui_hint" == "agent" ]]; then
+                focused_rows+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                    "$age_seconds" "$ago" "$attached" "$clients" "$alias" "$session" \
+                    "$activity_seconds" "$active_ago" "$snippet" "$cwd_hint" "$project_hint" "$ui_hint")
+                focused_rows+=$'\n'
+            else
+                hidden_low_signal=$((hidden_low_signal + 1))
+            fi
+        done <<< "$sorted"
+
+        if [[ -n "$focused_rows" ]]; then
+            display_rows="$(printf '%s' "$focused_rows" | sed '/^$/d')"
+            display_total="$(count_rows "$display_rows")"
+            signal_filtered=1
+        else
+            hidden_low_signal=0
+        fi
+    fi
+
+    if [[ "$json" -eq 1 ]]; then
+        printf '{"count":%s,"total_live_count":%s,"messageable_only":true' "$display_total" "$total"
+        printf ',"high_signal_only":%s,"hidden_low_signal_count":%s' \
+            "$([[ "$signal_filtered" -eq 1 ]] && printf 'true' || printf 'false')" \
+            "$hidden_low_signal"
+        if [[ -n "$anomaly" ]]; then
+            local anomaly_state anomaly_alias anomaly_session anomaly_note
+            IFS=$'\t' read -r anomaly_state anomaly_alias anomaly_session anomaly_note <<< "$anomaly"
+            printf ',"current_shell":{"state":"%s","alias":"%s","session":"%s","note":"%s"}' \
+                "$(json_escape "$anomaly_state")" \
+                "$(json_escape "$anomaly_alias")" \
+                "$(json_escape "$anomaly_session")" \
+                "$(json_escape "$anomaly_note")"
+        else
+            printf ',"current_shell":null'
+        fi
+        printf ',"sessions":['
+        local first=1
+        while IFS=$'\t' read -r age_seconds ago attached clients alias session activity_seconds active_ago snippet cwd_hint project_hint ui_hint; do
+            [[ -n "$session" ]] || continue
+            [[ "$first" -eq 1 ]] || printf ','
+            first=0
+            printf '{"state":"live","alias":"%s","session":"%s","clients":%s,"attached":%s,"last_active":"%s","last_active_seconds":%s,"age":"%s","age_seconds":%s,"snippet":"%s","cwd_hint":%s,"project_hint":%s,"ui_hint":"%s"}' \
+                "$(json_escape "$alias")" \
+                "$(json_escape "$session")" \
+                "$clients" \
+                "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')" \
+                "$(json_escape "$active_ago")" \
+                "$activity_seconds" \
+                "$(json_escape "$ago")" \
+                "$age_seconds" \
+                "$(json_escape "$snippet")" \
+                "$(json_or_null "$(record_nullable_field "$cwd_hint")")" \
+                "$(json_or_null "$(record_nullable_field "$project_hint")")" \
+                "$(json_escape "$ui_hint")"
+        done <<< "$display_rows"
+        echo ']}'
+        return 0
+    fi
+
+    if [[ -n "$display_rows" ]]; then
+        printf "%-6s %-6s %-4s %-18s %-12s %-42s %s\n" "STATE" "ACTIVE" "AGE" "ALIAS" "PROJECT" "SESSION" "SNIPPET"
+        while IFS=$'\t' read -r _age_seconds ago _attached _clients alias session _activity_seconds active_ago snippet _cwd_hint project_hint _ui_hint; do
+            [[ -n "$session" ]] || continue
+            printf "%-6s %-6s %-4s %-18s %-12s %-42s %s\n" "LIVE" "$active_ago" "$ago" "$alias" "${project_hint:--}" "$session" "$snippet"
+        done <<< "$display_rows"
+        if [[ "$signal_filtered" -eq 1 ]]; then
+            echo "── $display_total likely-actionable live session(s); $hidden_low_signal low-signal live session(s) hidden ──"
+        else
+            echo "── $display_total live session(s), recent activity first ──"
+        fi
+    else
+        echo "no live messageable sessions matched"
+    fi
+
+    if [[ -n "$anomaly" ]]; then
+        echo ""
+        echo "Current shell anomaly:"
+        printf "%-6s %-18s %-42s %s\n" "STATE" "ALIAS" "SESSION" "NOTE"
+        local anomaly_state anomaly_alias anomaly_session anomaly_note
+        IFS=$'\t' read -r anomaly_state anomaly_alias anomaly_session anomaly_note <<< "$anomaly"
+        printf "%-6s %-18s %-42s %s\n" "$anomaly_state" "$anomaly_alias" "$anomaly_session" "$anomaly_note"
+    fi
+
+    if [[ "$signal_filtered" -eq 1 ]]; then
+        echo "Hidden by design: old detached sessions and low-signal live lanes. Review with: surrogate live --all --recent $recent_count"
+    else
+        echo "Hidden by design: old detached sessions. Review with: surrogate stale --older-than 72"
+    fi
 }
 
 cmd_brief() {
@@ -1583,7 +2263,7 @@ cmd_brief() {
         return 0
     fi
 
-    local -a selector_args=("active" "--json")
+    local -a selector_args=("live" "--json")
     [[ "$include_all" -eq 1 ]] && selector_args+=("--all")
     [[ -n "$recent_arg" ]] && selector_args+=("--recent" "$recent_arg")
     [[ -n "$project_filter" ]] && selector_args+=("--project" "$project_filter")
@@ -1674,19 +2354,31 @@ cmd_whoami() {
     esac
     [[ $# -eq 0 ]] || die "usage: surrogate whoami"
 
-    local session="${ZMX_SESSION:-}"
-    if [[ -z "$session" ]]; then
+    local status session alias
+    if ! IFS=$'\t' read -r status session < <(current_session_identity 2>/dev/null || true); then
         die "not inside a zmx session (ZMX_SESSION not set)"
     fi
-    if ! session_exists "$session"; then
-        die "current ZMX_SESSION '$session' is not present in zmx list (stale or leaked environment)"
+    if [[ -z "$status" || -z "$session" ]]; then
+        die "not inside a zmx session (ZMX_SESSION not set)"
     fi
-    _build_alias_cache
-    local alias="${_ALIAS_CACHE[$session]:-}"
-    if [[ -z "$alias" ]]; then
-        alias="$(session_alias "$session")"
-    fi
-    echo "$alias  $session"
+
+    case "$status" in
+        live)
+            _build_alias_cache
+            alias="${_ALIAS_CACHE[$session]:-$(session_alias "$session")}"
+            echo "$alias  $session"
+            ;;
+        ancestry)
+            alias="$(session_alias_base "$session")"
+            echo "$alias  $session  (ancestry-only; not present in zmx list, not messageable via surrogate)"
+            ;;
+        stale-env)
+            die "current ZMX_SESSION '$session' is not present in zmx list (stale or leaked environment)"
+            ;;
+        *)
+            die "not inside a zmx session (ZMX_SESSION not set)"
+            ;;
+    esac
 }
 
 cmd_rename() {
@@ -1724,23 +2416,41 @@ cmd_rename() {
     echo "renamed: $old_alias -> $new_alias  ($session)"
 }
 
-cmd_cull() {
+deprecated_command_warning() {
+    local old_cmd="$1"
+    local new_cmd="$2"
+    local note="${3:-}"
+    if [[ -n "$note" ]]; then
+        warn "'$old_cmd' is deprecated. Use '$new_cmd' instead. $note"
+    else
+        warn "'$old_cmd' is deprecated. Use '$new_cmd' instead."
+    fi
+}
+
+cmd_prune_sessions() {
     check_deps
     local mode="explicit"
     local older_than_hours=24
     local filter=""
     local limit=0
     local dry_run=0
+    local assume_yes=0
+    local auto_preview=0
+    local explicit_invalid=0
     local -a requested=()
     local -a targets=()
+    local rows=""
+    local skipped=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help) prune_sessions_usage; return 0 ;;
             --stale) mode="stale"; shift ;;
             --older-than) [[ $# -ge 2 ]] || die "--older-than requires an hour count"; require_hours "$2"; older_than_hours="$2"; shift 2 ;;
             --filter) [[ $# -ge 2 ]] || die "--filter requires a pattern"; filter="$2"; shift 2 ;;
             --limit) [[ $# -ge 2 ]] || die "--limit requires a count"; require_int "$2"; limit="$2"; shift 2 ;;
             --dry-run) dry_run=1; shift ;;
+            --yes) assume_yes=1; shift ;;
             -*) die "unknown flag: $1" ;;
             *) requested+=("$1"); shift ;;
         esac
@@ -1750,48 +2460,141 @@ cmd_cull() {
         die "cannot mix explicit sessions with --stale"
     fi
     if [[ "$mode" == "explicit" && "${#requested[@]}" -eq 0 ]]; then
-        die "usage: surrogate cull <session>... | surrogate cull --stale [--older-than HOURS] [--filter PATTERN] [--dry-run]"
+        die "usage: surrogate prune-sessions <session>... [--dry-run] | surrogate prune-sessions --stale [--older-than HOURS] [--filter PATTERN] [--limit N] [--dry-run|--yes]"
+    fi
+    if [[ "$mode" == "explicit" && ( -n "$filter" || "$limit" -gt 0 || "$older_than_hours" -ne 24 ) ]]; then
+        die "--older-than, --filter, and --limit require --stale"
     fi
 
     if [[ "$mode" == "stale" ]]; then
-        local rows=""
         rows="$(stale_candidates "$older_than_hours" "$filter" "$limit")"
-        if [[ -z "$rows" ]]; then
-            echo "no stale sessions to cull"
-            return 0
-        fi
+        skipped="$(stale_skips "$older_than_hours" "$filter")"
         while IFS=$'\t' read -r _age _alias session _snippet; do
             [[ -n "$session" ]] || continue
             targets+=("$session")
         done <<< "$rows"
+        if [[ "$dry_run" -eq 0 && "$assume_yes" -eq 0 ]]; then
+            auto_preview=1
+            dry_run=1
+        fi
     else
         local input session guard_reason
         for input in "${requested[@]}"; do
             session="$(resolve_session "$input")"
             if ! guard_reason="$(ensure_cullable_session "$session")"; then
-                die "$guard_reason"
+                skipped+="$(session_review_row "$session" | awk -F '\t' -v reason="$guard_reason" '{printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, reason, $4}')"
+                skipped+=$'\n'
+                explicit_invalid=1
+                continue
             fi
             targets+=("$session")
+            rows+="$(session_review_row "$session")"
+            rows+=$'\n'
         done
+        rows="$(printf '%s' "$rows" | sed '/^$/d' | sort -rn -k1,1)"
+        skipped="$(printf '%s' "$skipped" | sed '/^$/d' | sort -rn -k1,1)"
     fi
 
-    if [[ "${#targets[@]}" -eq 0 ]]; then
-        echo "no sessions to cull"
-        return 0
+    if [[ -z "$rows" && -z "$skipped" ]]; then
+        if [[ "$mode" == "stale" ]]; then
+            echo "no detached zmx sessions to prune"
+            return 0
+        fi
+        echo "no eligible zmx sessions to prune"
+        return 1
     fi
 
+    local candidate_count skip_count bridge_count
+    candidate_count="$(count_rows "$rows")"
+    skip_count="$(count_rows "$skipped")"
+    bridge_count="$(bridge_count_for_rows "$rows")"
+
+    if [[ -n "$rows" ]]; then
+        if [[ "$dry_run" -eq 1 ]]; then
+            echo "Would delete these zmx sessions:"
+        else
+            echo "Deleting these zmx sessions:"
+        fi
+        printf "%-4s %-18s %-42s %-6s %s\n" "AGE" "ALIAS" "SESSION" "BRIDGE" "SNIPPET"
+        local age alias session snippet bridge_label
+        while IFS=$'\t' read -r age alias session snippet; do
+            [[ -n "$session" ]] || continue
+            if bridge_exists "$session"; then
+                bridge_label="yes"
+            else
+                bridge_label="no"
+            fi
+            printf "%-4s %-18s %-42s %-6s %s\n" "$(format_age_secs "$age")" "$alias" "$session" "$bridge_label" "$snippet"
+        done <<< "$rows"
+    else
+        echo "No eligible zmx sessions would be deleted."
+    fi
+
+    if [[ -n "$skipped" ]]; then
+        echo ""
+        if [[ "$mode" == "stale" ]]; then
+            echo "Skipped old zmx sessions:"
+        else
+            echo "Skipped requested zmx sessions:"
+        fi
+        printf "%-4s %-18s %-42s %-24s %s\n" "AGE" "ALIAS" "SESSION" "WHY" "SNIPPET"
+        local age alias session reason snippet
+        while IFS=$'\t' read -r age alias session reason snippet; do
+            [[ -n "$session" ]] || continue
+            printf "%-4s %-18s %-42s %-24s %s\n" "$(format_age_secs "$age")" "$alias" "$session" "$reason" "$snippet"
+        done <<< "$skipped"
+    fi
+
+    echo ""
+    if [[ "$dry_run" -eq 1 ]]; then
+        echo "would delete ${candidate_count} zmx session(s)"
+        echo "would remove ${bridge_count} surrogate tmux bridge(s)"
+        if [[ "$mode" == "stale" && "$auto_preview" -eq 1 ]]; then
+            echo "Preview only. Re-run with --yes to delete these zmx sessions and remove their surrogate tmux bridges."
+        fi
+        [[ "$explicit_invalid" -eq 0 || "$candidate_count" -gt 0 ]] && return 0
+        return 1
+    fi
+
+    local deleted=0 removed_bridges=0
+    local session alias age_label had_bridge
     _build_alias_cache
-    local session alias age_label
     for session in "${targets[@]}"; do
+        [[ -n "$session" ]] || continue
         alias="${_ALIAS_CACHE[$session]:-$(session_alias "$session")}"
         age_label="$(format_age_secs "$(session_age_secs "$session" 2>/dev/null || echo 0)")"
-        if [[ "$dry_run" -eq 1 ]]; then
-            echo "would cull: $alias  $session  age=$age_label"
-            continue
+        had_bridge=0
+        if bridge_exists "$session"; then
+            had_bridge=1
         fi
-        cull_session "$session"
-        echo "culled: $alias  $session  age=$age_label"
+        prune_session "$session"
+        deleted=$((deleted + 1))
+        echo "deleted zmx session: $alias  $session  age=$age_label"
+        if [[ "$had_bridge" -eq 1 ]]; then
+            removed_bridges=$((removed_bridges + 1))
+            echo "removed surrogate tmux bridge: $(bridge_name "$session")"
+        fi
     done
+
+    echo ""
+    echo "deleted ${deleted} zmx session(s)"
+    echo "removed ${removed_bridges} surrogate tmux bridge(s)"
+}
+
+cmd_cull() {
+    deprecated_command_warning "surrogate cull" "surrogate prune-sessions" "Batch stale pruning now previews by default; add --yes to execute."
+    cmd_prune_sessions "$@"
+}
+
+cmd_sweep() {
+    check_deps
+    case "${1:-}" in
+        -h|--help)
+            sweep_usage
+            return 0
+            ;;
+    esac
+    cmd_prune_sessions --stale "$@"
 }
 
 cmd_bridge() {
@@ -1803,40 +2606,63 @@ cmd_bridge() {
     echo "bridge ready: $(bridge_name "$session")"
 }
 
-cmd_cleanup() {
+cmd_prune_bridges() {
     check_deps
-    local mode="${1:---dead}"
+    local mode="--dead"
 
-    case "$mode" in
-        --all)
-            local sessions
-            sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${BRIDGE_PREFIX}" || true)"
-            if [[ -z "$sessions" ]]; then
-                echo "no bridges to clean up"
-                return
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) prune_bridges_usage; return 0 ;;
+            --dead) mode="--dead"; shift ;;
+            --all) mode="--all"; shift ;;
+            *) die "unknown flag: $1 (use --all or --dead)" ;;
+        esac
+    done
+
+    local sessions candidates removed=0
+    sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${BRIDGE_PREFIX}" || true)"
+    if [[ -z "$sessions" ]]; then
+        echo "no surrogate tmux bridges to prune"
+        return 0
+    fi
+
+    candidates=""
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        local zmx_name="${s#"$BRIDGE_PREFIX"}"
+        if [[ "$mode" == "--all" ]]; then
+            candidates+="$s"
+            candidates+=$'\n'
+        elif ! session_exists "$zmx_name"; then
+            candidates+="$s"
+            candidates+=$'\n'
+        fi
+    done <<< "$sessions"
+
+    if [[ -z "$candidates" ]]; then
+        echo "no surrogate tmux bridges to prune"
+        return 0
+    fi
+
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        local zmx_name="${s#"$BRIDGE_PREFIX"}"
+        if tmux kill-session -t "$s" 2>/dev/null; then
+            removed=$((removed + 1))
+            if [[ "$mode" == "--all" ]]; then
+                echo "removed surrogate tmux bridge: $s"
+            else
+                echo "removed surrogate tmux bridge: $s (zmx session '$zmx_name' was already gone)"
             fi
-            while IFS= read -r s; do
-                tmux kill-session -t "$s" 2>/dev/null && echo "killed $s" || true
-            done <<< "$sessions"
-            ;;
-        --dead|"")
-            local sessions
-            sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${BRIDGE_PREFIX}" || true)"
-            if [[ -z "$sessions" ]]; then
-                echo "no bridges to clean up"
-                return
-            fi
-            while IFS= read -r s; do
-                local zmx_name="${s#"$BRIDGE_PREFIX"}"
-                if ! session_exists "$zmx_name"; then
-                    tmux kill-session -t "$s" 2>/dev/null && echo "killed $s (zmx session gone)" || true
-                fi
-            done <<< "$sessions"
-            ;;
-        *)
-            die "unknown flag: $mode (use --all or --dead)"
-            ;;
-    esac
+        fi
+    done <<< "$candidates"
+
+    echo "removed ${removed} surrogate tmux bridge(s)"
+}
+
+cmd_cleanup() {
+    deprecated_command_warning "surrogate cleanup" "surrogate prune-bridges" "This command only removes surrogate tmux bridges, not zmx sessions."
+    cmd_prune_bridges "$@"
 }
 
 cmd_status() {
@@ -1869,6 +2695,7 @@ cmd_status() {
 case "${1}" in
     list)    shift; cmd_list "$@" ;;
     stale)   shift; cmd_stale "$@" ;;
+    sweep)   shift; cmd_sweep "$@" ;;
     send)    shift; cmd_send "$@" ;;
     submit)  shift; cmd_submit "$@" ;;
     type)    shift; cmd_type "$@" ;;
@@ -1877,13 +2704,16 @@ case "${1}" in
     find)    shift; cmd_find "$@" ;;
     who)     shift; cmd_who "$@" ;;
     active)  shift; cmd_active "$@" ;;
+    live)    shift; cmd_live "$@" ;;
     brief)   shift; cmd_brief "$@" ;;
     peek)    shift; cmd_peek "$@" ;;
     alias)   shift; cmd_alias "$@" ;;
     whoami)  shift; cmd_whoami "$@" ;;
     rename)  shift; cmd_rename "$@" ;;
+    prune-sessions) shift; cmd_prune_sessions "$@" ;;
     cull)    shift; cmd_cull "$@" ;;
     bridge)  shift; cmd_bridge "$@" ;;
+    prune-bridges) shift; cmd_prune_bridges "$@" ;;
     cleanup) shift; cmd_cleanup "$@" ;;
     status)  shift; cmd_status "$@" ;;
     help|-h|--help) shift || true; cmd_help "$@" ;;

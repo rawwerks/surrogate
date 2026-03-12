@@ -30,7 +30,7 @@ touch "$RESULTS_FILE" "$TIMING_FILE"
 SUITE_START="$(date +%s)"
 SECURITY_METRICS_OUTPUT=""
 CLEANUP_DONE=0
-TEST_SESSION_NAME_RE='^(test-surrogate|surr-dead-test|surr-cleanup-all-test|surr-rename-test|surr-prose-crlf-test|surr-prose-test|surr-coll-a|surr-coll-b|surr-stale-test|surr-cull-test|surr-cull-batch-test|surr-cull-keep-test)-[0-9]+$'
+TEST_SESSION_NAME_RE='^(test-surrogate|surr-dead-test|surr-prune-all-test|surr-rename-test|surr-prose-crlf-test|surr-prose-test|surr-coll-a|surr-coll-b|surr-stale-test|surr-prune-test|surr-prune-batch-test|surr-prune-keep-test|surr-sweep-preview-test)-[0-9]+$'
 
 # Export variables needed by subshell test runners
 export RESULTS_FILE TIMING_FILE SURROGATE SURROGATE_BRIEF TEST_SESSION TEST_TIMEOUT
@@ -105,18 +105,50 @@ wait_for_output() {
 }
 
 STALE_OUTPUT_CACHE=""
+MOCK_PROC_ROOT=""
+MOCK_LIVE_TMPBIN=""
+MOCK_LIVE_SIGNAL_SESSION=""
+MOCK_LIVE_LOW_SESSION=""
+MOCK_LIVE_DETACHED_SESSION=""
+MOCK_LIVE_ZMX_DIR=""
 
 stale_output_matches() {
   local session="$1"
   STALE_OUTPUT_CACHE=$("$SURROGATE" stale --older-than 0 --filter "$session" 2>&1)
   echo "$STALE_OUTPUT_CACHE" | grep -q "$session" &&
-    echo "$STALE_OUTPUT_CACHE" | grep -q 'stale session'
+    echo "$STALE_OUTPUT_CACHE" | grep -q 'Detached zmx sessions older than'
 }
 
 read_matches_pattern() {
   local session="$1"
   local pattern="$2"
   "$SURROGATE" read "$session" -n 100 2>/dev/null | grep -Eq -- "$pattern"
+}
+
+setup_mock_proc_ancestry() {
+  local session="$1"
+  MOCK_PROC_ROOT="$(mktemp -d)"
+  mkdir -p "$MOCK_PROC_ROOT/9001" "$MOCK_PROC_ROOT/9002" "$MOCK_PROC_ROOT/1"
+
+  cat > "$MOCK_PROC_ROOT/9001/stat" <<'EOF'
+9001 (bash) S 9002 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+EOF
+  cat > "$MOCK_PROC_ROOT/9002/stat" <<'EOF'
+9002 (zmx) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+EOF
+  cat > "$MOCK_PROC_ROOT/1/stat" <<'EOF'
+1 (init) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+EOF
+  : > "$MOCK_PROC_ROOT/9001/cmdline"
+  printf '/home/raw/.local/bin/zmx\0attach\0%s\0' "$session" > "$MOCK_PROC_ROOT/9002/cmdline"
+  : > "$MOCK_PROC_ROOT/1/cmdline"
+}
+
+cleanup_mock_proc_ancestry() {
+  if [[ -n "$MOCK_PROC_ROOT" && -d "$MOCK_PROC_ROOT" ]]; then
+    rm -rf "$MOCK_PROC_ROOT"
+  fi
+  MOCK_PROC_ROOT=""
 }
 
 wait_for_read_match() {
@@ -395,6 +427,8 @@ cleanup() {
   CLEANUP_DONE=1
   echo ""
   echo "--- cleanup ---"
+  cleanup_mock_proc_ancestry
+  cleanup_mock_live_env
   cleanup_test_artifacts current
   cleanup_test_artifacts stale
   rm -rf "$RESULTS_DIR" 2>/dev/null || true
@@ -443,7 +477,7 @@ echo ""
 # ---------------------------------------------------------------------------
 
 test_list() {
-  # plumb:req-43c3eed5
+  # plumb:req-ea60b72f
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -498,11 +532,10 @@ test_list_help() {
 }
 
 test_type_and_read() {
-  # plumb:req-77cf38f4
-  # plumb:req-29b6b22a
-  # plumb:req-f6a28ee7
-  # plumb:req-c210345d
-  # plumb:req-da49d759
+  # plumb:req-761b5eb7
+  # plumb:req-678df52f
+  # plumb:req-78d69489
+  # plumb:req-bff14746
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -524,7 +557,7 @@ test_type_and_read() {
 }
 
 test_send_enter_key() {
-  # plumb:req-2335dd45
+  # plumb:req-4aeebe62
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -546,6 +579,7 @@ test_send_enter_key() {
 }
 
 test_submit_enters_staged_prompt() {
+  # plumb:req-96375da1
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -568,8 +602,7 @@ test_submit_enters_staged_prompt() {
 }
 
 test_bridge_creation() {
-  # plumb:req-b6f97f4e
-  # plumb:req-5b4577ce
+  # plumb:req-ff999eb3
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -585,8 +618,7 @@ test_bridge_creation() {
 }
 
 test_bridge_reuse() {
-  # plumb:req-ae4fb35e
-  # plumb:req-19170671
+  # plumb:req-75e9957c
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -607,11 +639,9 @@ test_bridge_reuse() {
 }
 
 test_wait_success() {
-  # plumb:req-4c7c7e3b
-  # plumb:req-997f73d2
-  # plumb:req-c53cf3b7
-  # plumb:req-4ecc2ef6
-  # plumb:req-2c9db8fd
+  # plumb:req-d232c0a3
+  # plumb:req-f93dfc32
+  # plumb:req-666eabd2
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -627,7 +657,6 @@ test_wait_success() {
 }
 
 test_wait_timeout() {
-  # plumb:req-8f64803b
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -639,8 +668,7 @@ test_wait_timeout() {
 }
 
 test_read_line_limit() {
-  # plumb:req-52cee173
-  # plumb:req-201cbd97
+  # plumb:req-be4c8c7b
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -662,9 +690,7 @@ test_read_line_limit() {
 }
 
 test_dead_session_error() {
-  # plumb:req-fd5d8f2f
-  # plumb:req-0748d740
-  # plumb:req-f63f502d
+  # plumb:req-464d5382
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -677,10 +703,8 @@ test_dead_session_error() {
   fi
 }
 
-test_cleanup_dead() {
-  # plumb:req-23993d75
-  # plumb:req-3bb77a03
-  # plumb:req-129f015a
+test_prune_bridges_dead() {
+  # plumb:req-dba88c95
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -698,7 +722,7 @@ test_cleanup_dead() {
   zmx kill "$tmp_session" 2>/dev/null || true
   wait "$tmp_pid" 2>/dev/null || true
 
-  "$SURROGATE" cleanup --dead
+  "$SURROGATE" prune-bridges --dead
 
   local remaining
   remaining=$(tmux list-sessions 2>/dev/null | grep "_surr_.*${tmp_session}" || true)
@@ -707,18 +731,17 @@ test_cleanup_dead() {
     pass "${FUNCNAME[0]}"
   else
     echo "    dead bridge still exists: $remaining"
-    fail "${FUNCNAME[0]} — cleanup --dead did not remove dead bridge"
+    fail "${FUNCNAME[0]} — prune-bridges --dead did not remove dead bridge"
   fi
 }
 
-test_cleanup_all() {
-  # plumb:req-231e031f
-  # plumb:req-be66a1c3
+test_prune_bridges_all() {
+  # plumb:req-ce7d6083
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
   # Create an isolated session+bridge just for this test
-  local iso_session="surr-cleanup-all-test-$$"
+  local iso_session="surr-prune-all-test-$$"
   zmx run "$iso_session" bash &
   local iso_pid=$!
   wait_until 5 zmx_session_exists "$iso_session" || {
@@ -738,11 +761,11 @@ test_cleanup_all() {
     return
   fi
 
-  "$SURROGATE" cleanup --all
+  "$SURROGATE" prune-bridges --all
 
   # Verify the bridge was removed
   if tmux has-session -t "$bridge" 2>/dev/null; then
-    fail "${FUNCNAME[0]} — cleanup --all did not remove bridge"
+    fail "${FUNCNAME[0]} — prune-bridges --all did not remove bridge"
   else
     pass "${FUNCNAME[0]}"
   fi
@@ -797,6 +820,8 @@ test_cleanup_reaps_stale_test_artifacts() {
 }
 
 test_stale_lists_detached_sessions() {
+  # plumb:req-efc0a173
+  # plumb:req-a7bef694
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -813,7 +838,7 @@ test_stale_lists_detached_sessions() {
   wait_for_output "$stale_session" "$stale_marker" 5 || true
 
   local output
-  if wait_until 5 stale_output_matches "$stale_session"; then
+  if wait_until 20 stale_output_matches "$stale_session"; then
     output="$STALE_OUTPUT_CACHE"
   else
     output="$STALE_OUTPUT_CACHE"
@@ -822,70 +847,110 @@ test_stale_lists_detached_sessions() {
   zmx kill "$stale_session" 2>/dev/null || true
   wait "$stale_pid" 2>/dev/null || true
 
-  if echo "$output" | grep -q "$stale_session" && echo "$output" | grep -q 'stale session'; then
+  if echo "$output" | grep -q "$stale_session" && echo "$output" | grep -q 'Detached zmx sessions older than'; then
     pass "${FUNCNAME[0]}"
   else
     fail "${FUNCNAME[0]} — stale output did not include the detached session: $output"
   fi
 }
 
-test_cull_explicit_session() {
+test_prune_sessions_explicit_session() {
+  # plumb:req-dabb0aad
+  # plumb:req-a2cbbeb8
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local cull_session="surr-cull-test-$$"
-  local cull_alias="cull-alias-$$"
-  local cull_marker="CULL_EXPLICIT_$$"
-  local bridge="_surr_${cull_session}"
-  local lock_file="/tmp/surrogate-${cull_session}.lock"
-  local watermark_file="/tmp/surrogate-${cull_session}.watermark"
-  zmx run "$cull_session" bash &
-  local cull_pid=$!
-  wait_until 5 zmx_session_exists "$cull_session" || {
-    fail "${FUNCNAME[0]} — failed to create explicit cull fixture"
+  local prune_session_name="surr-prune-test-$$"
+  local prune_alias="prune-alias-$$"
+  local prune_marker="PRUNE_EXPLICIT_$$"
+  local bridge="_surr_${prune_session_name}"
+  local lock_file="/tmp/surrogate-${prune_session_name}.lock"
+  local watermark_file="/tmp/surrogate-${prune_session_name}.watermark"
+  zmx run "$prune_session_name" bash &
+  local prune_pid=$!
+  wait_until 5 zmx_session_exists "$prune_session_name" || {
+    fail "${FUNCNAME[0]} — failed to create explicit prune fixture"
     return
   }
 
-  "$SURROGATE" type "$cull_session" "echo $cull_marker"
-  wait_for_output "$cull_session" "$cull_marker" 5 || true
-  "$SURROGATE" rename "$cull_session" "$cull_alias" >/dev/null
+  "$SURROGATE" type "$prune_session_name" "echo $prune_marker"
+  wait_for_output "$prune_session_name" "$prune_marker" 5 || true
+  "$SURROGATE" rename "$prune_session_name" "$prune_alias" >/dev/null
 
   local output
-  output=$("$SURROGATE" cull "$cull_alias" 2>&1)
-  wait "$cull_pid" 2>/dev/null || true
+  output=$("$SURROGATE" prune-sessions "$prune_alias" 2>&1)
+  wait "$prune_pid" 2>/dev/null || true
 
-  if echo "$output" | grep -q "culled: .*${cull_session}" &&
-     wait_until 5 zmx_session_absent "$cull_session" &&
+  if echo "$output" | grep -q "deleted zmx session: .*${prune_session_name}" &&
+     wait_until 5 zmx_session_absent "$prune_session_name" &&
      wait_until 5 tmux_session_absent "$bridge" &&
      [[ ! -e "$lock_file" ]] &&
      [[ ! -e "$watermark_file" ]] &&
-     ! grep -q "^${cull_session}=" /tmp/surrogate-aliases 2>/dev/null; then
+     ! grep -q "^${prune_session_name}=" /tmp/surrogate-aliases 2>/dev/null; then
     pass "${FUNCNAME[0]}"
   else
-    fail "${FUNCNAME[0]} — explicit cull did not remove session plumbing cleanly: $output"
+    fail "${FUNCNAME[0]} — explicit prune did not remove session plumbing cleanly: $output"
   fi
 }
 
-test_cull_stale_batch_filtered() {
+test_sweep_preview_default() {
+  # plumb:req-d1cb00b9
+  # plumb:req-42ee37a8
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local target_session="surr-cull-batch-test-$$"
-  local keep_session="surr-cull-keep-test-$$"
+  local preview_session="surr-sweep-preview-test-$$"
+  zmx run "$preview_session" bash &
+  local preview_pid=$!
+  wait_until 5 zmx_session_exists "$preview_session" || {
+    fail "${FUNCNAME[0]} — failed to create sweep preview target"
+    return
+  }
+
+  if ! wait_until 20 stale_output_matches "$preview_session"; then
+    zmx kill "$preview_session" 2>/dev/null || true
+    wait "$preview_pid" 2>/dev/null || true
+    fail "${FUNCNAME[0]} — preview session never appeared in stale output: $STALE_OUTPUT_CACHE"
+    return
+  fi
+
+  local output
+  output=$("$SURROGATE" sweep --older-than 0 --filter "$preview_session" 2>&1)
+
+  if echo "$output" | grep -q 'Would delete these zmx sessions:' &&
+     echo "$output" | grep -q 'Preview only\. Re-run with --yes' &&
+     zmx_session_exists "$preview_session"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — sweep did not preview by default: $output"
+  fi
+
+  zmx kill "$preview_session" 2>/dev/null || true
+  wait "$preview_pid" 2>/dev/null || true
+}
+
+test_prune_sessions_stale_batch_filtered_yes() {
+  # plumb:req-8e5dbf45
+  # plumb:req-abd88dc5
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local target_session="surr-prune-batch-test-$$"
+  local keep_session="surr-prune-keep-test-$$"
   zmx run "$target_session" bash &
   local target_pid=$!
   zmx run "$keep_session" bash &
   local keep_pid=$!
   wait_until 5 zmx_session_exists "$target_session" || {
-    fail "${FUNCNAME[0]} — failed to create batch cull target"
+    fail "${FUNCNAME[0]} — failed to create batch prune target"
     return
   }
   wait_until 5 zmx_session_exists "$keep_session" || {
-    fail "${FUNCNAME[0]} — failed to create batch cull survivor"
+    fail "${FUNCNAME[0]} — failed to create batch prune survivor"
     return
   }
 
-  if ! wait_until 5 stale_output_matches "$target_session"; then
+  if ! wait_until 20 stale_output_matches "$target_session"; then
     wait "$target_pid" 2>/dev/null || true
     zmx kill "$keep_session" 2>/dev/null || true
     wait "$keep_pid" 2>/dev/null || true
@@ -894,25 +959,55 @@ test_cull_stale_batch_filtered() {
   fi
 
   local output
-  output=$("$SURROGATE" cull --stale --older-than 0 --filter "$target_session" 2>&1)
+  output=$("$SURROGATE" prune-sessions --stale --older-than 0 --filter "$target_session" --yes 2>&1)
   wait "$target_pid" 2>/dev/null || true
 
-  if echo "$output" | grep -q "$target_session" &&
+  if echo "$output" | grep -q 'Deleting these zmx sessions:' &&
+     echo "$output" | grep -q "$target_session" &&
      wait_until 5 zmx_session_absent "$target_session" &&
      zmx_session_exists "$keep_session"; then
     pass "${FUNCNAME[0]}"
   else
-    fail "${FUNCNAME[0]} — batch stale cull did not target only the filtered session: $output"
+    fail "${FUNCNAME[0]} — batch stale prune did not target only the filtered session: $output"
   fi
 
   zmx kill "$keep_session" 2>/dev/null || true
   wait "$keep_pid" 2>/dev/null || true
 }
 
+test_cull_deprecated_alias_warns() {
+  # plumb:req-b40817a3
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" cull --help 2>&1 || true)
+
+  if echo "$output" | grep -q 'deprecated' &&
+     echo "$output" | grep -q 'surrogate prune-sessions'; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — cull alias did not warn clearly: $output"
+  fi
+}
+
+test_cleanup_deprecated_alias_warns() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  output=$("$SURROGATE" cleanup --help 2>&1 || true)
+
+  if echo "$output" | grep -q 'deprecated' &&
+     echo "$output" | grep -q 'surrogate prune-bridges'; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — cleanup alias did not warn clearly: $output"
+  fi
+}
+
 test_status() {
-  # plumb:req-3a11209c
-  # plumb:req-a727036c
-  # plumb:req-04b8212d
+  # plumb:req-b49f0f0a
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -929,9 +1024,7 @@ test_status() {
 }
 
 test_concurrent_serialization() {
-  # plumb:req-271825d3
-  # plumb:req-29465905
-  # plumb:req-934a7095
+  # plumb:req-fcfa572b
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -972,9 +1065,7 @@ test_concurrent_serialization() {
 # ---------------------------------------------------------------------------
 
 test_invariant_snippet_always_prints_message() {
-  # plumb:req-ca2be6e0
-  # plumb:req-d1726bef
-  # plumb:req-a64328f9
+  # plumb:req-f50fe267
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1001,7 +1092,7 @@ test_invariant_snippet_always_prints_message() {
 }
 
 test_invariant_snippet_all_shells() {
-  # plumb:req-5523d6ad
+  # plumb:req-60a4e4a8
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1038,6 +1129,7 @@ test_invariant_snippet_all_shells() {
 }
 
 test_invariant_inherited_status_shows_alias() {
+  # plumb:req-e4c7e35c
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1063,7 +1155,7 @@ test_invariant_inherited_status_shows_alias() {
 }
 
 test_invariant_no_terminal_specific_code() {
-  # plumb:req-eb9fb624
+  # plumb:req-4cbaecf8
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1087,7 +1179,6 @@ test_invariant_no_terminal_specific_code() {
 }
 
 test_invariant_surrogate_cli_terminal_agnostic() {
-  # plumb:req-bef8d006
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1104,6 +1195,7 @@ test_invariant_surrogate_cli_terminal_agnostic() {
 }
 
 test_invariant_surrogate_full_path_for_alias_lookup() {
+  # plumb:req-787926e7
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1134,7 +1226,7 @@ test_invariant_surrogate_full_path_for_alias_lookup() {
 }
 
 test_invariant_zmx_full_path() {
-  # plumb:req-5ad4c151
+  # plumb:req-d3b078df
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1154,7 +1246,7 @@ test_invariant_zmx_full_path() {
 }
 
 test_invariant_parent_check_not_env_var() {
-  # plumb:req-51b97d09
+  # plumb:req-a0e77c74
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1180,7 +1272,7 @@ test_invariant_parent_check_not_env_var() {
 }
 
 test_invariant_unsets_zmx_session_before_attach() {
-  # plumb:req-d2c194b8
+  # plumb:req-057ce4cf
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1406,14 +1498,14 @@ EOF
   fi
 }
 
-test_brief_uses_active_json_selection() {
+test_brief_uses_live_json_selection() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  if grep -q 'selector_args=("active" "--json")' "$SURROGATE"; then
-    pass "${FUNCNAME[0]} — brief reuses active --json selection"
+  if grep -q 'selector_args=("live" "--json")' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — brief reuses live --json selection"
   else
-    fail "${FUNCNAME[0]} — brief does not reuse active selection path"
+    fail "${FUNCNAME[0]} — brief does not reuse live selection path"
   fi
 }
 
@@ -1437,20 +1529,21 @@ run_section core smoke \
   test_wait_timeout \
   test_read_line_limit \
   test_dead_session_error \
-  test_cleanup_dead \
-  test_cleanup_all \
+  test_prune_bridges_dead \
+  test_prune_bridges_all \
   test_cleanup_reaps_stale_test_artifacts \
   test_stale_lists_detached_sessions \
-  test_cull_explicit_session \
-  test_cull_stale_batch_filtered \
+  test_prune_sessions_explicit_session \
+  test_sweep_preview_default \
+  test_prune_sessions_stale_batch_filtered_yes \
+  test_cull_deprecated_alias_warns \
+  test_cleanup_deprecated_alias_warns \
   test_status \
   test_concurrent_serialization
 
 test_find() {
-  # plumb:req-c789f866
-  # plumb:req-24a68c42
-  # plumb:req-720a5bc2
-  # plumb:req-cfd97f85
+  # plumb:req-762ccafb
+  # plumb:req-7cd0c015
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1471,7 +1564,7 @@ test_find() {
 }
 
 test_find_empty_query() {
-  # plumb:req-4b5c0133
+  # plumb:req-41842e4d
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1483,7 +1576,6 @@ test_find_empty_query() {
 }
 
 test_find_no_match() {
-  # plumb:req-16dd55a0
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1500,8 +1592,6 @@ test_find_no_match() {
 }
 
 test_find_with_context() {
-  # plumb:req-095a3f96
-  # plumb:req-c38efd2f
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1564,6 +1654,64 @@ EOF
 cleanup_mock_who_env() {
   rm -f "$MOCK_WHO_ZMX_DIR/$MOCK_WHO_OLD_SESSION" "$MOCK_WHO_ZMX_DIR/$MOCK_WHO_NEW_SESSION" 2>/dev/null || true
   rm -rf "$MOCK_WHO_TMPBIN" 2>/dev/null || true
+}
+
+setup_mock_live_env() {
+  MOCK_LIVE_TMPBIN="$(mktemp -d)"
+  MOCK_LIVE_SIGNAL_SESSION="mock-live-signal-$$"
+  MOCK_LIVE_LOW_SESSION="mock-live-low-$$"
+  MOCK_LIVE_DETACHED_SESSION="mock-live-detached-$$"
+  MOCK_LIVE_ZMX_DIR="/run/user/$(id -u)/zmx"
+
+  mkdir -p "$MOCK_LIVE_ZMX_DIR"
+  : > "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_SIGNAL_SESSION"
+  : > "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_LOW_SESSION"
+  : > "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_DETACHED_SESSION"
+  touch -d '20 seconds ago' "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_SIGNAL_SESSION"
+  touch -d '10 seconds ago' "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_LOW_SESSION"
+  touch -d '30 seconds ago' "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_DETACHED_SESSION"
+
+  cat > "$MOCK_LIVE_TMPBIN/zmx" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  list)
+    printf 'session_name=%s\tclients=1\n' "$MOCK_LIVE_SIGNAL_SESSION"
+    printf 'session_name=%s\tclients=1\n' "$MOCK_LIVE_LOW_SESSION"
+    printf 'session_name=%s\tclients=0\n' "$MOCK_LIVE_DETACHED_SESSION"
+    ;;
+  history)
+    case "\${2:-}" in
+      "$MOCK_LIVE_SIGNAL_SESSION")
+        printf '› review surrogate live\n• focused lane\ngpt-5.4 medium · 60%% left · /home/raw/Documents/GitHub/surrogate\n'
+        ;;
+      "$MOCK_LIVE_LOW_SESSION")
+        printf 'raw@host surrogate main ❯\n'
+        ;;
+      "$MOCK_LIVE_DETACHED_SESSION")
+        printf 'raw@host /tmp/mock-detached \$\n'
+        ;;
+    esac
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$MOCK_LIVE_TMPBIN/zmx"
+
+  ln -sf "$(command -v tmux)" "$MOCK_LIVE_TMPBIN/tmux"
+}
+
+cleanup_mock_live_env() {
+  if [[ -n "$MOCK_LIVE_ZMX_DIR" ]]; then
+    rm -f "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_SIGNAL_SESSION" "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_LOW_SESSION" "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_DETACHED_SESSION" 2>/dev/null || true
+  fi
+  rm -rf "$MOCK_LIVE_TMPBIN" 2>/dev/null || true
+  MOCK_LIVE_TMPBIN=""
+  MOCK_LIVE_SIGNAL_SESSION=""
+  MOCK_LIVE_LOW_SESSION=""
+  MOCK_LIVE_DETACHED_SESSION=""
 }
 
 setup_mock_type_env() {
@@ -1631,9 +1779,8 @@ cleanup_mock_type_env() {
 }
 
 test_who() {
-  # plumb:req-851ca449
-  # plumb:req-251007fd
-  # plumb:req-6a20e804
+  # plumb:req-4703b605
+  # plumb:req-d4d66352
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1710,6 +1857,7 @@ test_list_json_output() {
 }
 
 test_who_recent_first() {
+  # plumb:req-250cef7c
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1729,6 +1877,7 @@ test_who_recent_first() {
 }
 
 test_who_recent_duration_filter() {
+  # plumb:req-5617b9d9
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1748,6 +1897,7 @@ test_who_recent_duration_filter() {
 }
 
 test_who_project_filter() {
+  # plumb:req-dab33ed7
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1767,6 +1917,7 @@ test_who_project_filter() {
 }
 
 test_who_cwd_filter() {
+  # plumb:req-072ebd56
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1809,9 +1960,6 @@ test_who_json_output() {
 }
 
 test_who_n_zero() {
-  # plumb:req-40defb6c
-  # plumb:req-4e55b856
-  # plumb:req-0e241e62
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1827,29 +1975,105 @@ test_who_n_zero() {
 }
 
 test_active() {
-  # plumb:req-82e691b5
-  # plumb:req-295cf791
-  # plumb:req-55b5dea2
+  # plumb:req-c4befce9
+  # plumb:req-adff47fa
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local output
-  output=$("$SURROGATE" active --all 2>&1)
+  local output signal_session detached_session
+  setup_mock_live_env
+  signal_session="$MOCK_LIVE_SIGNAL_SESSION"
+  detached_session="$MOCK_LIVE_DETACHED_SESSION"
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" active --all --recent 10 2>&1)
+  cleanup_mock_live_env
 
-  if echo "$output" | grep -q "$TEST_SESSION"; then
+  if echo "$output" | grep -q "$signal_session" &&
+     echo "$output" | grep -q "$detached_session"; then
     pass "${FUNCNAME[0]}"
   else
-    echo "    expected test session in active output:"
+    echo "    expected mock attached + detached sessions in active output:"
     echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — test session not in active --all output"
+    fail "${FUNCNAME[0]} — active --all output missing expected mock sessions"
+  fi
+}
+
+test_live_focuses_high_signal_sessions() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output signal_session low_session
+  setup_mock_live_env
+  signal_session="$MOCK_LIVE_SIGNAL_SESSION"
+  low_session="$MOCK_LIVE_LOW_SESSION"
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" live --recent 10 2>&1)
+  cleanup_mock_live_env
+
+  if echo "$output" | grep -q "$signal_session" &&
+     ! echo "$output" | grep -q "$low_session" &&
+     echo "$output" | grep -q 'low-signal live session(s) hidden'; then
+    pass "${FUNCNAME[0]} — live defaults to high-signal messageable sessions"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — live did not focus the high-signal session"
+  fi
+}
+
+test_live_all_includes_low_signal_sessions() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output signal_session low_session
+  setup_mock_live_env
+  signal_session="$MOCK_LIVE_SIGNAL_SESSION"
+  low_session="$MOCK_LIVE_LOW_SESSION"
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" live --all --recent 10 2>&1)
+  cleanup_mock_live_env
+
+  if echo "$output" | grep -q "$signal_session" &&
+     echo "$output" | grep -q "$low_session" &&
+     ! echo "$output" | grep -q 'low-signal live session(s) hidden'; then
+    pass "${FUNCNAME[0]} — live --all includes low-signal live sessions"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — live --all did not include the low-signal session"
+  fi
+}
+
+test_live_json_reports_hidden_low_signal_sessions() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output signal_session
+  setup_mock_live_env
+  signal_session="$MOCK_LIVE_SIGNAL_SESSION"
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" live --json --recent 10 2>&1)
+  cleanup_mock_live_env
+
+  if printf '%s' "$output" | python3 -c '
+import json, sys
+obj = json.loads(sys.stdin.read())
+assert obj["count"] == 1
+assert obj["total_live_count"] == 2
+assert obj["high_signal_only"] is True
+assert obj["hidden_low_signal_count"] == 1
+assert len(obj["sessions"]) == 1
+assert obj["sessions"][0]["session"] == sys.argv[1]
+' "$signal_session"
+  then
+    pass "${FUNCNAME[0]} — live --json reports focused vs hidden sessions"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — live --json did not report hidden low-signal sessions correctly"
   fi
 }
 
 test_peek() {
-  # plumb:req-47c3463d
-  # plumb:req-4ef11b15
-  # plumb:req-a02e09c7
-  # plumb:req-7fcde33b
+  # plumb:req-c3690014
+  # plumb:req-59b42e29
+  # plumb:req-292f6a20
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1870,7 +2094,6 @@ test_peek() {
 }
 
 test_peek_no_filter_match() {
-  # plumb:req-53a2ec07
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1885,10 +2108,8 @@ test_peek_no_filter_match() {
 }
 
 test_rename() {
-  # plumb:req-5ee05e33
-  # plumb:req-62eb9d36
-  # plumb:req-a6498a94
-  # plumb:req-56aebe04
+  # plumb:req-34ca43ad
+  # plumb:req-799fccd6
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1920,7 +2141,7 @@ test_rename() {
 }
 
 test_rename_nonexistent() {
-  # plumb:req-db99d33a
+  # plumb:req-a5263a36
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1932,7 +2153,7 @@ test_rename_nonexistent() {
 }
 
 test_rename_collision() {
-  # plumb:req-9b0bac5e
+  # plumb:req-4526f067
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -1959,9 +2180,8 @@ test_rename_collision() {
 }
 
 test_require_int() {
-  # plumb:req-45a5c9ee
-  # plumb:req-41dfdd81
-  # plumb:req-73e7db09
+  # plumb:req-ee67fedf
+  # plumb:req-edf94cc1
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2001,6 +2221,8 @@ test_require_int() {
 }
 
 test_alias_resolve() {
+  # plumb:req-04237721
+  # plumb:req-d3426579
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2108,6 +2330,7 @@ test_label_verbose() {
 }
 
 test_type_shell_context_suppresses_label() {
+  # plumb:req-a5dd873c
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2131,8 +2354,7 @@ test_type_shell_context_suppresses_label() {
 # --- Tier 1: Alias system tests ---
 
 test_alias_deterministic() {
-  # plumb:req-e4bd038e
-  # plumb:req-09dd2024
+  # plumb:req-787f5f31
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2154,7 +2376,7 @@ test_alias_deterministic() {
 }
 
 test_alias_100_adjectives_100_nouns() {
-  # plumb:req-203451d6
+  # plumb:req-8d0a2c7f
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2175,7 +2397,7 @@ test_alias_100_adjectives_100_nouns() {
 }
 
 test_alias_collision_suffix() {
-  # plumb:req-469c2891
+  # plumb:req-6d897079
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2188,7 +2410,7 @@ test_alias_collision_suffix() {
 }
 
 test_alias_cache_built_once() {
-  # plumb:req-5b263329
+  # plumb:req-10215184
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2201,7 +2423,7 @@ test_alias_cache_built_once() {
 }
 
 test_list_shows_aliases() {
-  # plumb:req-c6b4fd93
+  # plumb:req-0d23a1bb
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2217,7 +2439,7 @@ test_list_shows_aliases() {
 }
 
 test_who_shows_aliases() {
-  # plumb:req-c105da89
+  # plumb:req-514ca399
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2233,8 +2455,8 @@ test_who_shows_aliases() {
 }
 
 test_session_resolution_by_alias() {
-  # plumb:req-6ecead1d
-  # plumb:req-73d7fb25
+  # plumb:req-e5cc14aa
+  # plumb:req-f7d615cd
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2266,8 +2488,8 @@ test_session_resolution_by_alias() {
 }
 
 test_whoami() {
-  # plumb:req-2936c105
-  # plumb:req-1a7505f2
+  # plumb:req-48ee0fb4
+  # plumb:req-c117273e
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2287,6 +2509,7 @@ test_whoami() {
 }
 
 test_whoami_help() {
+  # plumb:req-64333413
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2297,6 +2520,54 @@ test_whoami_help() {
     pass "${FUNCNAME[0]} — whoami help works"
   else
     fail "${FUNCNAME[0]} — whoami --help did not show help: $output"
+  fi
+}
+
+test_whoami_falls_back_to_live_ancestry_session() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local alias_name output
+  alias_name="$("$SURROGATE" alias "$TEST_SESSION")"
+  setup_mock_proc_ancestry "$TEST_SESSION"
+  output=$(
+    ZMX_SESSION="stale-session-$$" \
+    SURROGATE_PROC_ROOT="$MOCK_PROC_ROOT" \
+    SURROGATE_SELF_PID=9001 \
+    "$SURROGATE" whoami 2>&1
+  )
+  cleanup_mock_proc_ancestry
+
+  if echo "$output" | grep -q "$alias_name" &&
+     echo "$output" | grep -q "$TEST_SESSION" &&
+     ! echo "$output" | grep -q 'ancestry-only'; then
+    pass "${FUNCNAME[0]} — whoami recovers live session identity from zmx attach ancestry"
+  else
+    fail "${FUNCNAME[0]} — whoami did not recover live ancestry session: $output"
+  fi
+}
+
+test_whoami_reports_ancestry_only_session() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local ghost_session output
+  ghost_session="ghost-session-$$"
+  setup_mock_proc_ancestry "$ghost_session"
+  output=$(
+    ZMX_SESSION="stale-session-$$" \
+    SURROGATE_PROC_ROOT="$MOCK_PROC_ROOT" \
+    SURROGATE_SELF_PID=9001 \
+    "$SURROGATE" whoami 2>&1
+  )
+  cleanup_mock_proc_ancestry
+
+  if echo "$output" | grep -q "$ghost_session" &&
+     echo "$output" | grep -q 'ancestry-only' &&
+     echo "$output" | grep -q 'not messageable via surrogate'; then
+    pass "${FUNCNAME[0]} — whoami reports ancestry-only sessions explicitly"
+  else
+    fail "${FUNCNAME[0]} — whoami did not explain ancestry-only session: $output"
   fi
 }
 
@@ -2315,6 +2586,7 @@ test_whoami_rejects_extra_args() {
 }
 
 test_whoami_rejects_stale_env_session() {
+  # plumb:req-f7eb14cd
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2329,19 +2601,29 @@ test_whoami_rejects_stale_env_session() {
 }
 
 test_whoami_no_session() {
-  # plumb:req-2a55b048
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # whoami without ZMX_SESSION should fail
-  if ZMX_SESSION="" "$SURROGATE" whoami 2>/dev/null; then
-    fail "${FUNCNAME[0]} — whoami should fail without ZMX_SESSION"
+  local empty_proc output
+  empty_proc="$(mktemp -d)"
+  output=$(
+    ZMX_SESSION="" \
+    SURROGATE_PROC_ROOT="$empty_proc" \
+    SURROGATE_SELF_PID=9001 \
+    "$SURROGATE" whoami 2>&1 || true
+  )
+  rm -rf "$empty_proc"
+
+  if echo "$output" | grep -q 'not inside a zmx session'; then
+    pass "${FUNCNAME[0]} — whoami fails when neither env nor ancestry identifies a session"
   else
-    pass "${FUNCNAME[0]}"
+    fail "${FUNCNAME[0]} — whoami should fail when env and ancestry are both absent: $output"
   fi
 }
 
 test_type_rejects_self_target() {
+  # plumb:req-dbb5124e
+  # plumb:req-e72e700e
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2392,27 +2674,26 @@ test_submit_rejects_self_target() {
   fi
 }
 
-test_cull_rejects_current_live_session() {
+test_prune_sessions_rejects_current_live_session() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
   local alias_name output
   alias_name="$("$SURROGATE" alias "$TEST_SESSION")"
-  output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" cull "$TEST_SESSION" 2>&1 || true)
+  output=$(ZMX_SESSION="$TEST_SESSION" "$SURROGATE" prune-sessions "$TEST_SESSION" 2>&1 || true)
 
-  if echo "$output" | grep -q 'refusing to cull your own live session' &&
+  if echo "$output" | grep -q 'refusing to prune your own live zmx session' &&
      echo "$output" | grep -q "$alias_name" &&
      echo "$output" | grep -q "$TEST_SESSION"; then
-    pass "${FUNCNAME[0]} — self-target cull is blocked with identity context"
+    pass "${FUNCNAME[0]} — self-target prune is blocked with identity context"
   else
-    fail "${FUNCNAME[0]} — self-target cull was not explained clearly: $output"
+    fail "${FUNCNAME[0]} — self-target prune was not explained clearly: $output"
   fi
 }
 
 # --- Tier 2: Behavioral defaults and output format ---
 
 test_find_case_insensitive() {
-  # plumb:req-ca7ba157
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2432,9 +2713,8 @@ test_find_case_insensitive() {
 }
 
 test_find_grouped_output() {
-  # plumb:req-513d8424
-  # plumb:req-878cc413
-  # plumb:req-91c774fc
+  # plumb:req-738560c1
+  # plumb:req-cf1c97eb
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2467,8 +2747,8 @@ test_find_grouped_output() {
 }
 
 test_find_uses_rg_or_grep() {
-  # plumb:req-42415f9e
-  # plumb:req-28f6367a
+  # plumb:req-32f84b16
+  # plumb:req-f253db1e
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2481,10 +2761,6 @@ test_find_uses_rg_or_grep() {
 }
 
 test_who_age_and_attached() {
-  # plumb:req-4e7347ab
-  # plumb:req-57c416d3
-  # plumb:req-3fc6368a
-  # plumb:req-7e11908c
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2515,59 +2791,69 @@ test_who_age_and_attached() {
 }
 
 test_who_attached_marker() {
-  # plumb:req-76f76d80
-  # plumb:req-81d8a964
+  # plumb:req-a12fb059
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # The who command marks attached sessions with *
-  if grep -q 'attached="\\*"' "$SURROGATE" || grep -q "attached='\\*'" "$SURROGATE" || grep -q 'attached="\*"' "$SURROGATE"; then
-    pass "${FUNCNAME[0]} — attached marker * exists in code"
+  local output
+  setup_mock_who_env
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -qE '[0-9]+[smhd]\*'; then
+    pass "${FUNCNAME[0]} — who marks attached sessions with *"
   else
-    fail "${FUNCNAME[0]} — no attached marker code found"
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — who did not mark attached sessions with *"
   fi
 }
 
 test_active_default_attached_only() {
-  # plumb:req-e3427c24
-  # plumb:req-82e691b5
+  # plumb:req-f1d6584a
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # Default active (no --all) should only show sessions with clients > 0
-  # Our test session has no client attached, so it should NOT appear
-  local output
-  output=$("$SURROGATE" active 2>&1)
+  local output signal_session detached_session
+  setup_mock_live_env
+  signal_session="$MOCK_LIVE_SIGNAL_SESSION"
+  detached_session="$MOCK_LIVE_DETACHED_SESSION"
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" active --recent 10 2>&1)
+  cleanup_mock_live_env
 
-  # The test session is detached (zmx run ... &), so should not appear in default
-  # But active sessions from the user's real zmx sessions might appear
-  # Verify the command runs and produces structured output
-  if echo "$output" | grep -q 'active session'; then
-    pass "${FUNCNAME[0]} — active default mode works"
+  if echo "$output" | grep -q "$signal_session" &&
+     ! echo "$output" | grep -q "$detached_session"; then
+    pass "${FUNCNAME[0]} — active default hides detached sessions"
   else
-    fail "${FUNCNAME[0]} — active default mode failed"
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — active default did not restrict output to attached sessions"
   fi
 }
 
 test_active_all_includes_detached() {
-  # plumb:req-295cf791
-  # plumb:req-55b5dea2
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # --all should include detached sessions with non-empty history
-  local output
-  output=$("$SURROGATE" active --all 2>&1)
+  local output signal_session detached_session
+  setup_mock_live_env
+  signal_session="$MOCK_LIVE_SIGNAL_SESSION"
+  detached_session="$MOCK_LIVE_DETACHED_SESSION"
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" active --all --recent 10 2>&1)
+  cleanup_mock_live_env
 
-  if echo "$output" | grep -q "$TEST_SESSION"; then
-    pass "${FUNCNAME[0]} — active --all includes test session"
+  if echo "$output" | grep -q "$signal_session" &&
+     echo "$output" | grep -q "$detached_session"; then
+    pass "${FUNCNAME[0]} — active --all includes detached sessions with history"
   else
-    fail "${FUNCNAME[0]} — active --all should include detached test session"
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — active --all did not include the detached session"
   fi
 }
 
 test_peek_count_at_end() {
-  # plumb:req-a02e09c7
+  # plumb:req-4eb4a35d
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2582,7 +2868,6 @@ test_peek_count_at_end() {
 }
 
 test_read_default_20_lines() {
-  # plumb:req-52cee173
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2595,7 +2880,6 @@ test_read_default_20_lines() {
 }
 
 test_wait_default_30s() {
-  # plumb:req-4c7c7e3b
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2607,7 +2891,6 @@ test_wait_default_30s() {
 }
 
 test_find_default_200_lines_1_context() {
-  # plumb:req-c789f866
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2624,7 +2907,6 @@ test_find_default_200_lines_1_context() {
 }
 
 test_who_default_10_lines() {
-  # plumb:req-851ca449
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2637,7 +2919,6 @@ test_who_default_10_lines() {
 }
 
 test_peek_default_5_lines() {
-  # plumb:req-47c3463d
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2651,7 +2932,7 @@ test_peek_default_5_lines() {
 # --- Tier 3: Bridge, error handling, design invariants ---
 
 test_bridge_naming_convention() {
-  # plumb:req-b6f97f4e
+  # plumb:req-1dc8eb9f
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2668,8 +2949,7 @@ test_bridge_naming_convention() {
 }
 
 test_bridge_stale_recreate() {
-  # plumb:req-293ecfc6
-  # plumb:req-19170671
+  # plumb:req-ddbe1439
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2682,8 +2962,7 @@ test_bridge_stale_recreate() {
 }
 
 test_error_prefix() {
-  # plumb:req-d0b587e5
-  # plumb:req-fd5d8f2f
+  # plumb:req-d71a201b
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2699,7 +2978,6 @@ test_error_prefix() {
 }
 
 test_error_missing_session() {
-  # plumb:req-0748d740
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2725,6 +3003,7 @@ test_security_model_section_exists() {
 }
 
 test_type_normalizes_multiline_prose() {
+  # plumb:req-94bb96c4
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2795,6 +3074,7 @@ test_type_normalizes_tabs_and_crlf() {
 }
 
 test_send_rejects_dangerous_control_keys() {
+  # plumb:req-a760e8f3
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2809,6 +3089,7 @@ test_send_rejects_dangerous_control_keys() {
 }
 
 test_dcg_blocks_type_when_available() {
+  # plumb:req-1ad6bc8d
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2862,6 +3143,9 @@ EOF
 }
 
 test_audit_logs_allowed_type() {
+  # plumb:req-7b30e09c
+  # plumb:req-931163ed
+  # plumb:req-33a8e1eb
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -2952,6 +3236,8 @@ test_audit_logs_blocked_send() {
 }
 
 test_type_waits_before_enter_for_tui_like_targets() {
+  # plumb:req-2541839a
+  # plumb:req-188c833f
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3177,19 +3463,25 @@ test_type_rejects_invalid_enter_delay_config() {
 }
 
 test_type_warns_on_immediate_shell_error() {
+  # plumb:req-5ccb1a18
+  # plumb:req-cfc71712
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
   local shell_session shell_pid marker output
   shell_session="surr-shell-warn-test-$$"
   marker="definitely_missing_command_${$}"
-  zmx run "$shell_session" bash --noprofile --norc &
+  zmx run "$shell_session" bash --noprofile --norc -i &
   shell_pid=$!
-  sleep 2
+  wait_until 5 zmx_session_exists "$shell_session" || {
+    fail "${FUNCNAME[0]} — failed to create scratch shell session"
+    return
+  }
+  sleep 1
 
   output=$(
     SURROGATE_LABEL=off \
-    SURROGATE_TYPE_POSTCHECK_SECS=0.05 \
+    SURROGATE_TYPE_POSTCHECK_SECS=0.2 \
     "$SURROGATE" type "$shell_session" "$marker" 2>&1 || true
   )
 
@@ -3214,13 +3506,17 @@ test_type_no_shell_warning_on_success() {
   local shell_session shell_pid marker output
   shell_session="surr-shell-ok-test-$$"
   marker="SHELL_OK_${$}"
-  zmx run "$shell_session" bash --noprofile --norc &
+  zmx run "$shell_session" bash --noprofile --norc -i &
   shell_pid=$!
-  sleep 2
+  wait_until 5 zmx_session_exists "$shell_session" || {
+    fail "${FUNCNAME[0]} — failed to create scratch shell session"
+    return
+  }
+  sleep 1
 
   output=$(
     SURROGATE_LABEL=off \
-    SURROGATE_TYPE_POSTCHECK_SECS=0.05 \
+    SURROGATE_TYPE_POSTCHECK_SECS=0.2 \
     "$SURROGATE" type "$shell_session" "echo $marker" 2>&1 || true
   )
 
@@ -3237,6 +3533,8 @@ test_type_no_shell_warning_on_success() {
 }
 
 test_type_message_mode_rejects_shell_context() {
+  # plumb:req-c9633f32
+  # plumb:req-4dc4dfec
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3254,6 +3552,7 @@ test_type_message_mode_rejects_shell_context() {
 }
 
 test_type_message_mode_agent_context() {
+  # plumb:req-97f6c778
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3274,8 +3573,7 @@ test_type_message_mode_agent_context() {
 }
 
 test_error_missing_zmx() {
-  # plumb:req-106648f1
-  # plumb:req-f63f502d
+  # plumb:req-fb1e1be7
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3288,7 +3586,6 @@ test_error_missing_zmx() {
 }
 
 test_error_missing_tmux() {
-  # plumb:req-f63f502d
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3301,7 +3598,7 @@ test_error_missing_tmux() {
 }
 
 test_rename_kills_bridge() {
-  # plumb:req-a6498a94
+  # plumb:req-aa5efa7a
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3317,7 +3614,6 @@ test_rename_kills_bridge() {
 }
 
 test_list_delegates_to_zmx() {
-  # plumb:req-43c3eed5
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3330,6 +3626,8 @@ test_list_delegates_to_zmx() {
 }
 
 test_no_provider_specific_detection() {
+  # plumb:req-3db8e45a
+  # plumb:req-7ec98bcf
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3344,6 +3642,7 @@ test_no_provider_specific_detection() {
 }
 
 test_no_ml_detection() {
+  # plumb:req-14f069a6
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3358,6 +3657,7 @@ test_no_ml_detection() {
 }
 
 test_no_global_guard_disable() {
+  # plumb:req-af5d4096
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3369,6 +3669,7 @@ test_no_global_guard_disable() {
 }
 
 test_no_persistent_unsafe_mode() {
+  # plumb:req-e1fc3af2
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3380,8 +3681,7 @@ test_no_persistent_unsafe_mode() {
 }
 
 test_bridge_command() {
-  # plumb:req-fbfa2e19
-  # plumb:req-b6f97f4e
+  # plumb:req-34a4863c
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3395,22 +3695,36 @@ test_bridge_command() {
   fi
 }
 
-test_cleanup_default_is_dead() {
-  # plumb:req-23993d75
+test_prune_bridges_default_is_dead() {
+  # plumb:req-81753f60
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  # cleanup with no args should default to --dead
-  if grep -q 'mode="${1:---dead}"' "$SURROGATE"; then
-    pass "${FUNCNAME[0]} — cleanup defaults to --dead"
+  # prune-bridges with no args should default to --dead
+  if awk '/^cmd_prune_bridges\(\)/,/^cmd_cleanup\(\)/' "$SURROGATE" | grep -q 'local mode="--dead"'; then
+    pass "${FUNCNAME[0]} — prune-bridges defaults to --dead"
   else
-    fail "${FUNCNAME[0]} — cleanup default not --dead"
+    fail "${FUNCNAME[0]} — prune-bridges default not --dead"
+  fi
+}
+
+test_doctor_stale_guidance() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local doctor_bin
+  doctor_bin="$(dirname "$SCRIPT_DIR")/bin/surrogate-doctor"
+
+  if grep -q 'surrogate prune-bridges' "$doctor_bin" &&
+     grep -q 'surrogate sweep --older-than ${STALE_THRESHOLD_HOURS}' "$doctor_bin" &&
+     grep -q 'ancestry-only' "$doctor_bin"; then
+    pass "${FUNCNAME[0]} — doctor guidance points to prune commands"
+  else
+    fail "${FUNCNAME[0]} — doctor guidance still references old cleanup flow"
   fi
 }
 
 test_status_shows_health() {
-  # plumb:req-4e97ea84
-  # plumb:req-a727036c
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3429,8 +3743,7 @@ test_status_shows_health() {
 }
 
 test_send_creates_bridge_lazily() {
-  # plumb:req-fd809532
-  # plumb:req-5b4577ce
+  # plumb:req-bfb03682
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3443,8 +3756,7 @@ test_send_creates_bridge_lazily() {
 }
 
 test_type_creates_bridge_lazily() {
-  # plumb:req-800e6253
-  # plumb:req-5b4577ce
+  # plumb:req-4be670d2
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3456,8 +3768,6 @@ test_type_creates_bridge_lazily() {
 }
 
 test_send_updates_watermark() {
-  # plumb:req-1156290c
-  # plumb:req-2335dd45
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3469,8 +3779,6 @@ test_send_updates_watermark() {
 }
 
 test_type_updates_watermark() {
-  # plumb:req-6904f86d
-  # plumb:req-da49d759
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3482,7 +3790,6 @@ test_type_updates_watermark() {
 }
 
 test_send_serializes_via_flock() {
-  # plumb:req-271825d3
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3494,7 +3801,6 @@ test_send_serializes_via_flock() {
 }
 
 test_type_serializes_via_flock() {
-  # plumb:req-29465905
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3506,8 +3812,7 @@ test_type_serializes_via_flock() {
 }
 
 test_wait_validates_timeout() {
-  # plumb:req-137add0d
-  # plumb:req-997f73d2
+  # plumb:req-c71cda30
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3519,7 +3824,6 @@ test_wait_validates_timeout() {
 }
 
 test_read_validates_n() {
-  # plumb:req-201cbd97
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
@@ -3534,12 +3838,14 @@ run_section identity smoke \
   test_whoami \
   test_whoami_help \
   test_whoami_rejects_extra_args \
+  test_whoami_falls_back_to_live_ancestry_session \
+  test_whoami_reports_ancestry_only_session \
   test_whoami_rejects_stale_env_session \
   test_whoami_no_session \
   test_type_rejects_self_target \
   test_send_rejects_self_target \
   test_submit_rejects_self_target \
-  test_cull_rejects_current_live_session
+  test_prune_sessions_rejects_current_live_session
 
 run_section aliases full \
   test_alias_resolve \
@@ -3566,6 +3872,9 @@ run_section behavior full \
   test_who_project_filter \
   test_who_cwd_filter \
   test_who_json_output \
+  test_live_focuses_high_signal_sessions \
+  test_live_all_includes_low_signal_sessions \
+  test_live_json_reports_hidden_low_signal_sessions \
   test_active_default_attached_only \
   test_active_all_includes_detached \
   test_peek_count_at_end \
@@ -3606,7 +3915,8 @@ run_section design full \
   test_no_global_guard_disable \
   test_no_persistent_unsafe_mode \
   test_bridge_command \
-  test_cleanup_default_is_dead \
+  test_prune_bridges_default_is_dead \
+  test_doctor_stale_guidance \
   test_status_shows_health \
   test_send_creates_bridge_lazily \
   test_type_creates_bridge_lazily \
@@ -3618,7 +3928,7 @@ run_section design full \
   test_invariant_surrogate_full_path_for_alias_lookup \
   test_brief_help_is_discoverable \
   test_brief_explicit_session_passes_to_helper \
-  test_brief_uses_active_json_selection \
+  test_brief_uses_live_json_selection \
   test_surrogate_brief_show_config_defaults \
   test_surrogate_brief_show_config_overrides \
   test_surrogate_brief_missing_key_help \

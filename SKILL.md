@@ -21,7 +21,7 @@ Current built-in guardrails:
 
 - `surrogate type` normalizes embedded newlines to spaces and must actually submit, not just stage text
 - `surrogate type`, `surrogate send`, and `surrogate submit` reject self-targeting and tell you the current alias/session
-- `surrogate cull` rejects the current live session and any attached session with clients still present
+- `surrogate prune-sessions` rejects the current live session and any attached session with clients still present
 - `surrogate send` rejects `C-c`, `C-d`, and `C-z`
 - there is no global guard-disable mode
 - there is no persistent unsafe mode
@@ -89,6 +89,17 @@ surrogate active
 surrogate active --all   # include non-empty detached sessions
 ```
 
+### Show live, messageable sessions with less noise
+
+```bash
+surrogate live
+surrogate live --here
+surrogate live --all
+surrogate live --json
+```
+
+`surrogate live` is the low-noise operator view. It only shows sessions that are currently messageable, ranks them by recent visible activity, and hides low-signal shell-prompt lanes by default when they have no visible repo or cwd hint. Use `--all` when you want the full live set.
+
 ### Show stale detached sessions
 
 ```bash
@@ -122,14 +133,16 @@ surrogate rename <old-session> <new-name>
 surrogate alias <session>
 ```
 
-### Cull sessions
+### Review and prune zmx sessions
 
-`zmx` is still the source of truth. `surrogate cull` kills the zmx session and then cleans surrogate’s own bridge/alias/lock/watermark state.
+`zmx` is still the source of truth. `surrogate prune-sessions` kills the zmx session and then cleans surrogate’s own bridge/alias/lock/watermark state. Batch stale pruning previews by default. Add `--yes` to execute.
 
 ```bash
-surrogate cull <session>...
-surrogate cull --stale [--older-than HOURS] [--filter PATTERN] [--dry-run]
-surrogate cull --stale --older-than 24 --limit 10
+surrogate stale --older-than 48
+surrogate sweep --older-than 48
+surrogate prune-sessions <session>...
+surrogate prune-sessions --stale [--older-than HOURS] [--filter PATTERN] [--dry-run|--yes]
+surrogate prune-sessions --stale --older-than 24 --limit 10 --yes
 ```
 
 ### Type text + Enter (most common)
@@ -186,7 +199,7 @@ surrogate-brief --show-config
 surrogate-brief --openrouter-model openai/gpt-4.1-mini --inference-provider openai shiny-dolphin
 ```
 
-`surrogate brief` reuses the existing activity-ranked filtering logic from `surrogate active`. This path is optional and separate from core surrogate usage. If the key is missing, `surrogate-brief` prints the setup steps needed to enable it.
+`surrogate brief` reuses `surrogate live --json`, so the default brief targets the same high-signal, messageable sessions shown by `surrogate live`. Add `--all` if you want briefs for every live messageable session, including low-signal shell lanes. This path is optional and separate from core surrogate usage. If the key is missing, `surrogate-brief` prints the setup steps needed to enable it.
 
 ### Wait for pattern in output
 
@@ -203,11 +216,13 @@ surrogate bridge <session>
 ### Clean up dead bridges
 
 ```bash
-surrogate cleanup          # remove bridges for dead zmx sessions
-surrogate cleanup --all    # remove ALL bridges
+surrogate prune-bridges          # remove bridges for dead zmx sessions
+surrogate prune-bridges --all    # remove ALL bridges
 ```
 
-Bridge cleanup does not remove zmx sessions. Use `surrogate cull` for that.
+`surrogate cull` and `surrogate cleanup` still work as deprecated aliases, but primary docs should use `prune-sessions`, `prune-bridges`, and `sweep`.
+
+Bridge cleanup does not remove zmx sessions. Use `surrogate prune-sessions` or `surrogate sweep` for that.
 
 ### Show bridge health
 
@@ -242,6 +257,8 @@ Surrogate refuses to send input to the current live session. If you need to conf
 ```bash
 surrogate whoami
 ```
+
+If `ZMX_SESSION` is stale but the current process ancestry still includes `zmx attach <session>`, `surrogate whoami` reports that lane as `ancestry-only` and tells you it is not messageable via surrogate right now.
 
 ### Inter-agent communication
 

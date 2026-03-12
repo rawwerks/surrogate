@@ -45,7 +45,7 @@ The following rules are part of surrogate itself and must apply even when DCG is
 5. `type` in its default mode must stay shell-safe: if the target looks like a shell, surrogate must suppress the prose prefix so literal shell commands still work, and it must warn if the shell immediately reports obvious command errors.
 6. `type --message` must exist as a safer prose mode for agent/TUI messaging. It must normalize long prose and refuse shell-like or unknown contexts.
 7. `type`, `send`, and `submit` must reject targeting the current live session. The error must clearly state the current alias and session name so the caller can re-orient.
-8. `cull` must reject the current live session and any session that still has attached clients.
+8. `prune-sessions` must reject the current live session and any session that still has attached clients. The deprecated `cull` alias must preserve the same guardrails.
 9. Surrogate must not implement an ambient or inherited bypass mechanism such as a global "disable guards" environment variable.
 10. Surrogate must not implement a persistent unsafe mode.
 
@@ -167,9 +167,17 @@ The `who` command must accept an optional `-n LINES` flag (default 10) controlli
 
 The `active` command must accept an optional `--all` flag. By default, it must show only sessions with attached clients (clients > 0). With `--all`, it must also include detached sessions that have non-empty history.
 
+### live
+
+The `live` command must be the low-noise discovery view for sessions that are currently messageable via surrogate. It must show only sessions present in `zmx list` that still have attached clients, and it must rank them by recent visible activity rather than spawn time. It must support the same `--recent`, `--project`, `--cwd`, and `--json` filters as the other discovery commands, and `--here` must resolve to the current repo name.
+
+By default, `live` must hide low-signal shell-like lanes when they have no visible repo or cwd hint. `--all` must include those low-signal live lanes again. When low-signal rows are hidden, text output must say so explicitly, and JSON output must report both the displayed count and the hidden low-signal count.
+
+If the current shell is ancestry-backed but not present in `zmx list`, `live` must surface that fact separately as an anomaly instead of pretending the current shell is messageable.
+
 ### stale
 
-The `stale` command must list detached zmx sessions older than an `--older-than HOURS` threshold (default 24). Age must be derived from the zmx socket mtime, consistent with `who`. It may accept `--filter PATTERN` to match against alias, session name, or snippet, and `--limit N` to cap the result count. Results must be ordered oldest-first. It must not kill anything.
+The `stale` command must list detached zmx sessions older than an `--older-than HOURS` threshold (default 24). Age must be derived from the zmx socket mtime, consistent with `who`. It may accept `--filter PATTERN` to match against alias, session name, or snippet, and `--limit N` to cap the result count. Results must be ordered oldest-first. It must not kill anything. If old sessions are skipped because they are still attached or are the current live session, `stale` may print a separate skipped section with explicit reasons.
 
 ### peek
 
@@ -185,15 +193,23 @@ The `alias` command must accept a session name (or alias) and print its determin
 
 ### whoami
 
-The `whoami` command must print the alias and zmx session name of the current surrogate session (the zmx session this terminal is running in). It must detect the current session by checking the zmx environment or parent process. It must support `-h`/`--help` and reject extra positional arguments with `usage: surrogate whoami`. For a live current session, it must deterministically compute the alias rather than printing `unknown`. If `ZMX_SESSION` is set but not present in `zmx list`, `whoami` must reject it explicitly as a stale or leaked environment value instead of treating it as a live session.
+The `whoami` command must print the alias and zmx session name of the current surrogate session (the zmx session this terminal is running in). It must detect the current session by checking the zmx environment or parent `zmx attach <session>` ancestry. It must support `-h`/`--help` and reject extra positional arguments with `usage: surrogate whoami`. For a live current session, it must deterministically compute the alias rather than printing `unknown`. If `ZMX_SESSION` is set but not present in `zmx list`, `whoami` must first try to recover the session name from `zmx attach` ancestry. If ancestry identifies a live session, `whoami` must return it. If ancestry identifies a session name that is not present in `zmx list`, `whoami` must still succeed but mark it clearly as ancestry-only and not messageable via surrogate. If neither env nor ancestry yields a usable session identity, then `whoami` must reject the stale or leaked environment value explicitly.
 
-### cull
+### prune-sessions
 
-The `cull` command must remove zmx sessions, with zmx remaining the source of truth. Explicit `cull <session>...` must accept session names or aliases, reject the current live session, and reject sessions with attached clients. Batch `cull --stale` must select from the same detached/old candidate set as `stale`, support `--older-than HOURS`, may accept `--filter PATTERN`, may accept `--limit N`, and may support `--dry-run`. Batch results must be ordered oldest-first. Successful culls must call `zmx kill` and then clean surrogate’s own bridge, alias, lock, and watermark state for the culled session.
+The primary destructive session-removal command must be `prune-sessions`, with zmx remaining the source of truth. Explicit `prune-sessions <session>...` must accept session names or aliases, reject the current live session, and reject sessions with attached clients. Batch `prune-sessions --stale` must select from the same detached/old candidate set as `stale`, support `--older-than HOURS`, may accept `--filter PATTERN`, may accept `--limit N`, and may support `--dry-run`. Batch results must be ordered oldest-first.
+
+Batch stale pruning must preview by default. If neither `--dry-run` nor `--yes` is supplied, `prune-sessions --stale ...` must show what would be deleted and how many surrogate tmux bridges would be removed, then instruct the caller to re-run with `--yes`. Preview and execution output must keep zmx sessions and surrogate tmux bridges separate in both wording and counts. If sessions are skipped, output must explain why.
+
+Successful pruning must call `zmx kill` and then clean surrogate’s own bridge, alias, lock, and watermark state for the pruned session. `cull` must remain available as a deprecated alias for `prune-sessions`.
+
+### sweep
+
+The `sweep` command must be the plain-English batch entrypoint for stale-session review and deletion. It must behave like `prune-sessions --stale`, support the same `--older-than HOURS`, `--filter PATTERN`, `--limit N`, and `--yes` flags, and inherit the same preview-by-default behavior.
 
 ### Session Resolution
 
-All commands that accept a session name must also accept an alias. Session resolution must first check if the argument is a known alias and resolve it to the actual session name. If not an alias, it must be treated as a literal session name. This applies to: send, type, read, wait, bridge, rename, alias, and explicit cull commands.
+All commands that accept a session name must also accept an alias. Session resolution must first check if the argument is a known alias and resolve it to the actual session name. If not an alias, it must be treated as a literal session name. This applies to: send, type, read, wait, bridge, rename, alias, and explicit `prune-sessions` commands.
 
 ### list (alias display)
 
@@ -216,9 +232,9 @@ The `--project` and `--cwd` filters must remain deterministic and derive only fr
 
 The `bridge` command must pre-create a tmux bridge session for a zmx session.
 
-### cleanup
+### prune-bridges
 
-The `cleanup` command must accept `--dead` (default) or `--all`. With `--dead`, it must remove bridge sessions whose corresponding zmx session no longer exists. With `--all`, it must remove all bridge sessions.
+The primary bridge-only cleanup command must be `prune-bridges`. It must accept `--dead` (default) or `--all`. With `--dead`, it must remove bridge sessions whose corresponding zmx session no longer exists. With `--all`, it must remove all bridge sessions. `cleanup` must remain available as a deprecated alias for `prune-bridges`. Bridge pruning must never delete zmx sessions.
 
 ### status
 

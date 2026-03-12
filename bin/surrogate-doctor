@@ -6,6 +6,7 @@ set -euo pipefail
 PASS=0
 WARN=0
 FAIL=0
+STALE_THRESHOLD_HOURS=72
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_BIN_DIR="$REPO_DIR/bin"
@@ -151,6 +152,29 @@ fi
 
 echo ""
 
+# --- current shell identity ---
+
+echo "Current shell:"
+
+if command -v surrogate &>/dev/null; then
+  WHOAMI_OUTPUT="$(surrogate whoami 2>&1 || true)"
+  if printf '%s\n' "$WHOAMI_OUTPUT" | grep -q 'ancestry-only'; then
+    warn "current shell identity is ancestry-only — $WHOAMI_OUTPUT"
+  elif printf '%s\n' "$WHOAMI_OUTPUT" | grep -q '^surrogate: error: not inside a zmx session'; then
+    pass "current shell is not inside a zmx session"
+  elif printf '%s\n' "$WHOAMI_OUTPUT" | grep -q '^surrogate: error:'; then
+    warn "current shell identity could not be resolved — $WHOAMI_OUTPUT"
+  elif [[ -n "$WHOAMI_OUTPUT" ]]; then
+    pass "current shell identity: $WHOAMI_OUTPUT"
+  else
+    warn "current shell identity could not be resolved"
+  fi
+else
+  warn "cannot check current shell identity — surrogate not installed"
+fi
+
+echo ""
+
 # --- zmx sessions ---
 
 echo "ZMX sessions:"
@@ -159,6 +183,36 @@ if command -v zmx &>/dev/null; then
   SESSION_COUNT=$(zmx list 2>/dev/null | wc -l)
   CLIENT_COUNT=$(zmx list 2>/dev/null | grep -c 'clients=1' || echo 0)
   pass "$SESSION_COUNT sessions, $CLIENT_COUNT with active clients"
+
+  STALE_COUNT=0
+  NOW_EPOCH=$(date +%s)
+  while IFS= read -r line; do
+    session_name=$(echo "$line" | sed -n 's/.*session_name=\([^[:space:]]*\).*/\1/p')
+    clients=$(echo "$line" | sed -n 's/.*clients=\([0-9]*\).*/\1/p')
+    [[ -n "$session_name" ]] || continue
+    [[ -n "$clients" ]] || clients=0
+
+    if command -v tmux &>/dev/null; then
+      if tmux has-session -t "_surr_${session_name}" 2>/dev/null && [[ "$clients" -gt 0 ]]; then
+        clients=$((clients - 1))
+      fi
+    fi
+
+    [[ "$clients" -eq 0 ]] || continue
+
+    socket_path="/run/user/$(id -u)/zmx/$session_name"
+    [[ -e "$socket_path" ]] || continue
+    socket_mtime=$(stat -c %Y "$socket_path" 2>/dev/null || echo "$NOW_EPOCH")
+    if [[ "$socket_mtime" -le $((NOW_EPOCH - STALE_THRESHOLD_HOURS * 3600)) ]]; then
+      STALE_COUNT=$((STALE_COUNT + 1))
+    fi
+  done < <(zmx list 2>/dev/null)
+
+  if [[ "$STALE_COUNT" -gt 0 ]]; then
+    warn "$STALE_COUNT detached zmx sessions older than ${STALE_THRESHOLD_HOURS}h — review with: surrogate stale --older-than ${STALE_THRESHOLD_HOURS} ; remove with: surrogate sweep --older-than ${STALE_THRESHOLD_HOURS}"
+  else
+    pass "no detached zmx sessions older than ${STALE_THRESHOLD_HOURS}h"
+  fi
 else
   warn "cannot check — zmx not installed"
 fi
@@ -183,7 +237,7 @@ if command -v tmux &>/dev/null; then
   fi
   pass "$BRIDGE_COUNT active bridges"
   if [[ "$DEAD_COUNT" -gt 0 ]]; then
-    warn "$DEAD_COUNT dead bridges — run: surrogate cleanup"
+    warn "$DEAD_COUNT dead bridges — run: surrogate prune-bridges"
   fi
 else
   warn "cannot check — tmux not installed"

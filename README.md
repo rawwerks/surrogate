@@ -105,7 +105,7 @@ Current built-in structural guardrails:
 
 - `type` normalizes embedded newlines to spaces and must actually submit, not just stage text in the target input
 - `type`, `send`, and `submit` reject self-targeting and tell you the current alias/session
-- `cull` rejects the current live session and any attached session with clients still present
+- `prune-sessions` rejects the current live session and any attached session with clients still present
 - `send` rejects `C-c`, `C-d`, and `C-z`
 - there is no global "disable guards" switch
 - there is no persistent unsafe mode
@@ -200,6 +200,17 @@ surrogate active                         # only sessions with clients attached
 surrogate active --all                   # include non-empty detached sessions
 ```
 
+### Show live, messageable sessions with less noise
+
+```bash
+surrogate live                           # high-signal live sessions only
+surrogate live --here                    # same, but scoped to the current repo name
+surrogate live --all                     # include low-signal shell-like live lanes too
+surrogate live --json
+```
+
+`surrogate live` is the operator-facing discovery view. It only shows sessions that are currently messageable via surrogate, ranks them by recent visible activity, and hides low-signal shell-prompt lanes by default when they have no visible repo or cwd hint. Use `--all` when you want the full live set.
+
 ### Remote operator briefs with OpenRouter
 
 This path is optional and requires an OpenRouter API key. Core `surrogate` usage remains local and has no API cost.
@@ -214,7 +225,7 @@ surrogate brief 15
 surrogate brief silly-pixel
 ```
 
-`surrogate brief` reuses the existing activity-ranked session selection logic from `surrogate active --recent ...`, so it filters by recent activity, not recent spawn time.
+`surrogate brief` reuses `surrogate live --json`, so the default brief targets the same high-signal, messageable sessions shown by `surrogate live`. Add `--all` if you want briefs for every live messageable session, including low-signal shell lanes.
 
 Lower-level helper:
 
@@ -275,18 +286,26 @@ surrogate peek -n 2 --filter "error"
 surrogate rename <old-session> <new-name>
 ```
 
-### Cull stale or explicit sessions
+### Review and prune old zmx sessions
 
-`zmx` remains the source of truth. `surrogate cull` delegates the kill to `zmx kill`, then removes surrogate’s bridge/alias/lock/watermark plumbing for that session.
+`zmx` remains the source of truth. `surrogate prune-sessions` delegates deletion to `zmx kill`, then removes surrogate’s bridge/alias/lock/watermark plumbing for that session. Batch stale pruning previews by default. Add `--yes` to execute.
 
 ```bash
-surrogate cull sleepy-otter
-surrogate cull --stale --older-than 48
-surrogate cull --stale --older-than 24 --filter "2026-03-08" --dry-run
-surrogate cull --stale --older-than 24 --limit 10
+surrogate stale --older-than 48
+surrogate sweep --older-than 48
+surrogate prune-sessions sleepy-otter
+surrogate prune-sessions --stale --older-than 48 --dry-run
+surrogate prune-sessions --stale --older-than 48 --yes
+surrogate prune-sessions --stale --older-than 24 --filter "2026-03-08" --yes
+surrogate prune-sessions --stale --older-than 24 --limit 10 --yes
 ```
 
-Batch stale culls are ordered oldest-first.
+Batch stale pruning is ordered oldest-first and prints explicit skip reasons for old sessions that are still attached or are your current live session.
+
+Deprecated aliases:
+
+- `surrogate cull ...` -> `surrogate prune-sessions ...`
+- `surrogate cleanup ...` -> `surrogate prune-bridges ...`
 
 ### Type text + Enter
 
@@ -361,11 +380,11 @@ Surrogate creates ephemeral tmux "bridge" sessions behind the scenes. You rarely
 ```bash
 surrogate bridge <session>      # pre-warm a bridge
 surrogate status                # show all bridges and health
-surrogate cleanup               # remove bridges for dead zmx sessions
-surrogate cleanup --all         # remove all bridges
+surrogate prune-bridges         # remove bridges for dead zmx sessions
+surrogate prune-bridges --all   # remove all bridges
 ```
 
-Bridge cleanup only touches tmux plumbing. Session culling uses `zmx kill` and is handled separately by `surrogate cull`.
+`prune-bridges` only touches tmux plumbing. Use `surrogate prune-sessions` or `surrogate sweep` to remove old zmx sessions.
 
 ## Special keys reference
 
@@ -411,6 +430,8 @@ Surrogate refuses to type into the current live session. If you are unsure which
 ```bash
 surrogate whoami
 ```
+
+If `ZMX_SESSION` is stale but your process tree still runs under a `zmx attach <session>` parent, `surrogate whoami` reports that session as `ancestry-only` and tells you it is not currently messageable via surrogate.
 
 ### Automation loop
 

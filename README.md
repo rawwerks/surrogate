@@ -186,7 +186,7 @@ surrogate who                            # newest 20 first: age, ui, session, re
 surrogate who --recent 20                # show the 20 most recent sessions
 surrogate who --recent 2h                # only sessions seen in the last 2 hours
 surrogate who --project surrogate        # filter by visible repo basename hint
-surrogate who --cwd /home/raw/Documents/GitHub/surrogate
+surrogate who --cwd ~/Documents/GitHub/surrogate
 surrogate who --json                     # machine-readable output for agents/scripts
 surrogate who -n 20                      # inspect more recent history for snippet/hints
 ```
@@ -215,7 +215,7 @@ surrogate live --json
 
 This path is optional and requires an OpenRouter API key. Core `surrogate` usage remains local and has no API cost.
 
-If `OPENROUTER_API_KEY` is set, you can summarize active windows with one API call per zmx session. By default it uses model `z-ai/glm-4.7` with preferred provider `cerebras`.
+If `OPENROUTER_API_KEY` is set, you can triage and summarize active windows with one API call per zmx session. By default it uses model `z-ai/glm-4.7` with preferred provider `cerebras`.
 
 Recommended entrypoint:
 
@@ -237,16 +237,27 @@ surrogate-brief --openrouter-model openai/gpt-4.1-mini --inference-provider open
 surrogate-brief --show-config
 ```
 
-Each session summary includes:
+Each session brief includes:
+- `ATTENTION REQUIRED`
+- `PRIORITY`
+- `SIGNAL QUALITY`
+- `WHY NOW`
 - `STATUS`
 - `LAST COMPLETED`
+- `USER ACTION REQUIRED`
+- `NEXT UNBLOCKING STEP`
 - `PROPOSED NEXT STEPS`
 - `USER INPUT NEEDED`
 - `BLOCKERS`
 
+Low-signal shell-prompt lanes are explicitly demoted: if the visible evidence is only an idle prompt with no blocker, failure, approval request, or pending user decision, the brief should classify it as `ATTENTION REQUIRED: NO`, `PRIORITY: P3`, and `SIGNAL QUALITY: LOW`.
+
+Attention is broader than explicit questions. The brief should also treat implicit operator handoff as important when the visible stopping point shows interrupted work, parked troubleshooting, or a meaningful subtask completed and then handed back to the user prompt for the next decision. In practice, the end-state tail matters more than earlier milestones.
+
 Defaults:
 - Scrollback window: `500` lines
 - Completion budget: `1200` tokens per session
+- Sampling temperature: `0.0`
 - OpenRouter model: `z-ai/glm-4.7`
 - Preferred inference provider: `cerebras`
 

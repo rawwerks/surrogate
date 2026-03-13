@@ -73,7 +73,7 @@ surrogate who [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
 surrogate who
 surrogate who --recent 20
 surrogate who --project surrogate
-surrogate who --cwd /home/raw/Documents/GitHub/surrogate
+surrogate who --cwd ~/Documents/GitHub/surrogate
 surrogate who --json
 surrogate who -n 20   # inspect more history for snippet and path hints
 ```
@@ -188,7 +188,7 @@ surrogate read <session> [-n N]
 
 ### Optional remote operator briefs
 
-If `OPENROUTER_API_KEY` is configured, you can summarize where sessions left off with one OpenRouter call per zmx session:
+If `OPENROUTER_API_KEY` is configured, you can triage and summarize where sessions left off with one OpenRouter call per zmx session:
 
 ```bash
 surrogate brief --recent 15
@@ -199,7 +199,7 @@ surrogate-brief --show-config
 surrogate-brief --openrouter-model openai/gpt-4.1-mini --inference-provider openai shiny-dolphin
 ```
 
-`surrogate brief` reuses `surrogate live --json`, so the default brief targets the same high-signal, messageable sessions shown by `surrogate live`. Add `--all` if you want briefs for every live messageable session, including low-signal shell lanes. This path is optional and separate from core surrogate usage. If the key is missing, `surrogate-brief` prints the setup steps needed to enable it.
+`surrogate brief` reuses `surrogate live --json`, so the default brief targets the same high-signal, messageable sessions shown by `surrogate live`. Add `--all` if you want briefs for every live messageable session, including low-signal shell lanes. Each brief now classifies `ATTENTION REQUIRED`, `PRIORITY`, and `SIGNAL QUALITY` before summarizing status and next steps, so idle shell prompts get demoted instead of looking urgent. It should also treat implicit operator handoff as meaningful when a lane stops at interrupted work, parked troubleshooting, or a human decision boundary even without an explicit ask, and it should weight the end-state tail more heavily than an earlier milestone. This path is optional and separate from core surrogate usage. If the key is missing, `surrogate-brief` prints the setup steps needed to enable it.
 
 ### Wait for pattern in output
 

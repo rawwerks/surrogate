@@ -175,6 +175,14 @@ By default, `live` must hide low-signal shell-like lanes when they have no visib
 
 If the current shell is ancestry-backed but not present in `zmx list`, `live` must surface that fact separately as an anomaly instead of pretending the current shell is messageable.
 
+### brief
+
+The optional `brief` / `surrogate-brief` path must remain separate from core local surrogate usage and require an OpenRouter API key. By default, `surrogate brief` must reuse the same `live --json` selection path as `surrogate live`, so it targets only live, messageable sessions unless explicit sessions are named or `--all` is supplied.
+
+Each brief must be attention-first, not summary-first. The output must classify `ATTENTION REQUIRED`, `PRIORITY`, and `SIGNAL QUALITY` before the status recap so the operator can rank sessions quickly. Plain shell prompts, idle agent prompts, and other sparse low-signal lanes with no explicit blocker, pending user decision, failing verification, approval request, or visible interrupted work must be classified as low-signal and not requiring attention.
+
+Briefs must weight the most recent visible stopping point more heavily than earlier milestones. They must treat implicit operator handoff as attention-worthy when a lane ends in interrupted troubleshooting, a parked human decision boundary, or other visible resume-control states even if the agent did not explicitly ask for input. The prompt context must surface an explicit end-state tail so the model can anchor on how the session actually stopped rather than just the largest earlier milestone.
+
 ### stale
 
 The `stale` command must list detached zmx sessions older than an `--older-than HOURS` threshold (default 24). Age must be derived from the zmx socket mtime, consistent with `who`. It may accept `--filter PATTERN` to match against alias, session name, or snippet, and `--limit N` to cap the result count. Results must be ordered oldest-first. It must not kill anything. If old sessions are skipped because they are still attached or are the current live session, `stale` may print a separate skipped section with explicit reasons.

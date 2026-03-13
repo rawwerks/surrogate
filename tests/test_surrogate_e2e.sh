@@ -140,7 +140,7 @@ EOF
 1 (init) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 EOF
   : > "$MOCK_PROC_ROOT/9001/cmdline"
-  printf '/home/raw/.local/bin/zmx\0attach\0%s\0' "$session" > "$MOCK_PROC_ROOT/9002/cmdline"
+  printf '/home/testuser/.local/bin/zmx\0attach\0%s\0' "$session" > "$MOCK_PROC_ROOT/9002/cmdline"
   : > "$MOCK_PROC_ROOT/1/cmdline"
 }
 
@@ -1396,7 +1396,9 @@ test_surrogate_brief_show_config_defaults() {
 
   if echo "$output" | grep -q 'model=z-ai/glm-4.7' &&
      echo "$output" | grep -q 'provider=cerebras' &&
+     echo "$output" | grep -q 'brief_style=attention-first' &&
      echo "$output" | grep -q 'lines=500' &&
+     echo "$output" | grep -q 'temperature=0.0' &&
      echo "$output" | grep -q 'max_completion_tokens=1200'; then
     pass "${FUNCNAME[0]} — brief defaults are self-documenting"
   else
@@ -1506,6 +1508,37 @@ test_brief_uses_live_json_selection() {
     pass "${FUNCNAME[0]} — brief reuses live --json selection"
   else
     fail "${FUNCNAME[0]} — brief does not reuse live selection path"
+  fi
+}
+
+test_surrogate_brief_prompt_is_attention_first() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -q 'ATTENTION REQUIRED:' "$SURROGATE_BRIEF" &&
+     grep -q 'PRIORITY:' "$SURROGATE_BRIEF" &&
+     grep -q 'SIGNAL QUALITY:' "$SURROGATE_BRIEF" &&
+     grep -q 'USER ACTION REQUIRED:' "$SURROGATE_BRIEF" &&
+     grep -q 'NEXT UNBLOCKING STEP:' "$SURROGATE_BRIEF" &&
+     grep -q 'plain shell prompt, idle agent prompt' "$SURROGATE_BRIEF" &&
+     grep -q 'most recent visible stopping point' "$SURROGATE_BRIEF" &&
+     grep -q 'implicit operator handoff' "$SURROGATE_BRIEF" &&
+     grep -q 'END_STATE_WINDOW_MOST_IMPORTANT' "$SURROGATE_BRIEF" &&
+     grep -q "Conversation interrupted" "$SURROGATE_BRIEF"; then
+    pass "${FUNCNAME[0]} — brief prompt classifies attention before summary"
+  else
+    fail "${FUNCNAME[0]} — brief prompt is missing attention-first rules"
+  fi
+}
+
+test_list_fast_path_alias_fallback() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -Fq '${_ALIAS_CACHE[$session]:-$(session_alias_single "$session")}' "$SURROGATE"; then
+    pass "${FUNCNAME[0]} — list fast path falls back when alias cache races"
+  else
+    fail "${FUNCNAME[0]} — list fast path can crash on missing alias cache entries"
   fi
 }
 
@@ -1634,10 +1667,10 @@ case "\${1:-}" in
   history)
     case "\${2:-}" in
       "$MOCK_WHO_OLD_SESSION")
-        printf 'raw@host /home/raw/Documents/GitHub/older \$\n'
+        printf 'user@host /home/testuser/Documents/GitHub/older \$\n'
         ;;
       "$MOCK_WHO_NEW_SESSION")
-        printf '› run surrogate whoami\n• Ran surrogate whoami\ngpt-5.4 medium · 60%% left · /home/raw/Documents/GitHub/surrogate\n'
+        printf '› run surrogate whoami\n• Ran surrogate whoami\ngpt-5.4 medium · 60%% left · /home/testuser/Documents/GitHub/surrogate\n'
         ;;
     esac
     ;;
@@ -1683,13 +1716,13 @@ case "\${1:-}" in
   history)
     case "\${2:-}" in
       "$MOCK_LIVE_SIGNAL_SESSION")
-        printf '› review surrogate live\n• focused lane\ngpt-5.4 medium · 60%% left · /home/raw/Documents/GitHub/surrogate\n'
+        printf '› review surrogate live\n• focused lane\ngpt-5.4 medium · 60%% left · /home/testuser/Documents/GitHub/surrogate\n'
         ;;
       "$MOCK_LIVE_LOW_SESSION")
-        printf 'raw@host surrogate main ❯\n'
+        printf 'user@host surrogate main ❯\n'
         ;;
       "$MOCK_LIVE_DETACHED_SESSION")
-        printf 'raw@host /tmp/mock-detached \$\n'
+        printf 'user@host /tmp/mock-detached \$\n'
         ;;
     esac
     ;;
@@ -1827,7 +1860,7 @@ test_list_cwd_flag() {
   cleanup_mock_who_env
 
   if echo "$output" | grep -q 'CWD' &&
-     echo "$output" | grep -q '/home/raw/Documents/GitHub/surrogate'; then
+     echo "$output" | grep -q '/home/testuser/Documents/GitHub/surrogate'; then
     pass "${FUNCNAME[0]} — list --cwd exposes cwd hint"
   else
     echo "    output:"
@@ -1923,7 +1956,7 @@ test_who_cwd_filter() {
 
   setup_mock_who_env
   local output
-  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who --cwd /home/raw/Documents/GitHub/surrogate 2>&1)
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who --cwd /home/testuser/Documents/GitHub/surrogate 2>&1)
   cleanup_mock_who_env
 
   if echo "$output" | grep -q "$MOCK_WHO_NEW_SESSION" &&
@@ -1948,7 +1981,7 @@ test_who_json_output() {
   if echo "$output" | grep -q '"count":1' &&
      echo "$output" | grep -q '"recent_first":true' &&
      echo "$output" | grep -q "\"session\":\"$MOCK_WHO_NEW_SESSION\"" &&
-     echo "$output" | grep -q '"cwd_hint":"/home/raw/Documents/GitHub/surrogate"' &&
+     echo "$output" | grep -q '"cwd_hint":"/home/testuser/Documents/GitHub/surrogate"' &&
      echo "$output" | grep -q '"project_hint":"surrogate"' &&
      echo "$output" | grep -q '"ui_hint":"agent"'; then
     pass "${FUNCNAME[0]} — who --json exposes deterministic session metadata"
@@ -3926,9 +3959,11 @@ run_section design full \
   test_type_serializes_via_flock \
   test_invariant_inherited_status_shows_alias \
   test_invariant_surrogate_full_path_for_alias_lookup \
+  test_list_fast_path_alias_fallback \
   test_brief_help_is_discoverable \
   test_brief_explicit_session_passes_to_helper \
   test_brief_uses_live_json_selection \
+  test_surrogate_brief_prompt_is_attention_first \
   test_surrogate_brief_show_config_defaults \
   test_surrogate_brief_show_config_overrides \
   test_surrogate_brief_missing_key_help \

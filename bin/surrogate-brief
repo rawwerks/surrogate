@@ -58,7 +58,7 @@ usage() {
     cat <<'EOF'
 usage: surrogate-brief [options] [session|alias ...]
 
-Summarize zmx session history with one OpenRouter API call per target session.
+Triage and summarize zmx session history with one OpenRouter API call per target session.
 
 This helper is optional. Core surrogate usage remains local and has no API cost.
 
@@ -74,7 +74,7 @@ Options:
   --provider PROVIDER           Provider override
   --inference-provider PROVIDER OpenRouter inference provider override
   --no-fallbacks                Restrict routing to the preferred provider only
-  --temperature FLOAT           Sampling temperature (default: 0.1)
+  --temperature FLOAT           Sampling temperature (default: 0.0)
   --max-completion-tokens N     Completion budget per session (default: 1200)
   --api-url URL                 Override chat completions endpoint
   --show-config                 Print effective config and exit
@@ -157,6 +157,7 @@ session, alias, lines, model, provider, allow_fallbacks, temperature, max_comple
 history = Path(history_path).read_text()
 visible = [line for line in history.splitlines() if line.strip()]
 snippet = visible[-1][:160] if visible else ""
+tail_focus = "\n".join(visible[-40:]) if visible else ""
 path_matches = re.findall(r'((?:~|/)\S+)', history)
 cwd_hint = path_matches[-1].rstrip('.,;:)]}>') if path_matches else ""
 project_hint = cwd_hint.rstrip('/').split('/')[-1] if cwd_hint else ""
@@ -177,33 +178,57 @@ payload = {
         {
             "role": "system",
             "content": (
-                "You summarize terminal session scrollback for an operator who is away from the computer. "
-                "Use only the provided history. Be concrete, terse, and action-oriented. "
-                "Do not invent facts. If information is missing, say unclear."
+                "You produce remote operator briefs for terminal session scrollback. "
+                "Decide urgency before summarizing. Use only the provided history. "
+                "Be concrete, terse, and action-oriented. Do not invent facts. "
+                "If information is missing, say unclear."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Summarize this zmx session so the user can understand exactly where work stopped.\n\n"
+                f"Triage this zmx session so the user can tell whether it needs attention now, "
+                f"and then summarize exactly where work stopped.\n\n"
                 f"SESSION: {session}\n"
                 f"ALIAS: {alias}\n"
                 f"PROJECT_HINT: {project_hint or 'unclear'}\n"
                 f"CWD_HINT: {cwd_hint or 'unclear'}\n"
                 f"VISIBLE_SNIPPET: {snippet or 'unclear'}\n"
                 f"HISTORY_WINDOW_LINES: {lines}\n\n"
+                "END_STATE_WINDOW_MOST_IMPORTANT:\n"
+                f"{tail_focus or 'unclear'}\n\n"
                 "Output exactly these fields in this order:\n"
                 "SESSION:\n"
                 "ALIAS:\n"
+                "ATTENTION REQUIRED:\n"
+                "PRIORITY:\n"
+                "SIGNAL QUALITY:\n"
+                "WHY NOW:\n"
                 "REPO/CONTEXT:\n"
                 "STATUS:\n"
                 "LAST COMPLETED:\n"
+                "USER ACTION REQUIRED:\n"
+                "NEXT UNBLOCKING STEP:\n"
                 "PROPOSED NEXT STEPS:\n"
                 "USER INPUT NEEDED:\n"
                 "BLOCKERS:\n\n"
                 "Rules:\n"
+                "- Fill the attention fields first; do not delay the classification until later fields.\n"
+                "- ATTENTION REQUIRED must be exactly YES, NO, or UNCLEAR.\n"
+                "- PRIORITY must be exactly P0, P1, P2, or P3.\n"
+                "- SIGNAL QUALITY must be exactly HIGH or LOW.\n"
+                "- Treat END_STATE_WINDOW_MOST_IMPORTANT as the strongest evidence. Weight the most recent visible stopping point more heavily than earlier milestones. Summarize where the session actually stopped, not just the biggest thing it completed earlier.\n"
+                "- A plain shell prompt, idle agent prompt, or sparse session with no explicit ask, blocker, failing check, approval request, or pending decision is low-signal and does not require attention.\n"
+                "- Treat implicit operator handoff as attention-worthy even if the agent did not ask explicitly. Examples: interrupted troubleshooting, work parked at a user prompt after a meaningful subtask, a likely next human decision, or a lane waiting for the user to resume control.\n"
+                "- If the session appears complete, deployed, idle, or awaiting new instruction, write ATTENTION REQUIRED as NO, PRIORITY as P3, USER ACTION REQUIRED as None, NEXT UNBLOCKING STEP as None, and PROPOSED NEXT STEPS as 'No immediate action.'\n"
+                "- Use ATTENTION REQUIRED as YES for visible blockers, pending user decisions, approval requests, failing verification, explicit errors, interrupted in-progress work with a clear next action, or implicit operator handoff at the end of the visible history.\n"
+                "- If the end state shows 'Conversation interrupted', a fresh user prompt, or unfinished troubleshooting after an earlier milestone, bias strongly toward ATTENTION REQUIRED YES unless the later lines clearly show that the interruption was resolved. Do not mark the session complete or no-action by default. Describe the parked stopping point instead.\n"
+                "- Use ATTENTION REQUIRED as UNCLEAR only when the history is too thin to tell; pair it with SIGNAL QUALITY LOW.\n"
+                "- WHY NOW must be one short sentence explaining why the user should or should not look at this now.\n"
+                "- USER ACTION REQUIRED must be either 'None' or the concrete action the user likely needs to take now, even when that action is implicit rather than explicitly requested in the log.\n"
+                "- NEXT UNBLOCKING STEP must be either 'None' or the single next step that would move the work forward from the actual stopping point.\n"
+                "- STATUS must describe the current stopping point, including interruption or parked-handoff states when visible.\n"
                 "- PROPOSED NEXT STEPS must be concrete and sequential.\n"
-                "- If the session appears complete, deployed, idle, or awaiting new instruction, write 'No immediate action.'\n"
                 "- USER INPUT NEEDED must be either 'None' or explicit decisions/questions the user needs to answer.\n"
                 "- Do not invent follow-up work that is not visible in the history.\n"
                 "- Prefer repo names, files, commits, commands, tests, URLs, and pending decisions.\n"
@@ -285,7 +310,7 @@ main() {
     local model="z-ai/glm-4.7"
     local provider="cerebras"
     local allow_fallbacks=1
-    local temperature="0.1"
+    local temperature="0.0"
     local max_completion_tokens=1200
     local api_url="${OPENROUTER_API_URL:-https://openrouter.ai/api/v1/chat/completions}"
     local -a requested=()
@@ -401,6 +426,7 @@ main() {
         printf 'config_path=%s\n' "$config_path"
         printf 'use_config=%s\n' "$use_config"
         printf 'api_url=%s\n' "$api_url"
+        printf 'brief_style=attention-first\n'
         printf 'model=%s\n' "$model"
         printf 'provider=%s\n' "$provider"
         printf 'allow_fallbacks=%s\n' "$allow_fallbacks"

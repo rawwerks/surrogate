@@ -873,7 +873,7 @@ Examples:
   surrogate brief --recent 15
   surrogate brief 15
   surrogate brief silly-pixel
-  surrogate who --cwd /home/raw/Documents/GitHub/surrogate --json
+  surrogate who --cwd ~/Documents/GitHub/surrogate --json
   surrogate type --message lively-otter "Please review the patch plan above."
   surrogate submit lazy-sheep
   surrogate type lazy-sheep "echo hello"
@@ -946,7 +946,7 @@ brief_usage() {
     cat <<'EOF'
 usage: surrogate brief [--recent N|2h] [--project NAME] [--cwd PATH] [--all] [brief-flags] [session...]
 
-Summarize sessions with one remote brief per session.
+Triage and summarize sessions with one remote brief per session.
 
 Selection rules:
   - If you pass explicit session names or aliases, those sessions are briefed.
@@ -1492,7 +1492,7 @@ cmd_list() {
     if [[ "$show_cwd" -eq 0 && "$json" -eq 0 ]]; then
         # Fast path: plain list stays cheap and delegates directly to zmx session names.
         while IFS= read -r session; do
-            printf "%-20s %s\n" "${_ALIAS_CACHE[$session]}" "$session"
+            printf "%-20s %s\n" "${_ALIAS_CACHE[$session]:-$(session_alias_single "$session")}" "$session"
         done < <(_session_names)
         return 0
     fi

@@ -132,13 +132,19 @@ if [[ -f "$RC_FILE" ]] && grep -qF "surrogate:zmx:begin" "$RC_FILE"; then
   if grep -q 'unset ZMX_SESSION\|set -e ZMX_SESSION' "$RC_FILE"; then
     pass "snippet unsets ZMX_SESSION before attach"
   else
-    fail "snippet missing 'unset ZMX_SESSION' — run: surrogate-shell-setup --uninstall && surrogate-shell-setup --install"
+    fail "snippet missing 'unset ZMX_SESSION' — run: surrogate-shell-setup --install"
   fi
 
   if grep -q 'ps -o comm= -p.*PPID\|ps -o comm= -p %self' "$RC_FILE"; then
     pass "snippet uses parent process check (not env var)"
   else
-    fail "snippet uses old env var check — run: surrogate-shell-setup --uninstall && surrogate-shell-setup --install"
+    fail "snippet uses old env var check — run: surrogate-shell-setup --install"
+  fi
+
+  if grep -q 'env -u ZMX_SESSION.*_surr_real_zmx' "$RC_FILE"; then
+    pass "snippet preserves manual zmx attach inside zmx"
+  else
+    fail "snippet missing nested zmx attach shim — run: surrogate-shell-setup --install"
   fi
 
   if grep -q 'ZMX_BIN:-.*/.local/bin/zmx' "$RC_FILE"; then

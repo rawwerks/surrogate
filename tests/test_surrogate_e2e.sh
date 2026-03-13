@@ -1258,15 +1258,16 @@ test_invariant_parent_check_not_env_var() {
   local snippet
   snippet=$("$setup_script" --show 2>&1)
 
-  local uses_ppid uses_env_check
+  local uses_ppid uses_env_wrap_check
   uses_ppid=$(echo "$snippet" | grep -c 'PPID\|%self' || true)
-  # Check for ZMX_SESSION used as the wrap/skip decision (not just the display)
-  uses_env_check=$(echo "$snippet" | grep -c 'if.*ZMX_SESSION\|test.*ZMX_SESSION' || true)
+  # Check for ZMX_SESSION used in the top-level wrap/skip gate.
+  # Display/alias lookup may still reference ZMX_SESSION later in the snippet.
+  uses_env_wrap_check=$(echo "$snippet" | grep -Ec 'SURROGATE_NO_ZMX.*ZMX_SESSION|ZMX_SESSION.*SURROGATE_NO_ZMX|\$-.*ZMX_SESSION|ZMX_SESSION.*\$-' || true)
 
-  if [[ "$uses_ppid" -ge 1 && "$uses_env_check" -eq 0 ]]; then
+  if [[ "$uses_ppid" -ge 1 && "$uses_env_wrap_check" -eq 0 ]]; then
     pass "${FUNCNAME[0]} — uses parent process check, not env var leak"
   else
-    echo "    uses_ppid=$uses_ppid uses_env_check=$uses_env_check"
+    echo "    uses_ppid=$uses_ppid uses_env_wrap_check=$uses_env_wrap_check"
     fail "${FUNCNAME[0]} — must check parent process, not ZMX_SESSION (leaks via WM)"
   fi
 }
@@ -1292,6 +1293,137 @@ test_invariant_unsets_zmx_session_before_attach() {
     echo "    snippet does not unset ZMX_SESSION before exec zmx attach"
     echo "    zmx attach will fail with CannotAttachToSessionInSession in leaked-env terminals"
     fail "${FUNCNAME[0]} — MUST unset ZMX_SESSION before exec (env var leaks via WM)"
+  fi
+}
+
+test_invariant_snippet_shims_nested_attach_all_shells() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+
+  local all_ok=true
+  for shell_name in bash zsh fish; do
+    local snippet
+    snippet=$(SHELL="/bin/$shell_name" "$setup_script" --show 2>&1)
+
+    if ! echo "$snippet" | grep -Eq 'function zmx|zmx\(\)'; then
+      echo "    missing zmx shim for shell: $shell_name"
+      all_ok=false
+    fi
+
+    if ! echo "$snippet" | grep -q 'env -u ZMX_SESSION'; then
+      echo "    missing clean-env attach wrapper for shell: $shell_name"
+      all_ok=false
+    fi
+  done
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]} — all shell snippets preserve manual nested zmx attach"
+  else
+    fail "${FUNCNAME[0]} — snippets must shim manual nested zmx attach in every shell"
+  fi
+}
+
+test_shell_setup_bash_attach_wrapper_clears_leaked_env() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script tmp_home tmpbin log_file snippet_file output
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  tmp_home="$(mktemp -d)"
+  tmpbin="$(mktemp -d)"
+  log_file="$(mktemp)"
+  snippet_file="$tmp_home/snippet.sh"
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\t%s\n' "${ZMX_SESSION-<unset>}" "$*" >> "$SURR_TEST_LOG"
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/ps" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'zmx\n'
+EOF
+  chmod +x "$tmpbin/ps"
+
+  cat > "$tmpbin/surrogate" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "alias" ]]; then
+  printf 'mock-alias\n'
+fi
+EOF
+  chmod +x "$tmpbin/surrogate"
+
+  "$setup_script" --show | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
+
+  output=$(
+    HOME="$tmp_home" \
+    PATH="$tmpbin:/usr/bin:/bin" \
+    ZMX_BIN="$tmpbin/zmx" \
+    SURROGATE_BIN="$tmpbin/surrogate" \
+    ZMX_SESSION="outer-shell" \
+    SURR_TEST_LOG="$log_file" \
+    bash --noprofile --norc -ic "source '$snippet_file'; zmx attach inner-shell; zmx list" 2>&1
+  )
+
+  if grep -Fq $'<unset>\tattach inner-shell' "$log_file" &&
+     grep -Fq $'outer-shell\tlist' "$log_file" &&
+     echo "$output" | grep -Fq 'surrogate: zmx session outer-shell alias mock-alias'; then
+    pass "${FUNCNAME[0]} — bash snippet clears leaked env only for nested attach"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    zmx log:"
+    sed 's/^/    /' "$log_file"
+    fail "${FUNCNAME[0]} — expected attach to run without leaked ZMX_SESSION while other zmx commands keep current session env"
+  fi
+}
+
+test_shell_setup_install_refreshes_existing_snippet() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script tmp_home rc_file output marker_count
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  tmp_home="$(mktemp -d)"
+  rc_file="$tmp_home/.bashrc"
+
+  cat > "$rc_file" <<'EOF'
+# surrogate:zmx:begin
+# old surrogate snippet
+if [[ $- == *i* ]]; then
+  echo "old"
+fi
+# surrogate:zmx:end
+
+export SURROGATE_USER_RC_MARKER=1
+EOF
+
+  output=$(
+    HOME="$tmp_home" \
+    SHELL="/bin/bash" \
+    "$setup_script" --install 2>&1
+  )
+  marker_count=$(grep -c '^# surrogate:zmx:begin$' "$rc_file" || true)
+
+  if echo "$output" | grep -Fq "Updated auto-zmx snippet at top of $rc_file" &&
+     [[ "$marker_count" -eq 1 ]] &&
+     grep -Fq 'env -u ZMX_SESSION "$_surr_real_zmx" "$@"' "$rc_file" &&
+     grep -Fq 'export SURROGATE_USER_RC_MARKER=1' "$rc_file"; then
+    pass "${FUNCNAME[0]} — --install refreshes the managed snippet in place"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    rc file:"
+    sed 's/^/    /' "$rc_file"
+    fail "${FUNCNAME[0]} — expected --install to refresh the managed snippet without duplicating markers or deleting user rc content"
   fi
 }
 
@@ -3958,6 +4090,7 @@ run_section design full \
   test_send_serializes_via_flock \
   test_type_serializes_via_flock \
   test_invariant_inherited_status_shows_alias \
+  test_shell_setup_bash_attach_wrapper_clears_leaked_env \
   test_invariant_surrogate_full_path_for_alias_lookup \
   test_list_fast_path_alias_fallback \
   test_brief_help_is_discoverable \
@@ -3999,6 +4132,8 @@ run_section invariants full \
   test_invariant_zmx_full_path \
   test_invariant_parent_check_not_env_var \
   test_invariant_unsets_zmx_session_before_attach \
+  test_invariant_snippet_shims_nested_attach_all_shells \
+  test_shell_setup_install_refreshes_existing_snippet \
   test_invariant_installed_matches_repo \
   test_install_replaces_dev_link_with_real_copy \
   test_release_helper_reinstalls_real_binaries

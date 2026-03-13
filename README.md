@@ -129,7 +129,9 @@ surrogate-shell-setup --install
 This prepends a small snippet to your shell rc file (`.bashrc`, `.zshrc`, or `config.fish`). It:
 - Wraps each new interactive shell in `zmx attach <unique-name>`
 - Won't double-wrap (checks parent process name via `$PPID`, not env vars which leak through window managers)
+- Keeps plain `zmx attach ...` working inside an already-wrapped shell by clearing leaked `ZMX_SESSION` only for nested attaches
 - Always prints a `surrogate:` status line, regardless of terminal app
+- Refreshes the managed rc block in place when you rerun `surrogate-shell-setup --install`
 - Can be opted out per-session with `SURROGATE_NO_ZMX=1`
 - Can be removed cleanly with `surrogate-shell-setup --uninstall`
 
@@ -470,6 +472,7 @@ These are enforced by automated tests and must hold for every change:
 | **Full path to zmx** | Snippet uses `$HOME/.local/bin/zmx`, not `command -v zmx` (PATH isn't set when rc files run) |
 | **Full path to surrogate** | Snippet uses `$HOME/.local/bin/surrogate` for inherited-session alias lookup, not `command -v surrogate`, and seeds a minimal `PATH` so lookup works before shell init finishes |
 | **Parent process check** | Double-wrap prevention checks parent process name (`ps -o comm= -p $PPID`), not `$ZMX_SESSION` env var (which leaks through window managers to all children) |
+| **Nested attach works** | The managed shell snippet shims `zmx attach` so manual attaches from inside zmx clear leaked `ZMX_SESSION` and still work |
 | **Deterministic aliases** | Every session gets a collision-free adjective-noun alias derived from its name via `cksum` — no state files, no config |
 | **Deterministic search** | `find`, `who`, `active`, `peek` use only rg/grep + zmx + tmux — no provider-specific parsing or ML |
 | **Input validation** | All numeric flags (`-n`, `-C`, `-t`) reject non-integer values before reaching internal commands |

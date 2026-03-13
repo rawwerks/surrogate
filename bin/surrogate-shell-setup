@@ -10,7 +10,7 @@ surrogate-shell-setup — install/manage auto-zmx for interactive terminals
 
 Usage:
   surrogate-shell-setup [--show]      Show the snippet for your shell (default)
-  surrogate-shell-setup --install     Append snippet to your shell rc file
+  surrogate-shell-setup --install     Install or refresh the managed snippet in your shell rc file
   surrogate-shell-setup --uninstall   Remove snippet from your shell rc file
   surrogate-shell-setup --check       Check if snippet is already installed
   surrogate-shell-setup --help        Show this help
@@ -51,6 +51,21 @@ if [[ -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]]; then
   _surr_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
   _surr_surrogate="${SURROGATE_BIN:-$HOME/.local/bin/surrogate}"
   if [[ -x "$_surr_zmx" ]]; then
+    zmx() {
+      local _surr_real_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
+      if [[ ! -x "$_surr_real_zmx" ]]; then
+        command zmx "$@"
+        return
+      fi
+      case "${1:-}" in
+        attach|a)
+          env -u ZMX_SESSION "$_surr_real_zmx" "$@"
+          ;;
+        *)
+          "$_surr_real_zmx" "$@"
+          ;;
+      esac
+    }
     _surr_parent="$(ps -o comm= -p $PPID 2>/dev/null)"
     if [[ "$_surr_parent" != "zmx" ]]; then
       _surr_name="$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
@@ -84,6 +99,22 @@ if not set -q SURROGATE_NO_ZMX; and status is-interactive
   set -l _surr_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
   set -l _surr_surrogate (set -q SURROGATE_BIN; and echo $SURROGATE_BIN; or echo $HOME/.local/bin/surrogate)
   if test -x "$_surr_zmx"
+    function zmx --description 'surrogate nested zmx attach shim'
+      set -l _surr_real_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
+      if not test -x "$_surr_real_zmx"
+        command zmx $argv
+        return $status
+      end
+      if test (count $argv) -ge 1
+        switch "$argv[1]"
+          case attach a
+            env -u ZMX_SESSION "$_surr_real_zmx" $argv
+            return $status
+        end
+      end
+      "$_surr_real_zmx" $argv
+      return $status
+    end
     set -l _surr_parent (ps -o comm= -p %self 2>/dev/null)
     if test "$_surr_parent" != "zmx"
       set -l _surr_name (date +'%Y-%m-%d_%H-%M-%S_%Z')"-$fish_pid"
@@ -116,6 +147,30 @@ is_installed() {
   [[ -f "$rc" ]] && grep -qF "$MARKER_BEGIN" "$rc"
 }
 
+current_managed_block() {
+  local rc="$1"
+  [[ -f "$rc" ]] || return 0
+  awk -v begin="$MARKER_BEGIN" -v end="$MARKER_END" '
+    $0 == begin { print; capture=1; next }
+    capture {
+      print
+      if ($0 == end) {
+        exit
+      }
+    }
+  ' "$rc"
+}
+
+render_without_managed_block() {
+  local rc="$1"
+  [[ -f "$rc" ]] || return 0
+  awk -v begin="$MARKER_BEGIN" -v end="$MARKER_END" '
+    $0 == begin { skip=1; next }
+    $0 == end   { skip=0; getline; if ($0 != "") print; next }
+    !skip       { print }
+  ' "$rc"
+}
+
 do_show() {
   local sh="$1"
   local rc
@@ -145,28 +200,36 @@ do_check() {
 do_install() {
   local sh="$1"
   local rc
+  local desired
+  local current=""
+  local action="Installed"
   rc="$(rc_file_for "$sh")"
-
-  if is_installed "$rc"; then
-    echo "Already installed in $rc — nothing to do."
-    return 0
-  fi
+  desired="$(snippet_for "$sh")"
 
   # Ensure rc file and parent dirs exist
   mkdir -p "$(dirname "$rc")"
   touch "$rc"
 
-  # Prepend snippet to rc file (it must run early, before other config)
+  if is_installed "$rc"; then
+    current="$(current_managed_block "$rc")"
+    if [[ "$current" == "$desired" ]]; then
+      echo "Already installed in $rc — nothing to do."
+      return 0
+    fi
+    action="Updated"
+  fi
+
+  # Prepend snippet to rc file (it must run early, before other config).
   local tmp
   tmp="$(mktemp)"
   {
-    snippet_for "$sh"
+    printf '%s\n' "$desired"
     echo ""
-    cat "$rc"
+    render_without_managed_block "$rc"
   } > "$tmp"
 
   mv "$tmp" "$rc"
-  echo "Installed auto-zmx snippet at top of $rc"
+  echo "$action auto-zmx snippet at top of $rc"
 }
 
 do_uninstall() {
@@ -182,12 +245,7 @@ do_uninstall() {
   local tmp
   tmp="$(mktemp)"
 
-  # Remove everything between markers (inclusive), plus one trailing blank line if present
-  awk -v begin="$MARKER_BEGIN" -v end="$MARKER_END" '
-    $0 == begin { skip=1; next }
-    $0 == end   { skip=0; getline; if ($0 != "") print; next }
-    !skip       { print }
-  ' "$rc" > "$tmp"
+  render_without_managed_block "$rc" > "$tmp"
 
   mv "$tmp" "$rc"
   echo "Removed auto-zmx snippet from $rc"

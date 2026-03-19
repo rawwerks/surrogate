@@ -617,6 +617,45 @@ test_bridge_creation() {
   fi
 }
 
+test_bridge_survives_zmx_session_env() {
+  # Regression: ensure_bridge must unset ZMX_SESSION before running zmx attach,
+  # otherwise the bridge dies immediately with CannotAttachToSessionInSession.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  # Ensure ZMX_SESSION is set (it should be — we're in a zmx session)
+  if [[ -z "${ZMX_SESSION:-}" ]]; then
+    pass "${FUNCNAME[0]} — skipped (not running inside zmx)"
+    return
+  fi
+
+  # Prune all bridges so we start clean
+  "$SURROGATE" prune-bridges --all 2>/dev/null || true
+
+  # Create bridge — this is the operation that used to fail
+  "$SURROGATE" bridge "$TEST_SESSION" 2>/dev/null
+
+  # Give bridge time to stabilize (zmx attach needs ~1s)
+  sleep 2
+
+  # Verify bridge is alive by checking surrogate status output
+  local status_out
+  status_out=$("$SURROGATE" status 2>&1 || true)
+
+  if echo "$status_out" | grep -q "$TEST_SESSION"; then
+    pass "${FUNCNAME[0]}"
+  else
+    # Also try direct tmux check with the known bridge naming pattern
+    local zmx_id
+    zmx_id=$(zmx list 2>/dev/null | awk -v s="$TEST_SESSION" '$0 ~ s {print $1; exit}')
+    if [[ -n "$zmx_id" ]] && tmux has-session -t "_surr_${zmx_id}" 2>/dev/null; then
+      pass "${FUNCNAME[0]}"
+    else
+      fail "${FUNCNAME[0]} — bridge died (ZMX_SESSION leak causes CannotAttachToSessionInSession)"
+    fi
+  fi
+}
+
 test_bridge_reuse() {
   # plumb:req-75e9957c
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -1689,6 +1728,7 @@ run_section core smoke \
   test_send_enter_key \
   test_submit_enters_staged_prompt \
   test_bridge_creation \
+  test_bridge_survives_zmx_session_env \
   test_bridge_reuse \
   test_wait_success \
   test_wait_timeout \

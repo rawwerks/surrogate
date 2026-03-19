@@ -1455,8 +1455,9 @@ ensure_bridge() {
         tmux kill-session -t "$bridge" 2>/dev/null || true
     fi
 
-    # Create bridge
-    tmux new-session -d -s "$bridge" "zmx attach $session"
+    # Create bridge — unset ZMX_SESSION so zmx attach doesn't reject
+    # with CannotAttachToSessionInSession when called from inside a zmx session
+    tmux new-session -d -s "$bridge" "unset ZMX_SESSION; zmx attach $session"
     sleep 1
 }
 

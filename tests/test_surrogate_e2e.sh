@@ -1097,6 +1097,21 @@ test_concurrent_serialization() {
   fi
 }
 
+test_type_rejects_misplaced_flags() {
+  # Regression: surrogate type <session> --message "text" silently typed "--message"
+  # as literal keystrokes into the target. Flags after positional args must be rejected.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local out
+  out=$("$SURROGATE" type "$TEST_SESSION" --message "some text" 2>&1 || true)
+  if echo "$out" | grep -q "flag.*must come before"; then
+    pass "${FUNCNAME[0]} — misplaced --message flag rejected"
+  else
+    fail "${FUNCNAME[0]} — misplaced --message was not rejected: $out"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Design Invariant Tests
 # These assert the core design requirements that must hold for ALL terminals,
@@ -1744,7 +1759,8 @@ run_section core smoke \
   test_cull_deprecated_alias_warns \
   test_cleanup_deprecated_alias_warns \
   test_status \
-  test_concurrent_serialization
+  test_concurrent_serialization \
+  test_type_rejects_misplaced_flags
 
 test_find() {
   # plumb:req-762ccafb

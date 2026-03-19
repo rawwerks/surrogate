@@ -1677,6 +1677,11 @@ cmd_type() {
     local session
     session="$(resolve_session "$requested_session")"
     local original_text="$2"
+
+    # Reject flags passed after positional args — they'd be typed literally
+    if [[ "$original_text" == --* ]]; then
+        die "flag '$original_text' must come before <session>; got: surrogate type $requested_session $original_text ..."
+    fi
     local text
     text="$(normalize_type_text "$original_text")"
     [[ -n "$text" ]] || die "type text must not be empty"

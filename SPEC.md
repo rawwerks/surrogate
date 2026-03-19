@@ -39,7 +39,7 @@ Surrogate safety has two layers:
 The following rules are part of surrogate itself and must apply even when DCG is absent:
 
 1. The `type` command must normalize embedded newlines to spaces and submit once. A successful `type` must mean the prompt was actually submitted to the target application, not merely staged in the input field.
-2. The `type` delivery path must include a configurable fixed submit pause with a sensible default so Enter lands reliably in agent TUIs without introducing heuristics.
+2. The `type` delivery path must include a configurable deterministic submit pause so Enter lands reliably in agent TUIs. The default may be an adaptive delay derived only from the submitted text length, and callers may override it with an explicit numeric seconds value.
 3. If `type` transport fails after staging text, surrogate must provide one obvious repair path that agents can invoke directly.
 4. The `send` command must reject dangerous control keys: `C-c`, `C-d`, and `C-z`.
 5. `type` in its default mode must stay shell-safe: if the target looks like a shell, surrogate must suppress the prose prefix so literal shell commands still work, and it must warn if the shell immediately reports obvious command errors.
@@ -131,7 +131,7 @@ The `send` command must accept a session name and one or more tmux send-keys arg
 
 ### type
 
-The `type` command must accept a session name and a text string. It must type the literal text followed by Enter. A successful `type` must correspond to an actual submission, not a staged-but-unentered prompt. The delivery path must remain deterministic and include any fixed submit pause needed to make Enter land reliably in agent TUIs. The submit pause must be configurable with a sensible default. If transport fails after the text may already be staged, the error must point to a single obvious recovery command. It must create a bridge lazily, update the watermark, and serialize via flock. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
+The `type` command must accept a session name and a text string. It must type the literal text followed by Enter. A successful `type` must correspond to an actual submission, not a staged-but-unentered prompt. The delivery path must remain deterministic and include any submit pause needed to make Enter land reliably in agent TUIs. The submit pause must be configurable with a sensible default. The default may be an adaptive delay derived only from text length, and callers may override it with a fixed numeric seconds value. If transport fails after the text may already be staged, the error must point to a single obvious recovery command. It must create a bridge lazily, update the watermark, and serialize via flock. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
 
 Default `type` must remain safe for shell targets:
 
@@ -259,6 +259,8 @@ A bridge is a tmux session named `_surr_<zmx-session>` that runs `zmx attach <se
 ## Input Validation
 
 All numeric flags (`-n`, `-C`, `-t`) must be validated as non-negative integers before being passed to internal commands like `tail` or `grep`. Invalid values must produce a clear error message (`'<value>' is not a valid number`) and exit 1. This prevents leaking internal tool errors (e.g., 76 `tail: invalid number` messages) to the user.
+
+`SURROGATE_TYPE_ENTER_DELAY_SECS` is a special validated setting rather than a CLI flag. It must accept either the literal sentinel `adaptive` or a non-negative numeric seconds value. Any other value must be rejected before reaching `sleep`.
 
 The `--recent` flag on `who` must accept either a non-negative integer count or a duration in `Ns`, `Nm`, `Nh`, or `Nd` form. Invalid values must produce a clear error message.
 

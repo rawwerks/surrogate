@@ -344,11 +344,14 @@ surrogate type --message <session> "Long conversational prompt..."
 
 `--message` requires an agent-like target and refuses shell or unknown contexts. Use it when you want safer long-form prose delivery into a coding-agent TUI.
 
-The submit pause is configurable:
+The submit pause is configurable. By default it is `adaptive`, which scales with text length (`0.1s + 0.001s/char`, capped at `2.0s`). You can still force a fixed delay when needed:
 
 ```bash
+SURROGATE_TYPE_ENTER_DELAY_SECS=adaptive surrogate type my-session "hello"
 SURROGATE_TYPE_ENTER_DELAY_SECS=0.02 surrogate type my-session "hello"
 ```
+
+`SURROGATE_TYPE_ENTER_DELAY_SECS` accepts only `adaptive` or a numeric seconds value.
 
 If a prompt is visibly staged and just needs the missing Enter, the obvious repair path is:
 

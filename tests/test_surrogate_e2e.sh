@@ -3558,9 +3558,9 @@ EOF
   if [[ "$(wc -l < "$tmux_log")" -eq 2 ]] &&
      grep -Fq 'send-keys -t _surr_test-surrogate-mock -l hello from test' "$tmux_log" &&
      grep -Fq 'send-keys -t _surr_test-surrogate-mock Enter' "$tmux_log" &&
-     grep -Fxq '0.02' "$sleep_log" &&
+     grep -Fxq '0.12' "$sleep_log" &&
      grep -q '"decision":"allow"' "$audit_file"; then
-    pass "${FUNCNAME[0]} — type waits before Enter so TUI-like targets accept submission"
+    pass "${FUNCNAME[0]} — type uses adaptive delay before Enter so TUI-like targets accept submission"
   else
     echo "    surrogate output:"
     echo "$output" | sed 's/^/    /'
@@ -3570,7 +3570,7 @@ EOF
     sed 's/^/    /' "$sleep_log" 2>/dev/null || true
     echo "    audit log:"
     sed 's/^/    /' "$audit_file" 2>/dev/null || true
-    fail "${FUNCNAME[0]} — expected text send, fixed submit pause, Enter, and allow audit"
+    fail "${FUNCNAME[0]} — expected text send, adaptive submit pause, Enter, and allow audit"
   fi
 }
 
@@ -3663,22 +3663,126 @@ EOF
   fi
 }
 
-test_type_implementation_uses_fixed_submit_pause() {
+test_type_implementation_uses_adaptive_or_fixed_submit_pause() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
   local cmd_type_block
   cmd_type_block="$(sed -n '/^cmd_type()/,/^cmd_[a-z_].*()/p' "$SURROGATE")"
 
-  if grep -Fq 'SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-0.02}"' "$SURROGATE" &&
-     printf '%s\n' "$cmd_type_block" | grep -Fq 'tmux send-keys -t "$bridge" -l "$text"' &&
-     printf '%s\n' "$cmd_type_block" | grep -Fq 'sleep "$SURROGATE_TYPE_ENTER_DELAY_SECS"' &&
+  if grep -Fq 'SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-adaptive}"' "$SURROGATE" &&
+     grep -Fq 'require_enter_delay_setting()' "$SURROGATE" &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'require_enter_delay_setting "$SURROGATE_TYPE_ENTER_DELAY_SECS"' &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'enter_delay="$(compute_enter_delay "${#text}")"' &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'sleep "$enter_delay"' &&
      printf '%s\n' "$cmd_type_block" | grep -Fq 'tmux send-keys -t "$bridge" Enter'; then
-    pass "${FUNCNAME[0]} — cmd_type uses deterministic fixed submit pause before Enter"
+    pass "${FUNCNAME[0]} — cmd_type uses adaptive default delay with validated fixed override support"
   else
     echo "    cmd_type block:"
     printf '%s\n' "$cmd_type_block" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — cmd_type must keep the fixed submit pause delivery path"
+    fail "${FUNCNAME[0]} — cmd_type must validate adaptive|seconds and sleep for the computed delay"
+  fi
+}
+
+test_type_honors_fixed_enter_delay_override() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmpbin audit_file tmux_log sleep_log sleep_marker output
+  tmpbin="$(mktemp -d)"
+  audit_file="$(mktemp)"
+  tmux_log="$(mktemp)"
+  sleep_log="$(mktemp)"
+  sleep_marker="$(mktemp)"
+  rm -f "$sleep_marker"
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  list)
+    printf 'session_name=test-surrogate-mock\tattached=true\tcreated_at=0\n'
+    ;;
+  history)
+    printf 'line one\nline two\n'
+    ;;
+  attach)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/tmux" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+log_file="$tmux_log"
+sleep_marker="$sleep_marker"
+case "\${1:-}" in
+  has-session)
+    exit 1
+    ;;
+  new-session)
+    exit 0
+    ;;
+  display-message)
+    printf 'zmx\n'
+    exit 0
+    ;;
+  send-keys)
+    printf '%s\n' "\$*" >> "\$log_file"
+    if [[ "\$*" == *" -l "* ]]; then
+      rm -f "\$sleep_marker"
+      exit 0
+    fi
+    if [[ "\$*" == *" Enter" ]]; then
+      [[ -f "\$sleep_marker" ]] || exit 1
+      exit 0
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/tmux"
+
+  cat > "$tmpbin/sleep" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\${1:-}" >> "$sleep_log"
+touch "$sleep_marker"
+EOF
+  chmod +x "$tmpbin/sleep"
+
+  output=$(
+    PATH="$tmpbin:/usr/bin:/bin" \
+    SURROGATE_AUDIT_FILE="$audit_file" \
+    SURROGATE_LABEL=off \
+    SURROGATE_TYPE_ENTER_DELAY_SECS=0.5 \
+    "$SURROGATE" type test-surrogate-mock "hello from test" 2>&1 || true
+  )
+
+  if [[ "$(wc -l < "$tmux_log")" -eq 2 ]] &&
+     grep -Fq 'send-keys -t _surr_test-surrogate-mock -l hello from test' "$tmux_log" &&
+     grep -Fq 'send-keys -t _surr_test-surrogate-mock Enter' "$tmux_log" &&
+     grep -Fxq '0.5' "$sleep_log" &&
+     grep -q '"decision":"allow"' "$audit_file"; then
+    pass "${FUNCNAME[0]} — fixed numeric enter delay override is honored"
+  else
+    echo "    surrogate output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    tmux log:"
+    sed 's/^/    /' "$tmux_log" 2>/dev/null || true
+    echo "    sleep log:"
+    sed 's/^/    /' "$sleep_log" 2>/dev/null || true
+    echo "    audit log:"
+    sed 's/^/    /' "$audit_file" 2>/dev/null || true
+    fail "${FUNCNAME[0]} — expected fixed numeric override to control the submit pause"
   fi
 }
 
@@ -3686,15 +3790,60 @@ test_type_rejects_invalid_enter_delay_config() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local output
-  output=$(SURROGATE_TYPE_ENTER_DELAY_SECS=banana "$SURROGATE" type "$TEST_SESSION" "echo nope" 2>&1 || true)
+  local tmpbin sleep_log bogus_output negative_output
+  tmpbin="$(mktemp -d)"
+  sleep_log="$(mktemp)"
 
-  if echo "$output" | grep -Fq "is not a valid seconds value"; then
-    pass "${FUNCNAME[0]} — invalid enter delay config rejected"
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  list)
+    printf 'session_name=test-surrogate-mock\tattached=true\tcreated_at=0\n'
+    ;;
+  history)
+    printf 'line one\nline two\n'
+    ;;
+  attach)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/tmux" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+EOF
+  chmod +x "$tmpbin/tmux"
+
+  cat > "$tmpbin/sleep" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\${1:-}" >> "$sleep_log"
+exit 99
+EOF
+  chmod +x "$tmpbin/sleep"
+
+  bogus_output=$(PATH="$tmpbin:/usr/bin:/bin" SURROGATE_TYPE_ENTER_DELAY_SECS=bogus "$SURROGATE" type test-surrogate-mock "echo nope" 2>&1 || true)
+  negative_output=$(PATH="$tmpbin:/usr/bin:/bin" SURROGATE_TYPE_ENTER_DELAY_SECS=-1 "$SURROGATE" type test-surrogate-mock "echo nope" 2>&1 || true)
+
+  if echo "$bogus_output" | grep -Fq "is not a valid seconds value" &&
+     echo "$negative_output" | grep -Fq "is not a valid seconds value" &&
+     [[ ! -s "$sleep_log" ]]; then
+    pass "${FUNCNAME[0]} — invalid enter delay config rejects non-adaptive and negative values before sleep"
   else
-    echo "    output:"
-    echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — invalid enter delay config not rejected"
+    echo "    bogus output:"
+    echo "$bogus_output" | sed 's/^/    /'
+    echo "    negative output:"
+    echo "$negative_output" | sed 's/^/    /'
+    echo "    sleep log:"
+    sed 's/^/    /' "$sleep_log" 2>/dev/null || true
+    fail "${FUNCNAME[0]} — invalid enter delay config not rejected before sleep"
   fi
 }
 
@@ -4136,7 +4285,8 @@ run_section design full \
   test_audit_logs_blocked_send \
   test_type_waits_before_enter_for_tui_like_targets \
   test_type_no_allow_audit_if_enter_fails_after_text_send \
-  test_type_implementation_uses_fixed_submit_pause \
+  test_type_implementation_uses_adaptive_or_fixed_submit_pause \
+  test_type_honors_fixed_enter_delay_override \
   test_type_rejects_invalid_enter_delay_config \
   test_type_warns_on_immediate_shell_error \
   test_type_no_shell_warning_on_success \

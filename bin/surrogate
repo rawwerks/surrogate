@@ -8,7 +8,7 @@ BRIDGE_PREFIX="_surr_"
 ALIAS_FILE="${SURROGATE_TMP}/surrogate-aliases"
 AUDIT_FILE="${SURROGATE_AUDIT_FILE:-${SURROGATE_TMP}/surrogate-audit.jsonl}"
 SURROGATE_LABEL="${SURROGATE_LABEL:-on}"  # on | off | verbose
-SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-0.02}"
+SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-adaptive}"
 SURROGATE_TYPE_POSTCHECK_SECS="${SURROGATE_TYPE_POSTCHECK_SECS:-0.15}"
 
 # --- helpers (needed early) ---
@@ -25,8 +25,30 @@ require_seconds() {
     [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "'$1' is not a valid seconds value"
 }
 
+require_enter_delay_setting() {
+    [[ "$1" == "adaptive" ]] && return 0
+    require_seconds "$1"
+}
+
 require_hours() {
     [[ "$1" =~ ^[0-9]+$ ]] || die "'$1' is not a valid hour count"
+}
+
+compute_enter_delay() {
+    # Compute the delay between pasting text and pressing Enter.
+    # "adaptive" (default): scales with text length so long pastes land reliably.
+    # Any numeric value: used as-is (fixed delay in seconds).
+    local text_len="$1"
+    local setting="$SURROGATE_TYPE_ENTER_DELAY_SECS"
+    if [[ "$setting" != "adaptive" ]]; then
+        echo "$setting"
+        return
+    fi
+    # Base 0.1s + 0.001s per character, capped at 2s.
+    # Short text (< 100 chars): ~0.1-0.2s
+    # Medium text (500 chars):  ~0.6s
+    # Long text (1000+ chars):  ~1.1-2.0s
+    LC_ALL=C awk "BEGIN { d = 0.1 + $text_len * 0.001; if (d > 2.0) d = 2.0; printf \"%.2f\", d }"
 }
 
 check_deps() {
@@ -847,7 +869,9 @@ Environment:
   SURROGATE_LABEL=verbose  Include process name, cwd, PID in prefix
   SURROGATE_AUDIT_FILE     Audit log path (default: /tmp/surrogate-audit.jsonl)
   SURROGATE_TYPE_ENTER_DELAY_SECS
-                          Fixed pause before Enter in `type` (default: 0.02)
+                          Pause before Enter in `type` (default: adaptive).
+                          "adaptive" scales with text length (0.1s base + 0.001s/char, max 2s).
+                          Set to a number (e.g. 0.5) for a fixed delay.
   SURROGATE_TYPE_POSTCHECK_SECS
                           Fixed pause before shell failure warning check (default: 0.15)
 
@@ -1683,7 +1707,7 @@ cmd_type() {
     local text
     text="$(normalize_type_text "$original_text")"
     [[ -n "$text" ]] || die "type text must not be empty"
-    require_seconds "$SURROGATE_TYPE_ENTER_DELAY_SECS"
+    require_enter_delay_setting "$SURROGATE_TYPE_ENTER_DELAY_SECS"
     require_seconds "$SURROGATE_TYPE_POSTCHECK_SECS"
 
     local history ui_hint
@@ -1726,10 +1750,13 @@ cmd_type() {
     local lock
     lock="$(lock_file "$session")"
 
+    local enter_delay
+    enter_delay="$(compute_enter_delay "${#text}")"
+
     if ! (
         flock 9
         tmux send-keys -t "$bridge" -l "$text"
-        sleep "$SURROGATE_TYPE_ENTER_DELAY_SECS"
+        sleep "$enter_delay"
         tmux send-keys -t "$bridge" Enter
     ) 9>"$lock"; then
         die "type delivery failed; if the text is already staged, run: surrogate submit $requested_session"

@@ -164,7 +164,7 @@ surrogate type --message <session> "Please review the patch plan above."
 
 `--message` is safer than plain `type` for prose because it requires an `agent` ui_hint and refuses `shell` or `unknown` targets.
 
-If the target TUI needs a slightly different cadence, `type` uses a fixed submit pause that can be configured via `SURROGATE_TYPE_ENTER_DELAY_SECS`.
+If the target TUI needs a slightly different cadence, `type` uses an adaptive submit pause by default (`0.1s + 0.001s/char`, capped at `2.0s`). You can override it with `SURROGATE_TYPE_ENTER_DELAY_SECS`, which accepts only `adaptive` or a numeric seconds value.
 
 If text is visibly staged and only the missing Enter is needed, use:
 

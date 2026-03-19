@@ -1664,24 +1664,22 @@ _surrogate_prefix() {
 cmd_type() {
     check_deps
     local message_mode=0
+    # Extract --message and --help from any position among the args
+    local positional=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) type_usage; return 0 ;;
             --message) message_mode=1; shift ;;
-            *) break ;;
+            *) positional+=("$1"); shift ;;
         esac
     done
+    set -- "${positional[@]}"
 
     [[ $# -ge 2 ]] || die "usage: surrogate type [--message] <session> <text>"
     local requested_session="$1"
     local session
     session="$(resolve_session "$requested_session")"
     local original_text="$2"
-
-    # Reject flags passed after positional args — they'd be typed literally
-    if [[ "$original_text" == --* ]]; then
-        die "flag '$original_text' must come before <session>; got: surrogate type $requested_session $original_text ..."
-    fi
     local text
     text="$(normalize_type_text "$original_text")"
     [[ -n "$text" ]] || die "type text must not be empty"

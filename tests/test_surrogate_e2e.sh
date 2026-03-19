@@ -1097,18 +1097,33 @@ test_concurrent_serialization() {
   fi
 }
 
-test_type_rejects_misplaced_flags() {
-  # Regression: surrogate type <session> --message "text" silently typed "--message"
-  # as literal keystrokes into the target. Flags after positional args must be rejected.
+test_type_accepts_message_flag_any_position() {
+  # Agents naturally put --message after the session name. Both orderings must
+  # be parsed as flags (not typed literally). The test session is a shell so
+  # --message will be rejected by the agent-target guard — but the error must
+  # be about ui_hint, NOT about flag ordering. That proves the flag was parsed.
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local out
-  out=$("$SURROGATE" type "$TEST_SESSION" --message "some text" 2>&1 || true)
-  if echo "$out" | grep -q "flag.*must come before"; then
-    pass "${FUNCNAME[0]} — misplaced --message flag rejected"
+  # --message before session (canonical order)
+  local out_before
+  out_before=$("$SURROGATE" type --message "$TEST_SESSION" "flag_before_$$" 2>&1 || true)
+
+  # --message after session (desire path — agents do this)
+  local out_after
+  out_after=$("$SURROGATE" type "$TEST_SESSION" --message "flag_after_$$" 2>&1 || true)
+
+  # Both must hit the ui_hint guard (proving --message was parsed as a flag)
+  local ok_before=0 ok_after=0
+  echo "$out_before" | grep -q "ui_hint" && ok_before=1
+  echo "$out_after"  | grep -q "ui_hint" && ok_after=1
+
+  if [[ "$ok_before" -eq 1 && "$ok_after" -eq 1 ]]; then
+    pass "${FUNCNAME[0]} — --message parsed as flag in both positions"
   else
-    fail "${FUNCNAME[0]} — misplaced --message was not rejected: $out"
+    echo "    before: ok=$ok_before output=$out_before"
+    echo "    after:  ok=$ok_after output=$out_after"
+    fail "${FUNCNAME[0]} — --message not parsed as flag in one or both positions"
   fi
 }
 
@@ -1760,7 +1775,7 @@ run_section core smoke \
   test_cleanup_deprecated_alias_warns \
   test_status \
   test_concurrent_serialization \
-  test_type_rejects_misplaced_flags
+  test_type_accepts_message_flag_any_position
 
 test_find() {
   # plumb:req-762ccafb

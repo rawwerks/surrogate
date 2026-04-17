@@ -1,0 +1,13 @@
+# Example shell integration config for surrogate-shell-setup.
+#
+# Public-safe example: only wrap a few well-known agent commands in zmx.
+#
+# Use one of these workflows:
+#   1. Copy to ~/.config/surrogate/shell.conf and run:
+#        surrogate-shell-setup --install
+#   2. Keep a private repo-local config at ./surrogate-shell.conf (gitignored)
+#      and run:
+#        surrogate-shell-setup --install --config "$PWD/surrogate-shell.conf"
+
+SURROGATE_ZMX_MODE="commands"
+SURROGATE_ZMX_COMMANDS="claude pi codex"

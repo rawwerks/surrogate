@@ -23,6 +23,7 @@ Current built-in guardrails:
 - `surrogate type`, `surrogate send`, and `surrogate submit` reject self-targeting and tell you the current alias/session
 - `surrogate prune-sessions` rejects the current live session and any attached session with clients still present
 - `surrogate send` rejects `C-c`, `C-d`, and `C-z`
+- `surrogate send` rejects prose (arguments with spaces or >40 chars) — use `surrogate type` for messages, which adds the `[SURROGATE]` label deterministically
 - there is no global guard-disable mode
 - there is no persistent unsafe mode
 
@@ -44,14 +45,22 @@ surrogate alias 2026-03-08_20-44-12_EDT-539343    # → shiny-dolphin
 
 ## Quick Reference
 
+### Start here: get full context
+
+```bash
+surrogate prime
+# Identity, all sessions with cwd-derived project + usage hints
+surrogate prime --json
+# Machine-readable version
+```
+
 ### Discover sessions
 
 ```bash
-surrogate help list
 surrogate list
-# Fast alias + full session name for every session
-surrogate list --cwd
-# Adds repo, cwd, and ui_hint (shell/agent/unknown)
+# All sessions with project, UI hint, and cwd columns
+surrogate list --bare
+# Minimal: alias + session name only
 surrogate list --json
 # Machine-readable repo/cwd/ui metadata
 ```
@@ -178,7 +187,7 @@ surrogate submit my-session
 surrogate send <session> <keys...>
 ```
 
-Use `send` for low-risk key events like `Enter`, `Escape`, arrows, and text literals. Do not rely on surrogate for `C-c`, `C-d`, or `C-z` — those are intentionally blocked.
+Use `send` only for tmux key names like `Enter`, `Escape`, arrows, and short text literals. Never use `send` for messages — it rejects prose (spaces or >40 chars) and has no `[SURROGATE]` label. Use `surrogate type` for all messages. `C-c`, `C-d`, and `C-z` are intentionally blocked.
 
 ### Read recent output
 
@@ -303,16 +312,29 @@ Since `surrogate send` passes through to tmux send-keys:
 
 ## Setup
 
-For users who want ALL new terminals to automatically be zmx sessions (enabling surrogate for everything):
+`surrogate-shell-setup` supports two shell-integration modes:
+
+- `all` — wrap every new interactive shell in zmx
+- `commands` — leave plain shells alone and wrap only configured commands such as `claude`, `pi`, or `codex`
+
+Recommended for agent-heavy desktops:
 
 ```bash
+cp surrogate-shell.conf.example ~/.config/surrogate/shell.conf
 surrogate-shell-setup --install
 ```
 
-This prepends a snippet to the shell rc file that:
-- Wraps new interactive shells in `zmx attach <unique-name>`
+That example config uses `commands` mode, so only the listed commands get zmx sessions. The snippet also clears leaked `ZMX_SESSION` when the current shell is not actually running under a zmx parent; otherwise command wrappers would silently fail to wrap.
+
+If you really want every new terminal wrapped, use:
+
+```bash
+surrogate-shell-setup --install --mode all
+```
+
+In both modes the snippet:
 - Won't double-wrap (checks parent process name via `$PPID`, not env vars)
-- Always prints a `surrogate:` status line regardless of terminal app
+- Keeps plain `zmx attach ...` working by clearing leaked `ZMX_SESSION` only for nested attaches
 - Supports bash, zsh, and fish
 
 ## Dependencies

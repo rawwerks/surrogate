@@ -3,22 +3,46 @@ set -euo pipefail
 
 MARKER_BEGIN="# surrogate:zmx:begin"
 MARKER_END="# surrogate:zmx:end"
+DEFAULT_MODE="all"
+DEFAULT_CONFIG_PATH="${HOME:-}/.config/surrogate/shell.conf"
 
 usage() {
   cat <<'EOF'
-surrogate-shell-setup — install/manage auto-zmx for interactive terminals
+surrogate-shell-setup — install/manage zmx shell integration
 
 Usage:
-  surrogate-shell-setup [--show]      Show the snippet for your shell (default)
-  surrogate-shell-setup --install     Install or refresh the managed snippet in your shell rc file
-  surrogate-shell-setup --uninstall   Remove snippet from your shell rc file
-  surrogate-shell-setup --check       Check if snippet is already installed
-  surrogate-shell-setup --help        Show this help
+  surrogate-shell-setup [--show] [--mode MODE] [--commands LIST] [--config PATH]
+      Show the snippet for your shell (default)
+  surrogate-shell-setup --install [--mode MODE] [--commands LIST] [--config PATH]
+      Install or refresh the managed snippet in your shell rc file
+  surrogate-shell-setup --uninstall
+      Remove snippet from your shell rc file
+  surrogate-shell-setup --check
+      Check if snippet is already installed
+  surrogate-shell-setup --help
+      Show this help
+
+Modes:
+  all       Wrap every new interactive shell in zmx (legacy/default behavior)
+  commands  Leave plain shells alone; wrap only configured commands in zmx
+
+Options:
+  --mode MODE       Override shell integration mode (all|commands)
+  --commands LIST   Command allowlist for commands mode (comma or space separated)
+  --config PATH     Load settings from a shell config file
 
 Environment:
-  SURROGATE_NO_ZMX=1   Set in any session to skip auto-zmx
-  ZMX_SESSION           Set automatically by zmx (prevents double-wrapping)
+  SURROGATE_NO_ZMX=1         Disable wrapping for the current shell session
+  SURROGATE_SHELL_CONFIG     Default config path when --config is not passed
+  SURROGATE_ZMX_MODE         Mode override (all|commands)
+  SURROGATE_ZMX_COMMANDS     Command allowlist override for commands mode
+  ZMX_SESSION                Set automatically by zmx (prevents double-wrapping)
 EOF
+}
+
+die() {
+  echo "surrogate-shell-setup: error: $*" >&2
+  exit 1
 }
 
 detect_shell() {
@@ -26,7 +50,7 @@ detect_shell() {
   sh="$(basename "${SHELL:-/bin/bash}")"
   case "$sh" in
     bash|zsh|fish) echo "$sh" ;;
-    *) echo "bash" ;;  # fallback
+    *) echo "bash" ;;
   esac
 }
 
@@ -38,43 +62,226 @@ rc_file_for() {
   esac
 }
 
-snippet_for() {
+validate_mode() {
   case "$1" in
-    bash|zsh)
-      cat <<'SNIPPET'
-# surrogate:zmx:begin
-# surrogate: auto-zmx for all interactive terminals
-# Uses full path to zmx — this runs before PATH is configured in .bashrc.
-# Checks parent process to avoid double-wrapping (env var leaks to children).
-# INVARIANT: Always prints "surrogate:" status line, regardless of terminal app.
-if [[ -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]]; then
-  _surr_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
-  _surr_surrogate="${SURROGATE_BIN:-$HOME/.local/bin/surrogate}"
-  if [[ -x "$_surr_zmx" ]]; then
-    zmx() {
-      local _surr_real_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
-      if [[ ! -x "$_surr_real_zmx" ]]; then
-        command zmx "$@"
-        return
-      fi
-      case "${1:-}" in
-        attach|a)
-          env -u ZMX_SESSION "$_surr_real_zmx" "$@"
-          ;;
-        *)
-          "$_surr_real_zmx" "$@"
-          ;;
-      esac
-    }
-    _surr_parent="$(ps -o comm= -p $PPID 2>/dev/null)"
-    if [[ "$_surr_parent" != "zmx" ]]; then
-      _surr_name="$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
-      echo "surrogate: wrapping in zmx session $_surr_name"
-      unset ZMX_SESSION
-      exec "$_surr_zmx" attach "$_surr_name"
+    all|commands) ;;
+    *) die "invalid mode '$1' (expected: all or commands)" ;;
+  esac
+}
+
+validate_command_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || die "invalid command name '$1' in allowlist"
+}
+
+normalize_commands() {
+  local raw="$1"
+  local normalized=""
+  local token
+  local -a tokens=()
+  local -A seen=()
+
+  raw="${raw//$'\n'/ }"
+  raw="${raw//,/ }"
+  read -r -a tokens <<< "$raw"
+
+  for token in "${tokens[@]}"; do
+    [[ -n "$token" ]] || continue
+    validate_command_name "$token"
+    [[ -n "${seen[$token]:-}" ]] && continue
+    seen["$token"]=1
+    if [[ -n "$normalized" ]]; then
+      normalized+=" "
+    fi
+    normalized+="$token"
+  done
+
+  printf '%s' "$normalized"
+}
+
+resolve_config_path() {
+  local explicit_path="$1"
+
+  if [[ -n "$explicit_path" ]]; then
+    printf '%s' "$explicit_path"
+    return 0
+  fi
+
+  if [[ -n "${SURROGATE_SHELL_CONFIG:-}" ]]; then
+    printf '%s' "$SURROGATE_SHELL_CONFIG"
+    return 0
+  fi
+
+  if [[ -f "$DEFAULT_CONFIG_PATH" ]]; then
+    printf '%s' "$DEFAULT_CONFIG_PATH"
+    return 0
+  fi
+
+  printf '%s' ""
+}
+
+load_config_values() {
+  local path="$1"
+  [[ -n "$path" ]] || return 0
+  [[ -f "$path" ]] || die "config file not found: $path"
+
+  local -a cfg_lines=()
+  if ! mapfile -t cfg_lines < <(
+    env -i HOME="$HOME" USER="${USER:-}" bash -c '
+      set -euo pipefail
+      source "$1"
+      printf "%s\n" "${SURROGATE_ZMX_MODE-}"
+      printf "%s\n" "${SURROGATE_ZMX_COMMANDS-}"
+    ' bash "$path"
+  ); then
+    die "failed to read config file: $path"
+  fi
+
+  printf '%s\n%s' "${cfg_lines[0]:-}" "${cfg_lines[1]:-}"
+}
+
+RESOLVED_MODE="$DEFAULT_MODE"
+RESOLVED_COMMANDS=""
+ACTIVE_CONFIG_PATH=""
+
+resolve_settings() {
+  local explicit_config="$1"
+  local cli_mode="$2"
+  local cli_commands="$3"
+  local -a cfg_values=()
+
+  RESOLVED_MODE="$DEFAULT_MODE"
+  RESOLVED_COMMANDS=""
+  ACTIVE_CONFIG_PATH="$(resolve_config_path "$explicit_config")"
+
+  if [[ -n "$ACTIVE_CONFIG_PATH" ]]; then
+    mapfile -t cfg_values < <(load_config_values "$ACTIVE_CONFIG_PATH")
+    [[ -n "${cfg_values[0]:-}" ]] && RESOLVED_MODE="${cfg_values[0]}"
+    [[ -n "${cfg_values[1]:-}" ]] && RESOLVED_COMMANDS="${cfg_values[1]}"
+  fi
+
+  [[ -n "${SURROGATE_ZMX_MODE:-}" ]] && RESOLVED_MODE="$SURROGATE_ZMX_MODE"
+  [[ -n "${SURROGATE_ZMX_COMMANDS:-}" ]] && RESOLVED_COMMANDS="$SURROGATE_ZMX_COMMANDS"
+  [[ -n "$cli_mode" ]] && RESOLVED_MODE="$cli_mode"
+  [[ -n "$cli_commands" ]] && RESOLVED_COMMANDS="$cli_commands"
+
+  validate_mode "$RESOLVED_MODE"
+  RESOLVED_COMMANDS="$(normalize_commands "$RESOLVED_COMMANDS")"
+
+  if [[ "$RESOLVED_MODE" == "commands" && -z "$RESOLVED_COMMANDS" ]]; then
+    die "commands mode requires at least one command"
+  fi
+}
+
+bash_like_wrappers() {
+  local commands="$1"
+  local cmd
+  for cmd in $commands; do
+    printf '    %s() { _surr_wrap_command %s "$@"; }\n' "$cmd" "$cmd"
+  done
+}
+
+bash_like_unaliases() {
+  # Emit top-level `unalias <cmd>` statements that execute BEFORE the
+  # wrapper `if` block is parsed. Bash parses a compound command (like
+  # an if block) as a unit and alias-expands inside it at parse time, so
+  # a runtime `unalias` inside the block fires too late: if the rc file
+  # earlier did `alias foo="bar ..."` for one of our wrapped commands,
+  # the function NAME `foo` in `foo() { ... }` would be alias-expanded during the
+  # block parse and cause a syntax error. Doing the unaliases as
+  # top-level statements first means they execute before the block is
+  # read, so the function definitions inside the block parse cleanly.
+  local commands="$1"
+  local cmd
+  for cmd in $commands; do
+    printf 'unalias %s 2>/dev/null || true\n' "$cmd"
+  done
+}
+
+fish_wrappers() {
+  local commands="$1"
+  local cmd
+  for cmd in $commands; do
+    printf "    function %s --wraps %s --description 'surrogate zmx wrapper for %s'\n" "$cmd" "$cmd" "$cmd"
+    printf '      _surr_wrap_command %s $argv\n' "$cmd"
+    printf '    end\n'
+  done
+}
+
+snippet_for_bash_like() {
+  local mode="$1"
+  local commands="$2"
+  local commands_comment="${commands:-<none>}"
+
+  printf '%s\n' \
+    "$MARKER_BEGIN" \
+    '# surrogate: zmx integration for interactive terminals' \
+    "# Mode: $mode" \
+    "# Commands: $commands_comment" \
+    '# Uses full path to zmx — this runs before PATH is configured in .bashrc.' \
+    '# Checks parent process to avoid double-wrapping (env var leaks to children).' \
+    '# INVARIANT: commands mode is silent at startup; all mode prints on wrap and inherited-session paths.'
+
+  if [[ "$mode" == "commands" ]]; then
+    bash_like_unaliases "$commands"
+  fi
+
+  cat <<'EOF'
+if [[ $- == *i* ]]; then
+  zmx() {
+    local _surr_real_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
+    if [[ ! -x "$_surr_real_zmx" ]]; then
+      command zmx "$@"
+      return
+    fi
+    case "${1:-}" in
+      attach|a)
+        env -u ZMX_SESSION "$_surr_real_zmx" "$@"
+        ;;
+      *)
+        "$_surr_real_zmx" "$@"
+        ;;
+    esac
+  }
+
+  _surr_parent_name() {
+    ps -o comm= -p "$PPID" 2>/dev/null || true
+  }
+
+  _surr_print_status() {
+    local _surr_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
+    local _surr_surrogate="${SURROGATE_BIN:-$HOME/.local/bin/surrogate}"
+    local _surr_alias=""
+    local _surr_path="$(dirname "$_surr_surrogate"):$(dirname "$_surr_zmx"):${PATH:-/usr/bin:/bin}"
+    if [[ -n "${SURROGATE_NO_ZMX:-}" ]]; then
+      return 0
+    fi
+    if [[ -n "${ZMX_SESSION:-}" && -x "$_surr_surrogate" ]]; then
+      _surr_alias="$(PATH="$_surr_path" "$_surr_surrogate" alias "$ZMX_SESSION" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_surr_alias" ]]; then
+      echo "surrogate: zmx session ${ZMX_SESSION:-inherited} alias $_surr_alias"
     else
-      _surr_alias=""
-      _surr_path="$(dirname "$_surr_surrogate"):$(dirname "$_surr_zmx"):${PATH:-/usr/bin:/bin}"
+      echo "surrogate: zmx session ${ZMX_SESSION:-inherited}"
+    fi
+  }
+
+  _surr_wrap_command() {
+    local _surr_cmd="$1"
+    shift
+    local _surr_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
+    local _surr_surrogate="${SURROGATE_BIN:-$HOME/.local/bin/surrogate}"
+    local _surr_path="$(dirname "$_surr_surrogate"):$(dirname "$_surr_zmx"):${PATH:-/usr/bin:/bin}"
+    local _surr_parent=""
+    local _surr_name=""
+    local _surr_alias=""
+    if [[ -n "${SURROGATE_NO_ZMX:-}" || ! -x "$_surr_zmx" ]]; then
+      command "$_surr_cmd" "$@"
+      return
+    fi
+    _surr_parent="$(_surr_parent_name)"
+    if [[ -n "${ZMX_SESSION:-}" || "$_surr_parent" == "zmx" ]]; then
+      # Already inside zmx — announce current session and run inline.
+      # Use plain `alias` (not --predict) so renames via `surrogate rename` win.
       if [[ -n "${ZMX_SESSION:-}" && -x "$_surr_surrogate" ]]; then
         _surr_alias="$(PATH="$_surr_path" "$_surr_surrogate" alias "$ZMX_SESSION" 2>/dev/null || true)"
       fi
@@ -83,61 +290,188 @@ if [[ -z "${SURROGATE_NO_ZMX:-}" && $- == *i* ]]; then
       else
         echo "surrogate: zmx session ${ZMX_SESSION:-inherited}"
       fi
+      command "$_surr_cmd" "$@"
+      return
     fi
-    unset _surr_alias _surr_parent _surr_path _surr_surrogate _surr_zmx
+    _surr_name="${_surr_cmd}-$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
+    if [[ -x "$_surr_surrogate" ]]; then
+      _surr_alias="$(PATH="$_surr_path" "$_surr_surrogate" alias --predict "$_surr_name" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_surr_alias" ]]; then
+      echo "surrogate: zmx session $_surr_name alias $_surr_alias"
+    else
+      echo "surrogate: zmx session $_surr_name"
+    fi
+    env -u ZMX_SESSION "$_surr_zmx" attach "$_surr_name" "$_surr_cmd" "$@"
+  }
+
+  _surr_parent="$(_surr_parent_name)"
+EOF
+
+  if [[ "$mode" == "commands" ]]; then
+    cat <<'EOF'
+  if [[ "$_surr_parent" != "zmx" ]]; then
+    unset ZMX_SESSION
   fi
-fi
-# surrogate:zmx:end
-SNIPPET
-      ;;
-    fish)
-      cat <<'SNIPPET'
-# surrogate:zmx:begin
-# surrogate: auto-zmx for all interactive terminals
-# INVARIANT: Always prints "surrogate:" status line, regardless of terminal app.
-if not set -q SURROGATE_NO_ZMX; and status is-interactive
-  set -l _surr_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
-  set -l _surr_surrogate (set -q SURROGATE_BIN; and echo $SURROGATE_BIN; or echo $HOME/.local/bin/surrogate)
-  if test -x "$_surr_zmx"
-    function zmx --description 'surrogate nested zmx attach shim'
-      set -l _surr_real_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
-      if not test -x "$_surr_real_zmx"
-        command zmx $argv
-        return $status
-      end
-      if test (count $argv) -ge 1
-        switch "$argv[1]"
-          case attach a
-            env -u ZMX_SESSION "$_surr_real_zmx" $argv
-            return $status
-        end
-      end
-      "$_surr_real_zmx" $argv
+EOF
+    bash_like_wrappers "$commands"
+  else
+    cat <<'EOF'
+  if [[ "$_surr_parent" == "zmx" ]]; then
+    _surr_print_status
+  elif [[ -z "${SURROGATE_NO_ZMX:-}" ]]; then
+    _surr_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
+    if [[ -x "$_surr_zmx" ]]; then
+      _surr_name="$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
+      echo "surrogate: wrapping in zmx session $_surr_name"
+      unset ZMX_SESSION
+      exec "$_surr_zmx" attach "$_surr_name"
+    fi
+  fi
+EOF
+  fi
+
+  printf '%s\n' '  unset _surr_parent' 'fi' "$MARKER_END"
+}
+
+snippet_for_fish() {
+  local mode="$1"
+  local commands="$2"
+  local commands_comment="${commands:-<none>}"
+
+  printf '%s\n' \
+    "$MARKER_BEGIN" \
+    '# surrogate: zmx integration for interactive terminals' \
+    "# Mode: $mode" \
+    "# Commands: $commands_comment" \
+    '# INVARIANT: commands mode is silent at startup; all mode prints on wrap and inherited-session paths.'
+
+  cat <<'EOF'
+if status is-interactive
+  function zmx --description 'surrogate nested zmx attach shim'
+    set -l _surr_real_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
+    if not test -x "$_surr_real_zmx"
+      command zmx $argv
       return $status
     end
-    set -l _surr_parent (ps -o comm= -p %self 2>/dev/null)
-    if test "$_surr_parent" != "zmx"
-      set -l _surr_name (date +'%Y-%m-%d_%H-%M-%S_%Z')"-$fish_pid"
-      echo "surrogate: wrapping in zmx session $_surr_name"
-      set -e ZMX_SESSION
-      exec $_surr_zmx attach $_surr_name
-    else
-      set -l _surr_session (set -q ZMX_SESSION; and echo $ZMX_SESSION; or echo "inherited")
-      set -l _surr_alias ""
-      set -l _surr_path (dirname "$_surr_surrogate")":"(dirname "$_surr_zmx")":"(string join ":" $PATH)
-      if set -q ZMX_SESSION; and test -x "$_surr_surrogate"
-        set _surr_alias (env PATH="$_surr_path" $_surr_surrogate alias "$ZMX_SESSION" 2>/dev/null)
+    if test (count $argv) -ge 1
+      switch "$argv[1]"
+        case attach a
+          env -u ZMX_SESSION "$_surr_real_zmx" $argv
+          return $status
       end
+    end
+    "$_surr_real_zmx" $argv
+    return $status
+  end
+
+  function _surr_parent_name
+    set -l _surr_ppid (ps -o ppid= -p $fish_pid 2>/dev/null | string trim)
+    if test -n "$_surr_ppid"
+      ps -o comm= -p $_surr_ppid 2>/dev/null | string trim
+    end
+  end
+
+  function _surr_print_status
+    if set -q SURROGATE_NO_ZMX
+      return 0
+    end
+    set -l _surr_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
+    set -l _surr_surrogate (set -q SURROGATE_BIN; and echo $SURROGATE_BIN; or echo $HOME/.local/bin/surrogate)
+    set -l _surr_alias ""
+    set -l _surr_session (set -q ZMX_SESSION; and echo $ZMX_SESSION; or echo inherited)
+    set -l _surr_path (dirname "$_surr_surrogate")":"(dirname "$_surr_zmx")":"(string join ":" $PATH)
+    if set -q ZMX_SESSION; and test -x "$_surr_surrogate"
+      set _surr_alias (env PATH="$_surr_path" "$_surr_surrogate" alias "$ZMX_SESSION" 2>/dev/null)
+    end
+    if test -n "$_surr_alias"
+      echo "surrogate: zmx session $_surr_session alias $_surr_alias"
+    else
+      echo "surrogate: zmx session $_surr_session"
+    end
+  end
+
+  function _surr_wrap_command
+    set -l _surr_cmd $argv[1]
+    set -e argv[1]
+    set -l _surr_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
+    set -l _surr_surrogate (set -q SURROGATE_BIN; and echo $SURROGATE_BIN; or echo $HOME/.local/bin/surrogate)
+    set -l _surr_path (dirname "$_surr_surrogate")":"(dirname "$_surr_zmx")":"(string join ":" $PATH)
+    set -l _surr_alias ""
+    if set -q SURROGATE_NO_ZMX; or not test -x "$_surr_zmx"
+      command "$_surr_cmd" $argv
+      return $status
+    end
+    set -l _surr_parent (_surr_parent_name)
+    if set -q ZMX_SESSION; or test "$_surr_parent" = "zmx"
+      # Already inside zmx — use plain `alias` (not --predict) so renames win.
+      if set -q ZMX_SESSION; and test -x "$_surr_surrogate"
+        set _surr_alias (env PATH="$_surr_path" "$_surr_surrogate" alias "$ZMX_SESSION" 2>/dev/null)
+      end
+      set -l _surr_session (set -q ZMX_SESSION; and echo $ZMX_SESSION; or echo inherited)
       if test -n "$_surr_alias"
         echo "surrogate: zmx session $_surr_session alias $_surr_alias"
       else
         echo "surrogate: zmx session $_surr_session"
       end
+      command "$_surr_cmd" $argv
+      return $status
+    end
+    set -l _surr_name "$_surr_cmd-"(date +'%Y-%m-%d_%H-%M-%S_%Z')"-$fish_pid"
+    if test -x "$_surr_surrogate"
+      set _surr_alias (env PATH="$_surr_path" "$_surr_surrogate" alias --predict "$_surr_name" 2>/dev/null)
+    end
+    if test -n "$_surr_alias"
+      echo "surrogate: zmx session $_surr_name alias $_surr_alias"
+    else
+      echo "surrogate: zmx session $_surr_name"
+    end
+    env -u ZMX_SESSION "$_surr_zmx" attach "$_surr_name" "$_surr_cmd" $argv
+    return $status
+  end
+
+  set -l _surr_parent (_surr_parent_name)
+EOF
+
+  if [[ "$mode" == "commands" ]]; then
+    cat <<'EOF'
+  if test "$_surr_parent" != "zmx"
+    set -e ZMX_SESSION
+  end
+EOF
+    fish_wrappers "$commands"
+  else
+    cat <<'EOF'
+  if test "$_surr_parent" = "zmx"
+    _surr_print_status
+  else
+    if not set -q SURROGATE_NO_ZMX
+      set -l _surr_zmx (set -q ZMX_BIN; and echo $ZMX_BIN; or echo $HOME/.local/bin/zmx)
+      if test -x "$_surr_zmx"
+        set -l _surr_name (date +'%Y-%m-%d_%H-%M-%S_%Z')"-$fish_pid"
+        echo "surrogate: wrapping in zmx session $_surr_name"
+        set -e ZMX_SESSION
+        exec "$_surr_zmx" attach "$_surr_name"
+      end
     end
   end
-end
-# surrogate:zmx:end
-SNIPPET
+EOF
+  fi
+
+  printf '%s\n' 'end' "$MARKER_END"
+}
+
+snippet_for() {
+  local shell_name="$1"
+  local mode="$2"
+  local commands="$3"
+
+  case "$shell_name" in
+    bash|zsh)
+      snippet_for_bash_like "$mode" "$commands"
+      ;;
+    fish)
+      snippet_for_fish "$mode" "$commands"
       ;;
   esac
 }
@@ -173,21 +507,29 @@ render_without_managed_block() {
 
 do_show() {
   local sh="$1"
-  local rc
-  rc="$(rc_file_for "$sh")"
+  local rc="$2"
+  local mode="$3"
+  local commands="$4"
+  local config_path="$5"
+
   echo "Shell:   $sh"
   echo "RC file: $rc"
+  echo "Mode:    $mode"
+  if [[ "$mode" == "commands" ]]; then
+    echo "Commands: $commands"
+  fi
+  if [[ -n "$config_path" ]]; then
+    echo "Config:  $config_path"
+  fi
   echo ""
   echo "Snippet that would be added:"
   echo "---"
-  snippet_for "$sh"
+  snippet_for "$sh" "$mode" "$commands"
   echo "---"
 }
 
 do_check() {
-  local sh="$1"
-  local rc
-  rc="$(rc_file_for "$sh")"
+  local rc="$1"
   if is_installed "$rc"; then
     echo "Installed in $rc"
     return 0
@@ -198,15 +540,11 @@ do_check() {
 }
 
 do_install() {
-  local sh="$1"
-  local rc
-  local desired
+  local rc="$1"
+  local desired="$2"
   local current=""
   local action="Installed"
-  rc="$(rc_file_for "$sh")"
-  desired="$(snippet_for "$sh")"
 
-  # Ensure rc file and parent dirs exist
   mkdir -p "$(dirname "$rc")"
   touch "$rc"
 
@@ -219,23 +557,26 @@ do_install() {
     action="Updated"
   fi
 
-  # Prepend snippet to rc file (it must run early, before other config).
+  # Place the managed block at the END of the rc file. In commands mode,
+  # user aliases (e.g. `alias codex='bunx ...'`) elsewhere in the rc would
+  # otherwise shadow our command wrappers — aliases always win over
+  # functions regardless of definition order. We unalias each wrapped
+  # command before defining its function, and running last guarantees no
+  # later alias definition can re-shadow us.
   local tmp
   tmp="$(mktemp)"
   {
-    printf '%s\n' "$desired"
-    echo ""
     render_without_managed_block "$rc"
+    echo ""
+    printf '%s\n' "$desired"
   } > "$tmp"
 
   mv "$tmp" "$rc"
-  echo "$action auto-zmx snippet at top of $rc"
+  echo "$action auto-zmx snippet at end of $rc"
 }
 
 do_uninstall() {
-  local sh="$1"
-  local rc
-  rc="$(rc_file_for "$sh")"
+  local rc="$1"
 
   if ! is_installed "$rc"; then
     echo "Not installed in $rc — nothing to do."
@@ -244,15 +585,16 @@ do_uninstall() {
 
   local tmp
   tmp="$(mktemp)"
-
   render_without_managed_block "$rc" > "$tmp"
-
   mv "$tmp" "$rc"
   echo "Removed auto-zmx snippet from $rc"
 }
 
 main() {
   local action="show"
+  local cli_mode=""
+  local cli_commands=""
+  local cli_config=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -260,7 +602,25 @@ main() {
       --install)   action="install"; shift ;;
       --uninstall) action="uninstall"; shift ;;
       --check)     action="check"; shift ;;
-      --help|-h)   usage; exit 0 ;;
+      --mode)
+        [[ $# -ge 2 ]] || die "--mode requires a value"
+        cli_mode="$2"
+        shift 2
+        ;;
+      --commands)
+        [[ $# -ge 2 ]] || die "--commands requires a value"
+        cli_commands="$2"
+        shift 2
+        ;;
+      --config)
+        [[ $# -ge 2 ]] || die "--config requires a path"
+        cli_config="$2"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
       *)
         echo "Unknown option: $1" >&2
         usage >&2
@@ -269,14 +629,17 @@ main() {
     esac
   done
 
-  local sh
+  local sh rc desired
   sh="$(detect_shell)"
+  rc="$(rc_file_for "$sh")"
+  resolve_settings "$cli_config" "$cli_mode" "$cli_commands"
+  desired="$(snippet_for "$sh" "$RESOLVED_MODE" "$RESOLVED_COMMANDS")"
 
   case "$action" in
-    show)      do_show "$sh" ;;
-    check)     do_check "$sh" ;;
-    install)   do_install "$sh" ;;
-    uninstall) do_uninstall "$sh" ;;
+    show)      do_show "$sh" "$rc" "$RESOLVED_MODE" "$RESOLVED_COMMANDS" "$ACTIVE_CONFIG_PATH" ;;
+    check)     do_check "$rc" ;;
+    install)   do_install "$rc" "$desired" ;;
+    uninstall) do_uninstall "$rc" ;;
   esac
 }
 

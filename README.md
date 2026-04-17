@@ -50,6 +50,8 @@ surrogate-doctor
 
 This installs `surrogate`, `surrogate-brief`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`. `surrogate-brief` is optional and only used for OpenRouter-backed remote summaries; core `surrogate` session control does not require any API key. It also tries to install [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) by default as a recommended safety guard. If dcg install fails, surrogate still installs and works.
 
+If you want zmx only for selected agent CLIs instead of every shell, start from `surrogate-shell.conf.example` and install shell integration in `commands` mode.
+
 For contributors working from a checkout, use dev-link mode so the installed CLI never drifts from the repo:
 
 ```bash
@@ -118,28 +120,68 @@ Surrogate also writes a deterministic audit trail for `type` and `send` actions:
 - override path: `SURROGATE_AUDIT_FILE=/path/to/file.jsonl`
 - both allowed and blocked actions are logged
 
-### Auto-wrap all terminals in zmx
+### Shell integration: every shell or selected commands
 
-By default, surrogate can only talk to apps running inside zmx sessions. To make **every** new terminal window a zmx session automatically:
+By default, surrogate can only talk to apps running inside zmx sessions. `surrogate-shell-setup` supports two deterministic modes:
+
+- `all` — wrap every new interactive shell in zmx
+- `commands` — leave plain shells alone and wrap only configured commands such as `claude`, `pi`, or `codex`
+
+#### Recommended: wrap selected commands only
+
+Public-safe example config:
 
 ```bash
+cp surrogate-shell.conf.example ~/.config/surrogate/shell.conf
 surrogate-shell-setup --install
 ```
 
-This prepends a small snippet to your shell rc file (`.bashrc`, `.zshrc`, or `config.fish`). It:
+`surrogate-shell.conf.example` uses:
+
+```bash
+SURROGATE_ZMX_MODE="commands"
+SURROGATE_ZMX_COMMANDS="claude pi codex"
+```
+
+For a private repo-local config, copy it to `./surrogate-shell.conf` instead. That file is gitignored, so your personal command allowlist stays out of the public repo:
+
+```bash
+cp surrogate-shell.conf.example surrogate-shell.conf
+surrogate-shell-setup --install --config "$PWD/surrogate-shell.conf"
+```
+
+In `commands` mode the snippet:
+- Leaves ordinary interactive shells unwrapped
+- Generates shell wrappers only for the configured commands
+- Wraps those commands with `zmx attach <unique-name> <command...>` and, before exec, prints `surrogate: zmx session <name> alias <alias>` so you see the deterministic alias for the session you're about to enter
+- Clears leaked `ZMX_SESSION` when the shell is not actually running under a zmx parent, so command wrappers still fire correctly
+- Keeps plain `zmx attach ...` working by clearing leaked `ZMX_SESSION` only for nested attaches
+- Stays silent at shell startup in all cases — including shells already spawned inside zmx by a terminal emulator or agent tooling (e.g. `pi`'s bash extension); the snippet announces only when one of the configured commands is actually wrapped
+- Installs the managed block at the **end** of your rc file and `unalias`es each wrapped command first, so a bash `alias codex='bunx ...'` (or similar) defined earlier in your rc doesn't shadow the wrapper — bash aliases otherwise win over shell functions regardless of definition order
+
+#### Legacy / maximal mode: auto-wrap every shell
+
+To make **every** new terminal window a zmx session automatically:
+
+```bash
+surrogate-shell-setup --install --mode all
+```
+
+This mode:
 - Wraps each new interactive shell in `zmx attach <unique-name>`
 - Won't double-wrap (checks parent process name via `$PPID`, not env vars which leak through window managers)
 - Keeps plain `zmx attach ...` working inside an already-wrapped shell by clearing leaked `ZMX_SESSION` only for nested attaches
-- Always prints a `surrogate:` status line, regardless of terminal app
+- Always prints a `surrogate:` status line on the wrap and inherited-session paths in this mode (commands mode is silent at startup)
 - Refreshes the managed rc block in place when you rerun `surrogate-shell-setup --install`
 - Can be opted out per-session with `SURROGATE_NO_ZMX=1`
 - Can be removed cleanly with `surrogate-shell-setup --uninstall`
 
-If your terminal already launches zmx (e.g., Ghostty with a custom command), the snippet detects the zmx parent process and prints the status line without double-wrapping.
+If your terminal already launches zmx, the snippet detects the zmx parent process and prints the status line without double-wrapping.
 
 **Preview before installing:**
 ```bash
 surrogate-shell-setup --show
+surrogate-shell-setup --show --mode commands --commands claude,pi,codex
 ```
 
 **Check if installed:**

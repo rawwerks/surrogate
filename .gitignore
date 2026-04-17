@@ -4,7 +4,12 @@
 .plumb/*
 !.plumb/decisions/
 .env
+surrogate-shell.conf
 
 # aPlumb internal state (gitignored; JSONL exports in .aplumb/decisions/ are tracked)
 .aplumb/*
 !.aplumb/decisions/
+
+# Local agent-harness state (Claude Code settings, Codex state, etc.)
+.claude/
+.codex

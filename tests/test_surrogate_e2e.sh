@@ -111,6 +111,7 @@ MOCK_LIVE_SIGNAL_SESSION=""
 MOCK_LIVE_LOW_SESSION=""
 MOCK_LIVE_DETACHED_SESSION=""
 MOCK_LIVE_ZMX_DIR=""
+MOCK_PI_BASH_REGISTRY=""
 
 stale_output_matches() {
   local session="$1"
@@ -149,6 +150,32 @@ cleanup_mock_proc_ancestry() {
     rm -rf "$MOCK_PROC_ROOT"
   fi
   MOCK_PROC_ROOT=""
+}
+
+setup_mock_pi_bash_registry() {
+  local session_id="$1"
+  shift
+
+  MOCK_PI_BASH_REGISTRY="$(mktemp -d)"
+  local job_id session_name
+  for job_id in "$@"; do
+    mkdir -p "$MOCK_PI_BASH_REGISTRY/$session_id/$job_id"
+    session_name="pi-bash-zmx-$session_id-$job_id"
+    cat > "$MOCK_PI_BASH_REGISTRY/$session_id/$job_id/meta.json" <<EOF
+{
+  "sessionId": "$session_id",
+  "jobId": "$job_id",
+  "sessionName": "$session_name"
+}
+EOF
+  done
+}
+
+cleanup_mock_pi_bash_registry() {
+  if [[ -n "$MOCK_PI_BASH_REGISTRY" && -d "$MOCK_PI_BASH_REGISTRY" ]]; then
+    rm -rf "$MOCK_PI_BASH_REGISTRY"
+  fi
+  MOCK_PI_BASH_REGISTRY=""
 }
 
 wait_for_read_match() {
@@ -428,6 +455,7 @@ cleanup() {
   echo ""
   echo "--- cleanup ---"
   cleanup_mock_proc_ancestry
+  cleanup_mock_pi_bash_registry
   cleanup_mock_live_env
   cleanup_test_artifacts current
   cleanup_test_artifacts stale
@@ -482,7 +510,7 @@ test_list() {
   TESTS_RUN=$((TESTS_RUN + 1))
 
   local output
-  output=$("$SURROGATE" list 2>&1)
+  output=$("$SURROGATE" list --bare 2>&1)
 
   if echo "$output" | grep -q "$TEST_SESSION"; then
     pass "${FUNCNAME[0]}"
@@ -501,7 +529,7 @@ test_help_discoverability() {
   output=$("$SURROGATE" help 2>&1)
 
   if echo "$output" | grep -q 'surrogate help list' &&
-     echo "$output" | grep -q 'surrogate list --cwd' &&
+     echo "$output" | grep -q 'surrogate list' &&
      echo "$output" | grep -q 'surrogate type --message' &&
      echo "$output" | grep -q 'surrogate submit'; then
     pass "${FUNCNAME[0]} — help highlights discovery and recovery flows"
@@ -521,7 +549,7 @@ test_list_help() {
 
   if echo "$output" | grep -q 'usage: surrogate list' &&
      echo "$output" | grep -q 'repo/cwd/ui hints' &&
-     echo "$output" | grep -q -- '--cwd' &&
+     echo "$output" | grep -q -- '--bare' &&
      echo "$output" | grep -q -- '--json'; then
     pass "${FUNCNAME[0]} — list help is discoverable"
   else
@@ -558,12 +586,15 @@ test_type_and_read() {
 
 test_send_enter_key() {
   # plumb:req-4aeebe62
+  # send is for tmux key names only; prose must go through type.
+  # This test verifies send works with valid key names (no spaces).
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local marker="SEND_ENTER_$$"
+  local marker="SENDENTER$$"
 
-  "$SURROGATE" send "$TEST_SESSION" "echo $marker" Enter
+  # Use type to stage+submit the echo, then verify send Enter works for bare keys
+  "$SURROGATE" type "$TEST_SESSION" "echo $marker"
   wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
   local output
@@ -572,9 +603,9 @@ test_send_enter_key() {
   if echo "$output" | grep -q "$marker"; then
     pass "${FUNCNAME[0]}"
   else
-    echo "    expected '$marker' in output after send + Enter:"
+    echo "    expected '$marker' in output after type:"
     echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — marker not found after send with Enter"
+    fail "${FUNCNAME[0]} — marker not found after type"
   fi
 }
 
@@ -583,9 +614,11 @@ test_submit_enters_staged_prompt() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local marker="SUBMIT_MARKER_$$"
+  local marker="SUBMITMARKER$$"
 
-  "$SURROGATE" send "$TEST_SESSION" "echo $marker"
+  # Stage text using individual key-name sends (no spaces, no prose)
+  "$SURROGATE" send "$TEST_SESSION" "echo"
+  "$SURROGATE" send "$TEST_SESSION" Space "$marker"
   "$SURROGATE" submit "$TEST_SESSION"
   wait_for_output "$TEST_SESSION" "$marker" 5 || true
 
@@ -1127,6 +1160,30 @@ test_type_accepts_message_flag_any_position() {
   fi
 }
 
+test_send_rejects_prose() {
+  # CRITICAL: surrogate send must never allow prose through — it bypasses labels.
+  # Without this guard, agents can impersonate humans (no [SURROGATE] tag).
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output
+  # Long string (>40 chars)
+  output=$("$SURROGATE" send "$TEST_SESSION" "This is a long message that bypasses labeling and must be rejected" 2>&1 || true)
+  if ! echo "$output" | grep -qi 'surrogate type'; then
+    fail "${FUNCNAME[0]} — long prose was not blocked: $output"
+    return
+  fi
+
+  # String with spaces
+  output=$("$SURROGATE" send "$TEST_SESSION" "hello world" 2>&1 || true)
+  if ! echo "$output" | grep -qi 'surrogate type'; then
+    fail "${FUNCNAME[0]} — spaced prose was not blocked: $output"
+    return
+  fi
+
+  pass "${FUNCNAME[0]} — prose smuggling through send is blocked"
+}
+
 # ---------------------------------------------------------------------------
 # Design Invariant Tests
 # These assert the core design requirements that must hold for ALL terminals,
@@ -1496,6 +1553,560 @@ EOF
   fi
 }
 
+test_shell_setup_commands_mode_requires_commands() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script output
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  output=$(SHELL="/bin/bash" "$setup_script" --show --mode commands 2>&1 || true)
+
+  if echo "$output" | grep -q 'commands mode requires at least one command'; then
+    pass "${FUNCNAME[0]} — commands mode rejects an empty command allowlist"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — expected commands mode without commands to fail fast"
+  fi
+}
+
+test_shell_setup_commands_mode_generates_registered_wrappers_all_shells() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script cfg all_ok=true
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  cfg="$(mktemp)"
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="claude pi codex"
+EOF
+
+  for shell_name in bash zsh fish; do
+    local snippet
+    snippet=$(SHELL="/bin/$shell_name" "$setup_script" --show --config "$cfg" 2>&1)
+
+    if ! echo "$snippet" | grep -q 'Mode:    commands'; then
+      echo "    missing commands mode header for shell: $shell_name"
+      all_ok=false
+    fi
+
+    case "$shell_name" in
+      bash|zsh)
+        for cmd_name in claude pi codex; do
+          if ! echo "$snippet" | grep -Fq "$cmd_name() { _surr_wrap_command $cmd_name \"\$@\"; }"; then
+            echo "    missing wrapper for $cmd_name in shell: $shell_name"
+            all_ok=false
+          fi
+        done
+        ;;
+      fish)
+        for cmd_name in claude pi codex; do
+          if ! echo "$snippet" | grep -Fq "function $cmd_name --wraps $cmd_name" ||
+             ! echo "$snippet" | grep -Fq "_surr_wrap_command $cmd_name \$argv"; then
+            echo "    missing fish wrapper for $cmd_name"
+            all_ok=false
+          fi
+        done
+        ;;
+    esac
+  done
+
+  rm -f "$cfg"
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]} — commands mode generates wrappers for configured commands in bash, zsh, and fish"
+  else
+    fail "${FUNCNAME[0]} — commands mode snippet missing configured wrappers"
+  fi
+}
+
+test_shell_setup_commands_mode_plain_shell_stays_unwrapped() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script cfg tmp_home tmpbin log_file snippet_file output
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  cfg="$(mktemp)"
+  tmp_home="$(mktemp -d)"
+  tmpbin="$(mktemp -d)"
+  log_file="$(mktemp)"
+  snippet_file="$tmp_home/snippet.sh"
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="pi"
+EOF
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\t%s\n' "${ZMX_SESSION-<unset>}" "$*" >> "$SURR_TEST_ZMX_LOG"
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  "$setup_script" --show --config "$cfg" | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
+
+  output=$(
+    HOME="$tmp_home" \
+    PATH="$tmpbin:/usr/bin:/bin" \
+    ZMX_BIN="$tmpbin/zmx" \
+    SURR_TEST_ZMX_LOG="$log_file" \
+    bash --noprofile --norc -ic "source '$snippet_file'; printf 'startup-zmx:%s\n' \"\${ZMX_SESSION-<unset>}\"" 2>&1
+  )
+
+  rm -f "$cfg"
+
+  if echo "$output" | grep -Fq 'startup-zmx:<unset>' &&
+     [[ ! -s "$log_file" ]] &&
+     ! echo "$output" | grep -q '^surrogate:'; then
+    pass "${FUNCNAME[0]} — commands mode leaves plain interactive shells unwrapped"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    zmx log:"
+    sed 's/^/    /' "$log_file"
+    fail "${FUNCNAME[0]} — expected no startup wrap and no alias/status spam in commands mode"
+  fi
+}
+
+test_shell_setup_commands_mode_wraps_only_registered_commands() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script cfg tmp_home tmpbin zmx_log plain_log direct_log snippet_file output
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  cfg="$(mktemp)"
+  tmp_home="$(mktemp -d)"
+  tmpbin="$(mktemp -d)"
+  zmx_log="$(mktemp)"
+  plain_log="$(mktemp)"
+  direct_log="$(mktemp)"
+  snippet_file="$tmp_home/snippet.sh"
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="pi"
+EOF
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\t%s\n' "${ZMX_SESSION-<unset>}" "$*" >> "$SURR_TEST_ZMX_LOG"
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/pi" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'direct:%s\n' "${ZMX_SESSION-<unset>}" >> "$SURR_TEST_DIRECT_LOG"
+exit 0
+EOF
+  chmod +x "$tmpbin/pi"
+
+  cat > "$tmpbin/plaincmd" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'plain:%s\n' "${ZMX_SESSION-<unset>}" >> "$SURR_TEST_PLAIN_LOG"
+exit 0
+EOF
+  chmod +x "$tmpbin/plaincmd"
+
+  "$setup_script" --show --config "$cfg" | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
+
+  output=$(
+    HOME="$tmp_home" \
+    PATH="$tmpbin:/usr/bin:/bin" \
+    ZMX_BIN="$tmpbin/zmx" \
+    SURR_TEST_ZMX_LOG="$zmx_log" \
+    SURR_TEST_PLAIN_LOG="$plain_log" \
+    SURR_TEST_DIRECT_LOG="$direct_log" \
+    bash --noprofile --norc -ic "source '$snippet_file'; pi --model local; plaincmd hello" 2>&1
+  )
+
+  rm -f "$cfg"
+
+  if echo "$output" | grep -Eq "^surrogate: zmx session pi-" &&
+     grep -Fq $'<unset>	attach pi-' "$zmx_log" &&
+     grep -Fq ' pi --model local' "$zmx_log" &&
+     grep -Fq 'plain:<unset>' "$plain_log" &&
+     [[ ! -s "$direct_log" ]]; then
+    pass "${FUNCNAME[0]} — commands mode wraps registered commands and leaves others alone"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    zmx log:"
+    sed 's/^/    /' "$zmx_log"
+    echo "    plain log:"
+    sed 's/^/    /' "$plain_log"
+    echo "    direct log:"
+    sed 's/^/    /' "$direct_log"
+    fail "${FUNCNAME[0]} — expected only registered commands to route through zmx"
+  fi
+}
+
+test_shell_setup_commands_mode_silent_under_nested_zmx() {
+  # Regression: pi/agent tooling spawns bash under `zmx run pi-bash-zmx-...`.
+  # In that case the bash snippet used to fire the "inherited" status line on
+  # every pi-launched shell. commands mode must stay silent at startup even
+  # when the parent process is zmx.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script cfg tmp_home tmpbin snippet_file output
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  cfg="$(mktemp)"
+  tmp_home="$(mktemp -d)"
+  tmpbin="$(mktemp -d)"
+  snippet_file="$tmp_home/snippet.sh"
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="pi"
+EOF
+
+  "$setup_script" --show --config "$cfg" | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
+
+  # Fail fast if the generated commands-mode snippet still *calls* the
+  # inherited-status printer. The function definition is allowed (it is the
+  # same prelude the `all` mode uses), but in commands mode no code path may
+  # invoke it — that is the branch that spams status lines.
+  local call_count
+  call_count=$(grep -cE '(^|[^[:alnum:]_])_surr_print_status([^(]|$)' "$snippet_file" || true)
+  if [[ "$call_count" -gt 0 ]]; then
+    echo "    snippet still calls _surr_print_status ($call_count time(s)):"
+    grep -nE '(^|[^[:alnum:]_])_surr_print_status([^(]|$)' "$snippet_file" | sed 's/^/    /'
+    rm -f "$cfg"
+    fail "${FUNCNAME[0]} — commands-mode snippet must not call _surr_print_status"
+    return
+  fi
+
+  # Simulate an inherited zmx session and source the snippet. Even with a
+  # fake 'zmx' in PATH as the parent, no surrogate output must appear at
+  # startup in commands mode.
+  output=$(
+    HOME="$tmp_home" \
+    PATH="/usr/bin:/bin" \
+    ZMX_BIN="/bin/true" \
+    ZMX_SESSION="pi-bash-zmx-fake-nested" \
+    bash --noprofile --norc -ic "source '$snippet_file'; echo DONE" 2>&1
+  )
+
+  rm -f "$cfg"
+
+  if echo "$output" | grep -Fq 'DONE' &&
+     ! echo "$output" | grep -q '^surrogate:'; then
+    pass "${FUNCNAME[0]} — commands mode stays silent at startup under inherited zmx"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — expected no surrogate status line at startup in commands mode"
+  fi
+}
+
+test_shell_setup_commands_mode_wrap_message_includes_alias() {
+  # The wrap banner must match 'surrogate: zmx session <name> alias <alias>'
+  # when the real surrogate binary is on PATH, so the user sees the same
+  # session/alias pair the zmx session will report via `surrogate whoami`.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script surrogate_bin cfg tmp_home tmpbin snippet_file zmx_log output expected_alias
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  surrogate_bin="$(dirname "$SCRIPT_DIR")/bin/surrogate"
+  cfg="$(mktemp)"
+  tmp_home="$(mktemp -d)"
+  tmpbin="$(mktemp -d)"
+  zmx_log="$(mktemp)"
+  snippet_file="$tmp_home/snippet.sh"
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="pi"
+EOF
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\t%s\n' "${ZMX_SESSION-<unset>}" "$*" >> "$SURR_TEST_ZMX_LOG"
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  "$setup_script" --show --config "$cfg" | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
+
+  output=$(
+    HOME="$tmp_home" \
+    PATH="$tmpbin:/usr/bin:/bin" \
+    ZMX_BIN="$tmpbin/zmx" \
+    SURROGATE_BIN="$surrogate_bin" \
+    SURR_TEST_ZMX_LOG="$zmx_log" \
+    bash --noprofile --norc -ic "source '$snippet_file'; pi --model local" 2>&1
+  )
+
+  rm -f "$cfg"
+
+  # Extract the session name the wrapper actually used from the banner and
+  # recompute the expected alias via `surrogate alias --predict`.
+  local banner session_name
+  banner=$(echo "$output" | grep -E '^surrogate: zmx session pi-' | head -1)
+  session_name=$(echo "$banner" | sed -E 's/^surrogate: zmx session ([^ ]+).*/\1/')
+  expected_alias=$("$surrogate_bin" alias --predict "$session_name" 2>/dev/null || true)
+
+  if [[ -n "$banner" && -n "$expected_alias" ]] &&
+     echo "$banner" | grep -Fq " alias $expected_alias"; then
+    pass "${FUNCNAME[0]} — wrap banner includes predicted alias ($expected_alias)"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    banner: $banner"
+    echo "    session: $session_name"
+    echo "    expected_alias: $expected_alias"
+    fail "${FUNCNAME[0]} — wrap banner must include ' alias <predicted>'"
+  fi
+}
+
+test_shell_setup_install_places_block_at_end_of_rc() {
+  # Regression: the managed block must be installed at the END of the rc
+  # file, not prepended. End-placement is load-bearing for commands mode
+  # because user aliases defined earlier in the rc would otherwise shadow
+  # our command wrappers.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script tmp_home cfg rc
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  tmp_home="$(mktemp -d)"
+  cfg="$(mktemp)"
+  rc="$tmp_home/.bashrc"
+
+  cat > "$rc" <<'EOF'
+# user content line 1
+export FOO=bar
+# user content line 2
+EOF
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="pi"
+EOF
+
+  HOME="$tmp_home" SHELL=/bin/bash "$setup_script" --install --config "$cfg" >/dev/null 2>&1
+
+  local begin_line last_user_line end_marker_line total_lines
+  begin_line=$(grep -n '^# surrogate:zmx:begin' "$rc" | head -1 | cut -d: -f1)
+  # The LAST non-managed, non-empty line of the original content ("# user content line 2").
+  last_user_line=$(grep -n '^# user content line 2' "$rc" | tail -1 | cut -d: -f1)
+  end_marker_line=$(grep -n '^# surrogate:zmx:end' "$rc" | tail -1 | cut -d: -f1)
+  total_lines=$(wc -l < "$rc")
+
+  rm -f "$cfg"
+
+  # Strict: managed block must come AFTER all existing user content, and
+  # `end` must be the final non-empty line of the file (±1 trailing blank
+  # from how we assemble the rewrite).
+  if [[ -n "$begin_line" && -n "$last_user_line" && -n "$end_marker_line" ]] &&
+     [[ "$begin_line" -gt "$last_user_line" ]] &&
+     (( end_marker_line >= total_lines - 1 )); then
+    pass "${FUNCNAME[0]} — managed block installed at end of rc (after all user content)"
+  else
+    echo "    begin=$begin_line last_user=$last_user_line end=$end_marker_line total=$total_lines"
+    echo "    rc contents:"
+    sed 's/^/    /' "$rc"
+    fail "${FUNCNAME[0]} — expected managed block to be the final section of rc"
+  fi
+}
+
+test_alias_predict_matches_base_hash() {
+  # Regression: `surrogate alias --predict <name>` must return the
+  # deterministic adjective-noun base hash for any string, without
+  # requiring the session to exist yet. Used by the shell snippet to
+  # compute the wrap banner before zmx creates the session.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local predicted
+  predicted="$("$SURROGATE" alias --predict mycli-2026-04-17_test-12345 2>&1)"
+
+  # Must be a simple adjective-noun pair (lowercase letters and a single dash),
+  # not a collision suffix, not an error, not empty.
+  if [[ "$predicted" =~ ^[a-z]+-[a-z]+$ ]]; then
+    pass "${FUNCNAME[0]} — --predict returns base adjective-noun hash ($predicted)"
+  else
+    echo "    got: '$predicted'"
+    fail "${FUNCNAME[0]} — --predict must return bare adjective-noun"
+  fi
+
+  # Determinism: same input → same output.
+  local predicted_again
+  predicted_again="$("$SURROGATE" alias --predict mycli-2026-04-17_test-12345 2>&1)"
+  if [[ "$predicted" == "$predicted_again" ]]; then
+    pass "${FUNCNAME[0]} (determinism) — same input yields same alias"
+  else
+    fail "${FUNCNAME[0]} (determinism) — '$predicted' vs '$predicted_again'"
+  fi
+}
+
+test_shell_setup_commands_mode_unaliases_before_if_block() {
+  # Regression: if the user's rc has `alias codex='bunx ...'`, a naive
+  # `codex() { ... }` inside the if-block would syntax-error at parse time
+  # because bash alias-expands the function NAME during the block parse.
+  # The snippet must emit top-level `unalias <cmd>` statements BEFORE the
+  # if-block so the aliases are gone by the time the block is parsed.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script cfg tmp_home tmpbin snippet_file unalias_lines begin_line if_line output
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  cfg="$(mktemp)"
+  tmp_home="$(mktemp -d)"
+  tmpbin="$(mktemp -d)"
+  snippet_file="$tmp_home/snippet.sh"
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="codex pi"
+EOF
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "zmx-called: ${ZMX_SESSION-<unset>} $*" >> "$SURR_TEST_ZMX_LOG"
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/codex" <<'EOF'
+#!/usr/bin/env bash
+echo "real-codex-ran with args: $*"
+EOF
+  chmod +x "$tmpbin/codex"
+
+  "$setup_script" --show --config "$cfg" | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
+
+  # (a) both unalias lines present and at top-level (before `if [[`)
+  begin_line=$(grep -n '^# surrogate:zmx:begin' "$snippet_file" | head -1 | cut -d: -f1)
+  if_line=$(grep -n '^if \[\[ \$- == \*i\*' "$snippet_file" | head -1 | cut -d: -f1)
+  unalias_lines=$(awk -v b="$begin_line" -v i="$if_line" 'NR > b && NR < i && /^unalias (codex|pi) 2>\/dev\/null \|\| true$/' "$snippet_file" | wc -l)
+
+  # (b) sourcing the snippet with an offending alias defined BEFORE must
+  # not error and must make codex a function.
+  local zmx_log
+  zmx_log="$(mktemp)"
+  output=$(
+    HOME="$tmp_home" \
+    PATH="$tmpbin:/usr/bin:/bin" \
+    ZMX_BIN="$tmpbin/zmx" \
+    SURR_TEST_ZMX_LOG="$zmx_log" \
+    bash --noprofile --norc -ic "
+      alias codex='bunx --bun @openai/codex@latest'
+      source '$snippet_file'
+      type codex
+    " 2>&1
+  )
+
+  rm -f "$cfg"
+
+  if [[ "$unalias_lines" -eq 2 ]] &&
+     echo "$output" | grep -Fq 'codex is a function' &&
+     ! echo "$output" | grep -Eqi 'syntax error|unexpected token'; then
+    pass "${FUNCNAME[0]} — unalias before if-block defeats rc aliases and keeps syntax valid"
+  else
+    echo "    unalias_lines=$unalias_lines (want 2)"
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — expected unalias statements at top level and codex to become a function"
+  fi
+}
+
+test_ui_hint_detects_agent_busy_states() {
+  # Regression: --message targeting must keep working when a Claude/Pi/Codex
+  # agent is mid-task, so ui_hint_from_history has to recognize busy-state
+  # indicators in addition to idle prompt glyphs. Exercises the detector
+  # via `surrogate find` semantics by writing a synthetic fake-zmx history
+  # is too heavy; instead we shell out to a helper that sources the
+  # function and checks each case.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local surrogate_bin probe
+  surrogate_bin="$(dirname "$SCRIPT_DIR")/bin/surrogate"
+
+  # Source just the detector by filtering it out of bin/surrogate. Easier:
+  # extract with awk and dot-source in a subshell.
+  probe="$(mktemp)"
+  awk '/^ui_hint_from_history\(\)/{flag=1} flag{print} /^}/ && flag{flag=0}' "$surrogate_bin" > "$probe"
+  # It also depends on last_visible_line — grab that too.
+  awk '/^last_visible_line\(\)/{flag=1} flag{print} /^}/ && flag{flag=0}' "$surrogate_bin" >> "$probe"
+
+  local fail_cases=""
+  check_agent() {
+    local label="$1" text="$2"
+    local got
+    got=$(bash -c "source '$probe'; ui_hint_from_history \"\$1\"" _ "$text" 2>/dev/null)
+    if [[ "$got" != "agent" ]]; then
+      fail_cases+="        [$label] expected agent, got '$got'\n"
+    fi
+  }
+
+  # Claude Code vendor banner / footer
+  check_agent "claude-banner"   "▐▛███▜▌   Claude Code v2.1.112"
+  check_agent "claude-shortcuts" "? for shortcuts"
+  check_agent "claude-bypass"    "⏵⏵ bypass permissions on (shift+tab to cycle)"
+  # Codex vendor footer
+  check_agent "codex-model"      "100% context left · ? for shortcuts"
+  check_agent "codex-gpt"        "gpt-5.4 xhigh fast · ~/Documents/GitHub/surrogate"
+  # Pi vendor indicators
+  check_agent "pi-banner"        "pi v0.67.6"
+  check_agent "pi-dirpack"       "dirpack 3000t ready mycelium off"
+  # Busy states (must still count as agent)
+  check_agent "esc-to-cancel"    "Esc to cancel · Tab to amend · ctrl+e to explain"
+  check_agent "esc-to-interrupt" "Working (5s · esc to interrupt)"
+  check_agent "proceed-prompt"   "Do you want to proceed?"
+  check_agent "spinner-working"  "⠙ Working..."
+
+  rm -f "$probe"
+
+  if [[ -z "$fail_cases" ]]; then
+    pass "${FUNCNAME[0]} — ui_hint_from_history classifies all agent/busy-state cases correctly"
+  else
+    echo "    failures:"
+    printf "%b" "$fail_cases"
+    fail "${FUNCNAME[0]} — some agent/busy-state cases were not classified as agent"
+  fi
+}
+
+test_shell_setup_private_config_is_gitignored() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -Eq '^surrogate-shell\.conf$' "$(dirname "$SCRIPT_DIR")/.gitignore"; then
+    pass "${FUNCNAME[0]} — private repo-local shell config is gitignored"
+  else
+    fail "${FUNCNAME[0]} — expected .gitignore to exclude surrogate-shell.conf"
+  fi
+}
+
+test_shell_setup_example_config_is_public_safe() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local example_file
+  example_file="$(dirname "$SCRIPT_DIR")/surrogate-shell.conf.example"
+
+  if [[ -f "$example_file" ]] &&
+     grep -Fq 'SURROGATE_ZMX_MODE="commands"' "$example_file" &&
+     grep -Fq 'SURROGATE_ZMX_COMMANDS="claude pi codex"' "$example_file"; then
+    pass "${FUNCNAME[0]} — committed shell config example uses the documented public-safe commands"
+  else
+    echo "    example file contents:"
+    sed 's/^/    /' "$example_file" 2>/dev/null || true
+    fail "${FUNCNAME[0]} — expected a public-safe example with mode=commands and the documented allowlist"
+  fi
+}
+
 test_invariant_installed_matches_repo() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -1775,7 +2386,8 @@ run_section core smoke \
   test_cleanup_deprecated_alias_warns \
   test_status \
   test_concurrent_serialization \
-  test_type_accepts_message_flag_any_position
+  test_type_accepts_message_flag_any_position \
+  test_send_rejects_prose
 
 test_find() {
   # plumb:req-762ccafb
@@ -2658,6 +3270,93 @@ test_alias_cache_built_once() {
   fi
 }
 
+test_alias_pi_bash_jobs_share_stable_alias() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local session_id job1 job2 raw1 raw2 tmpbin alias1 alias2
+  session_id="019d96e3-919b-750d-809c-cbe91385"
+  job1="aaaabbbbcccc"
+  job2="ddddeeeeffff"
+  raw1="pi-bash-zmx-$session_id-$job1"
+  raw2="pi-bash-zmx-$session_id-$job2"
+
+  setup_mock_pi_bash_registry "$session_id" "$job1" "$job2"
+  tmpbin="$(mktemp -d)"
+
+  cat > "$tmpbin/zmx" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "list" ]]; then
+  printf 'session_name=%s\tclients=1\n' "$raw1"
+  printf 'session_name=%s\tclients=1\n' "$raw2"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+  ln -sf "$(command -v tmux)" "$tmpbin/tmux"
+
+  alias1=$(SURROGATE_PI_BASH_ZMX_DIR="$MOCK_PI_BASH_REGISTRY" PATH="$tmpbin:/usr/bin:/bin" "$SURROGATE" alias "$raw1" 2>&1)
+  alias2=$(SURROGATE_PI_BASH_ZMX_DIR="$MOCK_PI_BASH_REGISTRY" PATH="$tmpbin:/usr/bin:/bin" "$SURROGATE" alias "$raw2" 2>&1)
+
+  rm -rf "$tmpbin"
+  cleanup_mock_pi_bash_registry
+
+  if [[ "$alias1" == "$alias2" && -n "$alias1" ]]; then
+    pass "${FUNCNAME[0]} — pi-bash job sessions with one sessionId share a stable alias"
+  else
+    echo "    alias #1: $alias1"
+    echo "    alias #2: $alias2"
+    fail "${FUNCNAME[0]} — expected both pi-bash job sessions to resolve to the same alias"
+  fi
+}
+
+test_rename_pi_bash_identity_persists_across_jobs() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local session_id job1 job2 raw1 raw2 tmpbin custom output alias2
+  session_id="019d96e3-919b-750d-809c-cbe91385"
+  job1="111122223333"
+  job2="444455556666"
+  raw1="pi-bash-zmx-$session_id-$job1"
+  raw2="pi-bash-zmx-$session_id-$job2"
+  custom="pi-bash-stable-$$"
+
+  setup_mock_pi_bash_registry "$session_id" "$job1" "$job2"
+  tmpbin="$(mktemp -d)"
+  sed -i "/^pi-bash-zmx-$session_id=/d" /tmp/surrogate-aliases 2>/dev/null || true
+
+  cat > "$tmpbin/zmx" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "list" ]]; then
+  printf 'session_name=%s\tclients=1\n' "$raw1"
+  printf 'session_name=%s\tclients=1\n' "$raw2"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+  ln -sf "$(command -v tmux)" "$tmpbin/tmux"
+
+  output=$(SURROGATE_PI_BASH_ZMX_DIR="$MOCK_PI_BASH_REGISTRY" PATH="$tmpbin:/usr/bin:/bin" "$SURROGATE" rename "$raw1" "$custom" 2>&1)
+  alias2=$(SURROGATE_PI_BASH_ZMX_DIR="$MOCK_PI_BASH_REGISTRY" PATH="$tmpbin:/usr/bin:/bin" "$SURROGATE" alias "$raw2" 2>&1)
+
+  rm -rf "$tmpbin"
+  cleanup_mock_pi_bash_registry
+  sed -i "/^pi-bash-zmx-$session_id=/d" /tmp/surrogate-aliases 2>/dev/null || true
+
+  if echo "$output" | grep -Fq "$custom" && [[ "$alias2" == "$custom" ]]; then
+    pass "${FUNCNAME[0]} — renaming one pi-bash job session persists on the stable per-pi identity"
+  else
+    echo "    rename output: $output"
+    echo "    alias #2: $alias2"
+    fail "${FUNCNAME[0]} — expected renamed pi-bash identity to persist across job ids"
+  fi
+}
+
 test_list_shows_aliases() {
   # plumb:req-0d23a1bb
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -2744,6 +3443,50 @@ test_whoami() {
   fi
 }
 
+test_whoami_uses_stable_pi_bash_identity() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local session_id job1 job2 raw1 raw2 tmpbin output1 output2
+  session_id="019d96e3-919b-750d-809c-cbe91385"
+  job1="aaaabbbbcccc"
+  job2="ddddeeeeffff"
+  raw1="pi-bash-zmx-$session_id-$job1"
+  raw2="pi-bash-zmx-$session_id-$job2"
+
+  setup_mock_pi_bash_registry "$session_id" "$job1" "$job2"
+  tmpbin="$(mktemp -d)"
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "list" ]]; then
+  printf 'session_name=%s\tclients=1\n' "${ZMX_SESSION:-}"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+  ln -sf "$(command -v tmux)" "$tmpbin/tmux"
+
+  output1=$(SURROGATE_PI_BASH_ZMX_DIR="$MOCK_PI_BASH_REGISTRY" PATH="$tmpbin:/usr/bin:/bin" ZMX_SESSION="$raw1" "$SURROGATE" whoami 2>&1)
+  output2=$(SURROGATE_PI_BASH_ZMX_DIR="$MOCK_PI_BASH_REGISTRY" PATH="$tmpbin:/usr/bin:/bin" ZMX_SESSION="$raw2" "$SURROGATE" whoami 2>&1)
+
+  rm -rf "$tmpbin"
+  cleanup_mock_pi_bash_registry
+
+  if [[ "$output1" == "$output2" ]] &&
+     echo "$output1" | grep -Fq "pi-bash-zmx-$session_id" &&
+     ! echo "$output1" | grep -Fq "$job1" &&
+     ! echo "$output2" | grep -Fq "$job2"; then
+    pass "${FUNCNAME[0]} — whoami canonicalizes pi-bash job sessions to a stable per-pi identity"
+  else
+    echo "    whoami #1: $output1"
+    echo "    whoami #2: $output2"
+    fail "${FUNCNAME[0]} — expected stable whoami output across pi-bash job ids"
+  fi
+}
+
 test_whoami_help() {
   # plumb:req-64333413
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -2826,8 +3569,10 @@ test_whoami_rejects_stale_env_session() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local output
-  output=$(ZMX_SESSION="stale-session-$$" "$SURROGATE" whoami 2>&1 || true)
+  local empty_proc output
+  empty_proc="$(mktemp -d)"
+  output=$(SURROGATE_PROC_ROOT="$empty_proc" ZMX_SESSION="stale-session-$$" "$SURROGATE" whoami 2>&1 || true)
+  rm -rf "$empty_proc"
 
   if echo "$output" | grep -q 'not present in zmx list'; then
     pass "${FUNCNAME[0]} — whoami rejects stale leaked env session"
@@ -4221,6 +4966,7 @@ test_read_validates_n() {
 
 run_section identity smoke \
   test_whoami \
+  test_whoami_uses_stable_pi_bash_identity \
   test_whoami_help \
   test_whoami_rejects_extra_args \
   test_whoami_falls_back_to_live_ancestry_session \
@@ -4239,6 +4985,8 @@ run_section aliases full \
   test_alias_100_adjectives_100_nouns \
   test_alias_collision_suffix \
   test_alias_cache_built_once \
+  test_alias_pi_bash_jobs_share_stable_alias \
+  test_rename_pi_bash_identity_persists_across_jobs \
   test_list_shows_aliases \
   test_who_shows_aliases \
   test_session_resolution_by_alias
@@ -4279,6 +5027,7 @@ run_section design full \
   test_type_rejects_empty_after_normalization \
   test_type_normalizes_tabs_and_crlf \
   test_send_rejects_dangerous_control_keys \
+  test_send_rejects_prose \
   test_dcg_blocks_type_when_available \
   test_dcg_blocks_normalized_multiline_type \
   test_audit_logs_allowed_type \
@@ -4354,7 +5103,19 @@ run_section invariants full \
   test_invariant_parent_check_not_env_var \
   test_invariant_unsets_zmx_session_before_attach \
   test_invariant_snippet_shims_nested_attach_all_shells \
+  test_shell_setup_commands_mode_requires_commands \
+  test_shell_setup_commands_mode_generates_registered_wrappers_all_shells \
+  test_shell_setup_commands_mode_plain_shell_stays_unwrapped \
+  test_shell_setup_commands_mode_wraps_only_registered_commands \
+  test_shell_setup_commands_mode_silent_under_nested_zmx \
+  test_shell_setup_commands_mode_wrap_message_includes_alias \
+  test_shell_setup_install_places_block_at_end_of_rc \
+  test_shell_setup_commands_mode_unaliases_before_if_block \
+  test_ui_hint_detects_agent_busy_states \
+  test_alias_predict_matches_base_hash \
   test_shell_setup_install_refreshes_existing_snippet \
+  test_shell_setup_private_config_is_gitignored \
+  test_shell_setup_example_config_is_public_safe \
   test_invariant_installed_matches_repo \
   test_install_replaces_dev_link_with_real_copy \
   test_release_helper_reinstalls_real_binaries

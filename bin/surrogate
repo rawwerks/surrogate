@@ -110,6 +110,13 @@ guard_send_keys() {
                 return 1
                 ;;
         esac
+        # Reject prose smuggled through send to bypass labels.
+        # tmux key names are short tokens (Enter, Escape, C-u, :wq, etc.).
+        # Any argument with spaces or >40 chars is prose, not a key name.
+        if [[ "${#key}" -gt 40 || "$key" == *" "* ]]; then
+            echo "surrogate send is for tmux key names, not prose. Use 'surrogate type' for messages (labels are required for safety)."
+            return 1
+        fi
     done
 }
 
@@ -819,14 +826,15 @@ High-value flows:
   surrogate who --recent 20           Find the most recent interesting sessions
   surrogate brief --recent 15         Brief the 15 most recently active sessions
   surrogate sweep --older-than 48     Preview old detached zmx sessions to delete
-  surrogate list --cwd                Show repo + cwd hints for every session
+  surrogate prime                     Agent context dump: identity, sessions, usage hints
+  surrogate list                      Show all sessions with project + cwd
   surrogate type --message <session> "long prose"
                                       Safest way to send agent prose
   surrogate submit <session>          Recover a visibly staged prompt
   surrogate read <session> -n 40      Inspect what happened after a send/type
 
 Commands:
-  list  [-n LINES] [--cwd] [--json]
+  list  [-n LINES] [--bare] [--json]
                                 List sessions by alias; add --cwd/--json for repo and UI context
   stale [--older-than HOURS]    List old detached zmx sessions (default: 24h)
   send  <session> [keys...]     Send tmux send-keys style keystrokes
@@ -852,6 +860,7 @@ Commands:
   prune-bridges [--all|--dead]  Remove surrogate tmux bridges only
   peek  [-n LINES] [--filter PATTERN]
                                 Batch read last N lines from all sessions (default: 5)
+  prime [--json]                Agent context dump: identity, sessions, usage hints
   alias <session>               Show the alias for a session
   whoami                        Show current session name and alias
   rename <session> <new-alias>  Set a custom alias (session ID stays the same)
@@ -884,7 +893,7 @@ Examples:
   surrogate list
   surrogate help list
   surrogate live --here
-  surrogate list --cwd
+  surrogate list
   surrogate stale --older-than 72 --limit 20
   surrogate sweep --older-than 48
   surrogate prune-sessions --stale --older-than 48 --dry-run
@@ -912,14 +921,13 @@ EOF
 
 list_usage() {
     cat <<'EOF'
-usage: surrogate list [-n LINES] [--cwd] [--json]
+usage: surrogate list [-n LINES] [--bare] [--json]
 
-List every zmx session with deterministic aliasing. Use `--cwd` or `--json`
-when you need visible repo/cwd/ui hints.
+List every zmx session with project, UI, and cwd columns.
 
 Options:
   -n LINES   Inspect this many recent history lines for repo/cwd/ui hints (default: 10)
-  --cwd      Include full cwd hint column in text output
+  --bare     Minimal output: alias + session name only
   --json     Emit machine-readable session metadata
 
 Notes:
@@ -1059,7 +1067,11 @@ send_usage() {
     cat <<'EOF'
 usage: surrogate send <session> <keys...>
 
-Send tmux-style keys directly. Use this for Enter, Escape, arrows, or manual repair.
+Send tmux-style key names only. For messages, use 'surrogate type' (which adds
+the [SURROGATE] label so messages can never impersonate a human).
+
+Each argument must be a single tmux key name (Enter, Escape, C-u, ":wq", etc.).
+Prose (arguments with spaces or >40 chars) is rejected — use 'surrogate type'.
 Dangerous control keys C-c, C-d, and C-z are intentionally blocked.
 EOF
 }
@@ -1084,6 +1096,7 @@ cmd_help() {
         prune-sessions) prune_sessions_usage ;;
         prune-bridges) prune_bridges_usage ;;
         sweep) sweep_usage ;;
+        prime) echo "usage: surrogate prime [--json]"; echo ""; echo "Agent context dump: identity, all sessions (enriched with peer project names), and usage hints." ;;
         type) type_usage ;;
         send) send_usage ;;
         submit) submit_usage ;;
@@ -1300,8 +1313,15 @@ ui_hint_from_history() {
     local last_line=""
     last_line="$(last_visible_line "$text")"
 
+    # Agent TUIs — prompt glyphs, vendor banners, busy/approval states.
+    # Busy states ("esc to cancel", "Working", approval dialogs) are also
+    # agent signals: the session is clearly running a TUI even if not idle
+    # at a ready prompt right now.
     if printf '%s\n' "$text" | grep -Eqi '^[[:space:]]*[›•✻]' ||
-       printf '%s\n' "$text" | grep -Eqi 'Use /skills to list available skills|Model interrupted|[0-9]+% left|tokens left|background terminal running|Worked for [0-9]+m'; then
+       printf '%s\n' "$text" | grep -Eqi 'Use /skills to list available skills|Model interrupted|[0-9]+% left|tokens left|background terminal running|Worked for [0-9]+m' ||
+       printf '%s\n' "$text" | grep -Eqi 'Claude Code|\? for shortcuts|⏵⏵ bypass permissions|shift\+tab to cycle' ||
+       printf '%s\n' "$text" | grep -Eqi 'pi v[0-9]|pi-handoff|mycelium (on|off)|dirpack [0-9]|\(openai-codex\)|gpt-[0-9]+\.[0-9]+ (xhigh|high|medium|low)' ||
+       printf '%s\n' "$text" | grep -Eqi '[Ee]sc to (cancel|interrupt)|Tab to amend|Do you want to proceed\?|Press enter to continue|ctrl\+e to explain|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] [Ww]orking'; then
         echo "agent"
         return 0
     fi
@@ -1501,21 +1521,21 @@ cmd_list() {
     check_deps
     _build_alias_cache
     local lines=10
-    local show_cwd=0
+    local bare=0
     local json=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) list_usage; return 0 ;;
             -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
-            --cwd) show_cwd=1; shift ;;
+            --cwd) shift ;;  # kept for compat, now default
+            --bare) bare=1; shift ;;
             --json) json=1; shift ;;
             *) die "unknown flag: $1" ;;
         esac
     done
 
-    if [[ "$show_cwd" -eq 0 && "$json" -eq 0 ]]; then
-        # Fast path: plain list stays cheap and delegates directly to zmx session names.
+    if [[ "$bare" -eq 1 && "$json" -eq 0 ]]; then
         while IFS= read -r session; do
             printf "%-20s %s\n" "${_ALIAS_CACHE[$session]:-$(session_alias_single "$session")}" "$session"
         done < <(_session_names)
@@ -1546,19 +1566,11 @@ cmd_list() {
         return 0
     fi
 
-    if [[ "$show_cwd" -eq 1 ]]; then
-        printf "%-18s %-42s %-14s %-8s %s\n" "ALIAS" "SESSION" "PROJECT" "UI" "CWD"
-        while IFS=$'\t' read -r _age_seconds _ago _attached _clients alias session _activity_seconds _active_ago _snippet cwd_hint project_hint ui_hint; do
-            [[ -n "$session" ]] || continue
-            printf "%-18s %-42s %-14s %-8s %s\n" "$alias" "$session" "${project_hint:--}" "$ui_hint" "${cwd_hint:--}"
-        done <<< "$rows"
-    else
-        printf "%-18s %-42s %-14s %s\n" "ALIAS" "SESSION" "PROJECT" "UI"
-        while IFS=$'\t' read -r _age_seconds _ago _attached _clients alias session _activity_seconds _active_ago _snippet _cwd_hint project_hint ui_hint; do
-            [[ -n "$session" ]] || continue
-            printf "%-18s %-42s %-14s %s\n" "$alias" "$session" "${project_hint:--}" "$ui_hint"
-        done <<< "$rows"
-    fi
+    printf "%-18s %-42s %-14s %-8s %s\n" "ALIAS" "SESSION" "PROJECT" "UI" "CWD"
+    while IFS=$'\t' read -r _age_seconds _ago _attached _clients alias session _activity_seconds _active_ago _snippet cwd_hint project_hint ui_hint; do
+        [[ -n "$session" ]] || continue
+        printf "%-18s %-42s %-14s %-8s %s\n" "$alias" "$session" "${project_hint:--}" "$ui_hint" "${cwd_hint:--}"
+    done <<< "$rows"
 }
 
 cmd_stale() {
@@ -2360,6 +2372,12 @@ cmd_peek() {
 
 cmd_alias() {
     check_deps
+    if [[ "${1:-}" == "--predict" ]]; then
+        shift
+        [[ $# -ge 1 ]] || die "usage: surrogate alias --predict <session-name>"
+        session_alias_base "$1"
+        return 0
+    fi
     [[ $# -ge 1 ]] || die "usage: surrogate alias <session>"
     local session
     session="$(resolve_session "$1")"
@@ -2696,6 +2714,73 @@ cmd_cleanup() {
     cmd_prune_bridges "$@"
 }
 
+cmd_prime() {
+    check_deps
+    _build_alias_cache
+
+    local json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) echo "usage: surrogate prime [--json]"; echo ""; echo "Dump everything an agent needs: identity, sessions, and usage hints."; return 0 ;;
+            --json) json=1; shift ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+
+    # --- Identity ---
+    local my_session="" my_alias=""
+    if IFS=$'\t' read -r _status my_session < <(current_session_identity 2>/dev/null || true); then
+        [[ -n "$my_session" ]] && my_alias="${_ALIAS_CACHE[$my_session]:-$(session_alias_base "$my_session")}"
+    fi
+
+    # --- Session records ---
+    local rows
+    rows="$(session_records 10 | sort -t $'\t' -k1,1n)"
+
+    if [[ "$json" -eq 1 ]]; then
+        printf '{"identity":{"session":%s,"alias":%s},' \
+            "$(json_or_null "${my_session:+\"$(json_escape "$my_session")\"}")" \
+            "$(json_or_null "${my_alias:+\"$(json_escape "$my_alias")\"}")"
+        printf '"sessions":['
+        local first=1
+        while IFS=$'\t' read -r age_seconds ago attached clients alias session _activity_seconds _active_ago snippet cwd_hint project_hint ui_hint; do
+            [[ -n "$session" ]] || continue
+            [[ "$first" -eq 1 ]] || printf ','
+            first=0
+            local effective_project="$(record_nullable_field "$project_hint")"
+            printf '{"alias":"%s","session":"%s","project":%s,"ui_hint":"%s","age":"%s","attached":%s,"clients":%s,"snippet":"%s"}' \
+                "$(json_escape "$alias")" \
+                "$(json_escape "$session")" \
+                "$(json_or_null "${effective_project:+\"$(json_escape "$effective_project")\"}")" \
+                "$(json_escape "$ui_hint")" \
+                "$(json_escape "$ago")" \
+                "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')" \
+                "$clients" \
+                "$(json_escape "$snippet")"
+        done <<< "$rows"
+        echo ']}'
+        return 0
+    fi
+
+    # --- Text output ---
+    if [[ -n "$my_session" ]]; then
+        echo "You: $my_alias  $my_session"
+        echo ""
+    fi
+
+    printf "%-4s %-8s %-18s %-42s %-16s %s\n" "AGE" "UI" "ALIAS" "SESSION" "PROJECT" "SNIPPET"
+    while IFS=$'\t' read -r _age_seconds ago attached _clients alias session _activity_seconds _active_ago snippet cwd_hint project_hint ui_hint; do
+        [[ -n "$session" ]] || continue
+        local attached_mark=""
+        [[ "$attached" == "attached" ]] && attached_mark="*"
+        printf "%-4s %-8s %-18s %-42s %-16s %s\n" \
+            "${ago}${attached_mark}" "$ui_hint" "$alias" "$session" "${project_hint:--}" "$snippet"
+    done <<< "$rows"
+
+    echo ""
+    echo "Usage: surrogate type <alias> \"message\"  |  surrogate read <alias> -n 30  |  surrogate who --project <name>"
+}
+
 cmd_status() {
     check_deps
     local sessions
@@ -2746,6 +2831,7 @@ case "${1}" in
     bridge)  shift; cmd_bridge "$@" ;;
     prune-bridges) shift; cmd_prune_bridges "$@" ;;
     cleanup) shift; cmd_cleanup "$@" ;;
+    prime)   shift; cmd_prime "$@" ;;
     status)  shift; cmd_status "$@" ;;
     help|-h|--help) shift || true; cmd_help "$@" ;;
     *)       die "unknown command: $1" ;;

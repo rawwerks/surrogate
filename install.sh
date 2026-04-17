@@ -195,8 +195,10 @@ install_dcg || true
 # --- next steps ---
 
 echo ""
+info "To wrap only selected agent commands in zmx (recommended):"
+info "  cp surrogate-shell.conf.example ~/.config/surrogate/shell.conf && surrogate-shell-setup --install"
 info "To auto-wrap all terminals in zmx sessions:"
-info "  surrogate-shell-setup --install"
+info "  surrogate-shell-setup --install --mode all"
 info "To skip dcg auto-install next time:"
 info "  SURROGATE_SKIP_DCG=1 bash install.sh"
 info "To keep installed binaries synced during development:"

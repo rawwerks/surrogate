@@ -2078,6 +2078,122 @@ test_ui_hint_detects_agent_busy_states() {
   fi
 }
 
+test_shell_setup_preserves_user_aliases_and_functions() {
+  # INVARIANT: wrapping a command must NOT destroy the user's existing
+  # alias or function for that command. Dispatch rules:
+  #   (a) alias-backed: the expansion is tokenized and wrap+exec'd inside
+  #       zmx. zmx receives the alias target as the real command.
+  #   (b) function-backed: the user's function is renamed in-process to
+  #       `_SURR_ORIG_<cmd>_fn` and the wrapper calls it DIRECTLY without
+  #       zmx. Wrapping a function would require exporting its body
+  #       (leaks via BASH_FUNC_<name>%%=... env entries) or writing it
+  #       to disk, both of which are private-data leakage primitives
+  #       because shell functions can contain secrets or private paths.
+  #   (c) bare: the wrapper wrap+exec's the command name itself inside zmx.
+  # In every case, the user's original command behavior is preserved.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script cfg tmp_home tmpbin zmx_log snippet_file
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  cfg="$(mktemp)"
+  tmp_home="$(mktemp -d)"
+  tmpbin="$(mktemp -d)"
+  zmx_log="$(mktemp)"
+  snippet_file="$tmp_home/snippet.sh"
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="myalias myfunc mybare"
+EOF
+
+  # Stub zmx: records which session-name was created and exec's the rest,
+  # so we can observe both "was zmx called" and "what did it exec".
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+shift  # drop 'attach'
+printf 'zmx-session:%s exec:%s\n' "$1" "$*" >> "$SURR_TEST_ZMX_LOG"
+shift  # drop session name
+exec "$@"
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/real-alias-target" <<'EOF'
+#!/usr/bin/env bash
+echo "alias-target-ran flags:$*"
+EOF
+  chmod +x "$tmpbin/real-alias-target"
+
+  cat > "$tmpbin/mybare" <<'EOF'
+#!/usr/bin/env bash
+echo "mybare-ran args:$*"
+EOF
+  chmod +x "$tmpbin/mybare"
+
+  "$setup_script" --show --config "$cfg" | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
+
+  local output
+  output=$(
+    HOME="$tmp_home" \
+    PATH="$tmpbin:/usr/bin:/bin" \
+    ZMX_BIN="$tmpbin/zmx" \
+    SURROGATE_BIN="$(dirname "$SCRIPT_DIR")/bin/surrogate" \
+    SURR_TEST_ZMX_LOG="$zmx_log" \
+    bash --noprofile --norc -ic "
+      alias myalias='real-alias-target --aliased'
+      myfunc() { echo \"function-ran args:\$*\"; echo \"function-env-BASH_FUNC_check:\${BASH_FUNC_myfunc%%:-unset}\"; }
+      source '$snippet_file'
+      myalias u1 u2
+      myfunc u3 u4
+      mybare u5 u6
+    " 2>&1
+  )
+
+  rm -f "$cfg"
+
+  local all_ok=true
+
+  # (a) alias case: zmx was called AND the alias target ran.
+  if ! echo "$output" | grep -Fq 'alias-target-ran flags:--aliased u1 u2' ||
+     ! grep -Fq 'zmx-session:myalias-' "$zmx_log"; then
+    echo "    alias case failed (expected zmx wrap + alias target exec)"
+    all_ok=false
+  fi
+
+  # (b) function case: the function body ran, AND zmx was NOT called for it,
+  # AND there is no BASH_FUNC_ env entry leaking the body.
+  if ! echo "$output" | grep -Fq 'function-ran args:u3 u4' ||
+     grep -Fq 'zmx-session:myfunc-' "$zmx_log"; then
+    echo "    function case failed (expected function body to run WITHOUT zmx wrap)"
+    all_ok=false
+  fi
+
+  # Security guard: the generated snippet must not emit a bash function
+  # export for the captured function — exporting leaks the body as
+  # `BASH_FUNC_<name>%%=...` into every child process environment.
+  if grep -qE 'export[[:space:]]+-f.*_SURR_ORIG_' "$snippet_file"; then
+    echo "    SECURITY: snippet exports captured function, leaking body via env"
+    all_ok=false
+  fi
+
+  # (c) bare case: zmx was called AND the bare binary ran.
+  if ! echo "$output" | grep -Fq 'mybare-ran args:u5 u6' ||
+     ! grep -Fq 'zmx-session:mybare-' "$zmx_log"; then
+    echo "    bare case failed (expected zmx wrap + bare binary exec)"
+    all_ok=false
+  fi
+
+  if $all_ok; then
+    pass "${FUNCNAME[0]} — aliases wrap through zmx, functions stay in-process (no env leak), bare commands wrap"
+  else
+    echo "    zmx log:"
+    sed 's/^/      /' "$zmx_log"
+    echo "    output:"
+    echo "$output" | sed 's/^/      /'
+    fail "${FUNCNAME[0]} — preservation invariant violated"
+  fi
+}
+
 test_shell_setup_private_config_is_gitignored() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -5113,6 +5229,7 @@ run_section invariants full \
   test_shell_setup_commands_mode_unaliases_before_if_block \
   test_ui_hint_detects_agent_busy_states \
   test_alias_predict_matches_base_hash \
+  test_shell_setup_preserves_user_aliases_and_functions \
   test_shell_setup_install_refreshes_existing_snippet \
   test_shell_setup_private_config_is_gitignored \
   test_shell_setup_example_config_is_public_safe \

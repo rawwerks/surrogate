@@ -173,28 +173,93 @@ resolve_settings() {
 }
 
 bash_like_wrappers() {
+  # Each wrapper dispatches on the kind captured at preamble time:
+  #   - function: the user's shell function was renamed to
+  #     `_SURR_ORIG_<cmd>_fn`. We call it directly in-process and do NOT
+  #     zmx-wrap. Wrapping a function would require exposing its body
+  #     across a process boundary — either via a bash function-export, which puts
+  #     the body in the environment as `BASH_FUNC_<name>%%=...`, or via
+  #     a temp file. Shell functions can contain secrets or private
+  #     paths, so either is a real private-data leakage primitive. The
+  #     safe default is to preserve the function's behavior without
+  #     wrapping. Users who want their command wrapped should define
+  #     it as an alias instead.
+  #   - alias:   tokenize the captured expansion and wrap+exec inside zmx.
+  #   - bare:    wrap+exec the command name itself inside zmx.
   local commands="$1"
-  local cmd
+  local cmd sanitized
   for cmd in $commands; do
-    printf '    %s() { _surr_wrap_command %s "$@"; }\n' "$cmd" "$cmd"
+    sanitized=$(printf '%s' "$cmd" | tr -c 'A-Za-z0-9' '_')
+    printf '    %s() {\n' "$cmd"
+    printf '      case "${_SURR_KIND_%s:-bare}" in\n' "$sanitized"
+    printf '        function) _SURR_ORIG_%s_fn "$@" ;;\n' "$sanitized"
+    printf '        alias)    local -a __t; read -ra __t <<< "${_SURR_ALIAS_%s}"; _surr_wrap_command %s "${__t[@]}" "$@" ;;\n' "$sanitized" "$cmd"
+    printf '        *)        _surr_wrap_command %s %s "$@" ;;\n' "$cmd" "$cmd"
+    printf '      esac\n'
+    printf '    }\n'
   done
 }
 
-bash_like_unaliases() {
-  # Emit top-level `unalias <cmd>` statements that execute BEFORE the
-  # wrapper `if` block is parsed. Bash parses a compound command (like
-  # an if block) as a unit and alias-expands inside it at parse time, so
-  # a runtime `unalias` inside the block fires too late: if the rc file
-  # earlier did `alias foo="bar ..."` for one of our wrapped commands,
-  # the function NAME `foo` in `foo() { ... }` would be alias-expanded during the
-  # block parse and cause a syntax error. Doing the unaliases as
-  # top-level statements first means they execute before the block is
-  # read, so the function definitions inside the block parse cleanly.
+bash_like_alias_preamble() {
+  # For each wrapped command, capture the user's original meaning
+  # (shell function, shell alias, or bare binary) before our wrapper
+  # shadows it. This preamble runs as top-level statements BEFORE the
+  # wrapper `if` block, for two load-bearing reasons:
+  #
+  # (1) User aliases like `alias foo='bar --some-flag'` and user
+  #     functions like `foo() { ... real work ... }` would otherwise be
+  #     destroyed: our wrapper function `<cmd>() { ... }` shadows them.
+  #     The captured value lets the wrapper still run the user's
+  #     intended command.
+  #
+  # (2) Bash parses a compound command (like an `if` block) as a unit
+  #     and alias-expands inside it at parse time, so a runtime
+  #     `unalias` inside the block fires too late: if the rc file
+  #     earlier did `alias foo="bar ..."` for one of our wrapped
+  #     commands, the function NAME `foo` in `foo() { ... }` would be
+  #     alias-expanded during the block parse and cause a syntax
+  #     error. Running the unalias/unset as top-level statements first
+  #     means they execute before the block is read, so the function
+  #     definitions inside the block parse cleanly.
+  #
+  # For function-backed commands we deliberately do NOT export the
+  # renamed function — that would leak the body into the env of every
+  # child process as `BASH_FUNC_<name>%%=...`, and shell functions can
+  # contain secrets or private paths. The wrapper calls the renamed
+  # function in-process instead, accepting that function-backed
+  # commands are preserved but not zmx-wrapped.
   local commands="$1"
-  local cmd
+  [[ -n "$commands" ]] || return 0
+
+  # Emit a one-time `_surr_capture_cmd` helper, then call it per command.
+  cat <<'PREAMBLE_EOF'
+_surr_capture_cmd() {
+  local _surr_cmd="$1"
+  local _surr_sanitized="$2"
+  if declare -f "$_surr_cmd" >/dev/null 2>&1; then
+    eval "$(declare -f "$_surr_cmd" | sed "1s/^$_surr_cmd /_SURR_ORIG_${_surr_sanitized}_fn /")"
+    unset -f "$_surr_cmd"
+    eval "_SURR_KIND_${_surr_sanitized}=function"
+    return 0
+  fi
+  local _surr_alias_val
+  _surr_alias_val="$(alias "$_surr_cmd" 2>/dev/null | sed -E "s/^alias [^=]+='(.*)'\$/\1/")"
+  unalias "$_surr_cmd" 2>/dev/null || true
+  if [[ -n "$_surr_alias_val" ]]; then
+    printf -v "_SURR_ALIAS_${_surr_sanitized}" '%s' "$_surr_alias_val"
+    eval "_SURR_KIND_${_surr_sanitized}=alias"
+  else
+    eval "_SURR_KIND_${_surr_sanitized}=bare"
+  fi
+}
+PREAMBLE_EOF
+
+  local cmd sanitized
   for cmd in $commands; do
-    printf 'unalias %s 2>/dev/null || true\n' "$cmd"
+    sanitized=$(printf '%s' "$cmd" | tr -c 'A-Za-z0-9' '_')
+    printf '_surr_capture_cmd %s %s\n' "$cmd" "$sanitized"
   done
+  printf 'unset -f _surr_capture_cmd\n'
 }
 
 fish_wrappers() {
@@ -222,7 +287,7 @@ snippet_for_bash_like() {
     '# INVARIANT: commands mode is silent at startup; all mode prints on wrap and inherited-session paths.'
 
   if [[ "$mode" == "commands" ]]; then
-    bash_like_unaliases "$commands"
+    bash_like_alias_preamble "$commands"
   fi
 
   cat <<'EOF'
@@ -266,7 +331,14 @@ if [[ $- == *i* ]]; then
   }
 
   _surr_wrap_command() {
-    local _surr_cmd="$1"
+    # Signature: _surr_wrap_command <label> <real_cmd_tokens...> <user_args...>
+    #   <label>           — session-name prefix and banner text (e.g. "mycli")
+    #   <real_cmd_tokens> — the actual command + flags to exec (e.g. "claude" "--dangerously-skip-permissions").
+    #                       Comes from the captured original alias expansion, or
+    #                       defaults to the bare command name when there was no alias.
+    #   <user_args>       — whatever the user typed after the wrapped command name.
+    # After shifting off <label>, "$@" is the full exec list we hand to zmx.
+    local _surr_label="$1"
     shift
     local _surr_zmx="${ZMX_BIN:-$HOME/.local/bin/zmx}"
     local _surr_surrogate="${SURROGATE_BIN:-$HOME/.local/bin/surrogate}"
@@ -275,7 +347,7 @@ if [[ $- == *i* ]]; then
     local _surr_name=""
     local _surr_alias=""
     if [[ -n "${SURROGATE_NO_ZMX:-}" || ! -x "$_surr_zmx" ]]; then
-      command "$_surr_cmd" "$@"
+      command "$@"
       return
     fi
     _surr_parent="$(_surr_parent_name)"
@@ -290,10 +362,10 @@ if [[ $- == *i* ]]; then
       else
         echo "surrogate: zmx session ${ZMX_SESSION:-inherited}"
       fi
-      command "$_surr_cmd" "$@"
+      command "$@"
       return
     fi
-    _surr_name="${_surr_cmd}-$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
+    _surr_name="${_surr_label}-$(date +'%Y-%m-%d_%H-%M-%S_%Z')-$$"
     if [[ -x "$_surr_surrogate" ]]; then
       _surr_alias="$(PATH="$_surr_path" "$_surr_surrogate" alias --predict "$_surr_name" 2>/dev/null || true)"
     fi
@@ -302,7 +374,7 @@ if [[ $- == *i* ]]; then
     else
       echo "surrogate: zmx session $_surr_name"
     fi
-    env -u ZMX_SESSION "$_surr_zmx" attach "$_surr_name" "$_surr_cmd" "$@"
+    env -u ZMX_SESSION "$_surr_zmx" attach "$_surr_name" "$@"
   }
 
   _surr_parent="$(_surr_parent_name)"

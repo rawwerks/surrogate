@@ -157,7 +157,7 @@ In `commands` mode the snippet:
 - Clears leaked `ZMX_SESSION` when the shell is not actually running under a zmx parent, so command wrappers still fire correctly
 - Keeps plain `zmx attach ...` working by clearing leaked `ZMX_SESSION` only for nested attaches
 - Stays silent at shell startup in all cases — including shells already spawned inside zmx by a terminal emulator or agent tooling (e.g. `pi`'s bash extension); the snippet announces only when one of the configured commands is actually wrapped
-- Installs the managed block at the **end** of your rc file and `unalias`es each wrapped command first, so a bash `alias codex='bunx ...'` (or similar) defined earlier in your rc doesn't shadow the wrapper — bash aliases otherwise win over shell functions regardless of definition order
+- Installs the managed block at the **end** of your rc file and preserves your existing aliases and shell functions. Aliases get the full zmx wrap — the expansion runs inside a fresh zmx session. Shell functions are preserved but **not** wrapped: the wrapper calls the renamed function in-process, because exporting a function across a zmx process boundary would leak its body into child-process environments (shell functions can contain secrets or private paths). If you want a command wrapped in zmx, bind it to an alias instead of a function
 
 #### Legacy / maximal mode: auto-wrap every shell
 

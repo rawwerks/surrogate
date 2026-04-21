@@ -115,6 +115,8 @@ If an action is outside surrogate's authority surface, the correct path is direc
 
 ## Commands
 
+Every surrogate subcommand must support `-h` and `--help` flags that print a usage summary and exit 0 without performing any side effect. The usage line must name the subcommand and its primary arguments.
+
 ### list
 
 The `list` command must print all zmx sessions by delegating directly to `zmx list`.
@@ -169,9 +171,11 @@ The `active` command must accept an optional `--all` flag. By default, it must s
 
 ### live
 
-The `live` command must be the low-noise discovery view for sessions that are currently messageable via surrogate. It must show only sessions present in `zmx list` that still have attached clients, and it must rank them by recent visible activity rather than spawn time. It must support the same `--recent`, `--project`, `--cwd`, and `--json` filters as the other discovery commands, and `--here` must resolve to the current repo name.
+The `live` command must be the low-noise discovery view for sessions that are currently messageable via surrogate. It must include every zmx session whose underlying process is still alive, regardless of whether any interactive client is currently attached — a detached agent session is still messageable via surrogate's tmux bridge, so attachment is not a precondition for "live." Sessions must be ranked by recent visible-pane activity rather than spawn time. It must support the same `--recent`, `--project`, `--cwd`, and `--json` filters as the other discovery commands, and `--here` must resolve to the current repo name.
 
-By default, `live` must hide low-signal shell-like lanes when they have no visible repo or cwd hint. `--all` must include those low-signal live lanes again. When low-signal rows are hidden, text output must say so explicitly, and JSON output must report both the displayed count and the hidden low-signal count.
+By default, `live` must hide low-signal lanes — sessions whose visible pane looks like a bare interactive shell (no `agent` UI hint, no project hint, no cwd hint). This is how noise self-cleans: when an agent session's primary process exits and drops back to a shell prompt, the lane stops looking like an agent lane and falls out of the default view without any manual reap step. `--all` must include those low-signal live lanes again. When low-signal rows are hidden, text output must say so explicitly, and JSON output must report both the displayed count and the hidden low-signal count.
+
+Visible-pane activity must be derived from actual pane content, not from the zmx log file's modification time. The zmx log file is mutated on every client connect/disconnect — including the connects performed by surrogate's own `zmx list` polling — so its mtime does not reflect agent work. Activity detection must take a deterministic snapshot of recent pane content (for example, a stable hash of the tail of `zmx history`) and persist it per-session in a surrogate-owned cache so that subsequent invocations can measure "time since the snapshot last changed." The cache must be local to the user and safe for concurrent surrogate invocations.
 
 If the current shell is ancestry-backed but not present in `zmx list`, `live` must surface that fact separately as an anomaly instead of pretending the current shell is messageable.
 
@@ -193,15 +197,17 @@ The `peek` command must accept optional `-n LINES` (default 5) and `--filter PAT
 
 ### rename
 
-The `rename` command must accept a source session name and a target name. It must rename the zmx socket file (the source of truth). It must kill any existing bridge for the old name — bridges hold a stale `zmx attach` command and must not be renamed. A fresh bridge will be created lazily on the next send/type. Watermark and lock files must be renamed. The command must reject if the source session does not exist. The command must reject if the target name already exists.
+The `rename` command must accept a source session name and a target name. It must rename the zmx socket file (the source of truth). It must kill any existing bridge for the old name — bridges hold a stale `zmx attach` command and must not be renamed. A fresh bridge will be created lazily on the next send/type. Watermark and lock files must be renamed. The command must reject if the source session does not exist. The command must reject if the target name already exists. The target alias must be non-empty; an empty target must be rejected with `error: alias cannot be empty`. For pi-bash sessions of the form `pi-bash-zmx-<session-id>-<job-id>`, the custom alias must be recorded under the canonical session key (`pi-bash-zmx-<session-id>`) so that subsequent job ids in the same pi-bash session inherit the rename.
 
 ### alias
 
 The `alias` command must accept a session name (or alias) and print its deterministic alias. The alias must be computed from the session name using a hash function, selecting one adjective and one noun from built-in wordlists (100 adjectives × 100 nouns = 10,000 combinations). The alias must be deterministic — the same session name must always produce the same alias. On hash collision, a numeric suffix must be appended. The alias cache must be built once per invocation and shared across all commands.
 
+For pi-bash sessions spawned from a shared `SURROGATE_PI_BASH_ZMX_DIR` registry, the alias must be computed from a canonical session identity derived from the registry metadata, not from the raw `pi-bash-zmx-<session-id>-<job-id>` string. Jobs belonging to the same pi-bash session id must share the same alias, so that long-lived pi-bash session identity survives job rotation.
+
 ### whoami
 
-The `whoami` command must print the alias and zmx session name of the current surrogate session (the zmx session this terminal is running in). It must detect the current session by checking the zmx environment or parent `zmx attach <session>` ancestry. It must support `-h`/`--help` and reject extra positional arguments with `usage: surrogate whoami`. For a live current session, it must deterministically compute the alias rather than printing `unknown`. If `ZMX_SESSION` is set but not present in `zmx list`, `whoami` must first try to recover the session name from `zmx attach` ancestry. If ancestry identifies a live session, `whoami` must return it. If ancestry identifies a session name that is not present in `zmx list`, `whoami` must still succeed but mark it clearly as ancestry-only and not messageable via surrogate. If neither env nor ancestry yields a usable session identity, then `whoami` must reject the stale or leaked environment value explicitly.
+The `whoami` command must print the alias and zmx session name of the current surrogate session (the zmx session this terminal is running in). It must detect the current session by checking the zmx environment or parent `zmx attach <session>` ancestry. It must support `-h`/`--help` and reject extra positional arguments with `usage: surrogate whoami`. For a live current session, it must deterministically compute the alias rather than printing `unknown`. If `ZMX_SESSION` is set but not present in `zmx list`, `whoami` must first try to recover the session name from `zmx attach` ancestry. If ancestry identifies a live session, `whoami` must return it. If ancestry identifies a session name that is not present in `zmx list`, `whoami` must still succeed but mark it clearly as ancestry-only and not messageable via surrogate. If neither env nor ancestry yields a usable session identity, then `whoami` must reject the stale or leaked environment value explicitly. For pi-bash sessions resolved via `SURROGATE_PI_BASH_ZMX_DIR`, `whoami` must print the canonical `pi-bash-zmx-<session-id>` identity rather than the raw per-job `pi-bash-zmx-<session-id>-<job-id>` form, so that the same pi-bash session produces the same output across job rotations.
 
 ### prune-sessions
 

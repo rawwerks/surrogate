@@ -264,17 +264,26 @@ _build_alias_cache() {
         sorted_names+=("$name")
     done < <(_session_names | sort)
 
-    # Compute aliases: custom overrides hash-derived
+    # Compute aliases: custom overrides hash-derived. Pi-bash job ids
+    # collapse to a single canonical identity (pi-bash-zmx-<sessionId>)
+    # so multiple jobs for one sessionId share one alias and one custom
+    # rename. Both raw and canonical names are stored as cache keys.
     local -A base_count
-    local h i c s base cnt
+    local -A canonical_alias
+    local h i c s base cnt canonical final_alias
     for name in "${sorted_names[@]}"; do
-        if [[ -n "${custom_aliases[$name]:-}" ]]; then
-            # Custom alias — use directly
-            _ALIAS_CACHE["$name"]="${custom_aliases[$name]}"
-            _ALIAS_REVERSE["${custom_aliases[$name]}"]="$name"
+        canonical="$(canonicalize_pi_bash_session "$name")"
+        if [[ -n "${canonical_alias[$canonical]:-}" ]]; then
+            final_alias="${canonical_alias[$canonical]}"
+            _ALIAS_CACHE["$name"]="$final_alias"
+            continue
+        fi
+        if [[ -n "${custom_aliases[$canonical]:-}" ]]; then
+            final_alias="${custom_aliases[$canonical]}"
+        elif [[ -n "${custom_aliases[$name]:-}" ]]; then
+            final_alias="${custom_aliases[$name]}"
         else
-            # Hash-derived alias
-            s="$name" h=5381
+            s="$canonical" h=5381
             for (( i=0; i<${#s}; i++ )); do
                 printf -v c '%d' "'${s:$i:1}"
                 h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
@@ -284,49 +293,90 @@ _build_alias_cache() {
             cnt=$((cnt + 1))
             base_count["$base"]=$cnt
             if [[ $cnt -eq 1 ]]; then
-                _ALIAS_CACHE["$name"]="$base"
-                _ALIAS_REVERSE["$base"]="$name"
+                final_alias="$base"
             else
-                _ALIAS_CACHE["$name"]="${base}-${cnt}"
-                _ALIAS_REVERSE["${base}-${cnt}"]="$name"
+                final_alias="${base}-${cnt}"
             fi
         fi
+        canonical_alias["$canonical"]="$final_alias"
+        _ALIAS_CACHE["$name"]="$final_alias"
+        _ALIAS_CACHE["$canonical"]="$final_alias"
+        _ALIAS_REVERSE["$final_alias"]="$canonical"
     done
     _ALIAS_CACHE_BUILT=1
 }
 
+canonicalize_pi_bash_session() {
+    # Collapse pi-bash-zmx-<session_id>-<job_id> to pi-bash-zmx-<session_id>
+    # when SURROGATE_PI_BASH_ZMX_DIR registers the raw name under a known
+    # sessionId. This keeps whoami/alias/rename stable across job ids that
+    # belong to one pi-bash session. Opt-in via env var so it stays off
+    # in environments that don't use pi-bash.
+    local name="$1"
+    local registry="${SURROGATE_PI_BASH_ZMX_DIR:-}"
+    case "$name" in
+        pi-bash-zmx-*) ;;
+        *) echo "$name"; return 0 ;;
+    esac
+    [[ -n "$registry" && -d "$registry" ]] || { echo "$name"; return 0; }
+
+    local session_dir job_dir meta session_id
+    for session_dir in "$registry"/*/; do
+        [[ -d "$session_dir" ]] || continue
+        for job_dir in "$session_dir"*/; do
+            meta="${job_dir}meta.json"
+            [[ -f "$meta" ]] || continue
+            if grep -Fq "\"sessionName\": \"$name\"" "$meta" 2>/dev/null; then
+                session_id="${session_dir%/}"
+                session_id="${session_id##*/}"
+                [[ -n "$session_id" ]] && { echo "pi-bash-zmx-$session_id"; return 0; }
+            fi
+        done
+    done
+    echo "$name"
+}
+
 session_alias_base() {
-    local name="$1" h=5381 i c
-    for (( i=0; i<${#name}; i++ )); do
-        printf -v c '%d' "'${name:$i:1}"
+    local name="$1" h=5381 i c canonical
+    canonical="$(canonicalize_pi_bash_session "$name")"
+    for (( i=0; i<${#canonical}; i++ )); do
+        printf -v c '%d' "'${canonical:$i:1}"
         h=$(( ((h << 5) + h + c) & 0x7FFFFFFF ))
     done
     echo "${ADJECTIVES[$((h % 100))]}-${NOUNS[$((h / 100 % 100))]}"
 }
 
 session_alias_single() {
-    local name="$1"
-    if [[ -n "$_ALIAS_CACHE_BUILT" && -n "${_ALIAS_CACHE[$name]:-}" ]]; then
-        echo "${_ALIAS_CACHE[$name]}"
+    local name="$1" canonical
+    canonical="$(canonicalize_pi_bash_session "$name")"
+    if [[ -n "$_ALIAS_CACHE_BUILT" && -n "${_ALIAS_CACHE[$canonical]:-}" ]]; then
+        echo "${_ALIAS_CACHE[$canonical]}"
         return 0
     fi
 
     local custom_alias=""
     if [[ -f "$ALIAS_FILE" ]]; then
-        custom_alias="$(awk -F= -v target="$name" '$1 == target { print $2; exit }' "$ALIAS_FILE" 2>/dev/null || true)"
+        custom_alias="$(awk -F= -v target="$canonical" '$1 == target { print $2; exit }' "$ALIAS_FILE" 2>/dev/null || true)"
+        if [[ -z "$custom_alias" && "$canonical" != "$name" ]]; then
+            custom_alias="$(awk -F= -v target="$name" '$1 == target { print $2; exit }' "$ALIAS_FILE" 2>/dev/null || true)"
+        fi
         if [[ -n "$custom_alias" ]]; then
             echo "$custom_alias"
             return 0
         fi
     fi
 
-    local base rank other
-    base="$(session_alias_base "$name")"
+    local base rank other other_canon
+    local -A seen=()
+    base="$(session_alias_base "$canonical")"
     rank=0
     while IFS= read -r other; do
         [[ -n "$other" ]] || continue
-        [[ "$(session_alias_base "$other")" == "$base" ]] || continue
-        if [[ "$other" < "$name" || "$other" == "$name" ]]; then
+        other_canon="$(canonicalize_pi_bash_session "$other")"
+        [[ -z "${seen[$other_canon]:-}" ]] || continue
+        seen[$other_canon]=1
+        [[ "$(session_alias_base "$other_canon")" == "$base" ]] || continue
+        if [[ "$other_canon" < "$canonical" || "$other_canon" == "$canonical" ]]; then
             rank=$((rank + 1))
         fi
     done < <(_session_names)
@@ -1183,17 +1233,66 @@ session_log_path() {
     printf '%s/%s.log\n' "$(zmx_log_dir)" "$session"
 }
 
+session_activity_cache_dir() {
+    local base="${SURROGATE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/surrogate}"
+    printf '%s/activity' "$base"
+}
+
+# session_activity_seconds — how long since this session's visible pane
+# last changed.
+#
+# History: we used to read this off the zmx log file's mtime. That log is
+# mutated by every client connect/disconnect (including surrogate's own
+# `zmx list` polling), so its mtime reports "time since last surrogate
+# invocation" rather than real pane activity. Now: snapshot the tail of
+# `zmx history`, hash it, and persist `<hash>\t<epoch>` to a per-user
+# cache. On the next call, if the hash is unchanged, report
+# `now - stored_epoch`; otherwise reset the cache to `<new_hash>\t<now>`
+# and report 0. This surfaces genuine idle time, and resets as soon as
+# the pane changes.
 session_activity_seconds() {
     local session="$1"
-    local now mtime
+    local now content hash cache_dir cache_file cached_line cached_hash cached_epoch tmp
     _build_session_time_cache
     now="$_SESSION_TIME_CACHE_NOW"
-    mtime="${_SESSION_LOG_MTIME[$session]:-}"
-    if [[ -n "$mtime" ]]; then
-        echo $(( now - mtime ))
+
+    content="$(zmx history "$session" 2>/dev/null | tail -n 40 || true)"
+    if [[ -z "$content" ]]; then
+        session_age_seconds "$session"
         return 0
     fi
-    session_age_seconds "$session"
+
+    if command -v sha1sum >/dev/null 2>&1; then
+        hash="$(printf '%s' "$content" | sha1sum | cut -d' ' -f1)"
+    else
+        hash="$(printf '%s' "$content" | cksum | tr -d ' ')"
+    fi
+    [[ -n "$hash" ]] || { session_age_seconds "$session"; return 0; }
+
+    cache_dir="$(session_activity_cache_dir)"
+    mkdir -p "$cache_dir" 2>/dev/null || true
+    cache_file="$cache_dir/$session"
+
+    cached_hash=""
+    cached_epoch=""
+    if [[ -r "$cache_file" ]]; then
+        cached_line="$(head -n1 "$cache_file" 2>/dev/null || true)"
+        cached_hash="${cached_line%%$'\t'*}"
+        cached_epoch="${cached_line##*$'\t'}"
+        [[ "$cached_hash" == "$cached_epoch" ]] && cached_epoch=""
+    fi
+
+    if [[ -n "$cached_epoch" && "$hash" == "$cached_hash" ]]; then
+        local delta=$(( now - cached_epoch ))
+        (( delta < 0 )) && delta=0
+        echo "$delta"
+        return 0
+    fi
+
+    tmp="$cache_file.tmp.$$"
+    printf '%s\t%s\n' "$hash" "$now" > "$tmp" 2>/dev/null && \
+        mv -f "$tmp" "$cache_file" 2>/dev/null
+    echo 0
 }
 
 session_recent_history() {
@@ -1218,7 +1317,7 @@ session_base_records() {
     _build_session_time_cache
 
     local line session clients age_seconds ago attached activity_seconds active_ago
-    local now socket_mtime log_mtime
+    local now socket_mtime
     now="$_SESSION_TIME_CACHE_NOW"
     while IFS= read -r line; do
         session="${line#session_name=}"
@@ -1235,12 +1334,8 @@ session_base_records() {
             age_seconds=2147483647
         fi
 
-        log_mtime="${_SESSION_LOG_MTIME[$session]:-}"
-        if [[ -n "$log_mtime" ]]; then
-            activity_seconds=$(( now - log_mtime ))
-        else
-            activity_seconds="$age_seconds"
-        fi
+        activity_seconds="$(session_activity_seconds "$session")"
+        [[ -n "$activity_seconds" ]] || activity_seconds="$age_seconds"
 
         format_age_into ago "$age_seconds"
         format_age_into active_ago "$activity_seconds"
@@ -1297,9 +1392,14 @@ last_visible_line() {
 
 visible_path_hint() {
     local text="$1"
+    # Trailing-punctuation strip must use extended regex; under BRE the `+`
+    # is literal, which allowed quotes and commas to ride along into
+    # downstream JSON fields and corrupt the emitted document. The `]` is
+    # placed first inside the bracket class so it is treated as a literal
+    # character — escaping with `\]` is not portable across sed flavors.
     { printf '%s\n' "$text" |
         grep -oE '((~|/)[^[:space:]]*/[^[:space:]]+)' 2>/dev/null |
-        sed 's#[,;:.)\]}]+$##' || true; } |
+        sed -E 's#[]",;:.()}]+$##' || true; } |
         tail -1
 }
 
@@ -1379,7 +1479,13 @@ activity_ranked_records() {
     while IFS=$'\t' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
         [[ -n "$session" ]] || continue
         case "$mode" in
-            live|attached)
+            live)
+                # live = any zmx-listed session. The presence of the session
+                # in `zmx list` already implies a live backend PID; detached
+                # clients count. Downstream noise (bare shells, unknown
+                # ui_hint) is filtered by the default-view classifier.
+                ;;
+            attached)
                 [[ "$clients" -gt 0 ]] || continue
                 ;;
             all)
@@ -1581,6 +1687,7 @@ cmd_stale() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help) echo "usage: surrogate stale [--older-than HOURS] [--filter PATTERN] [--limit N]"; return 0 ;;
             --older-than) [[ $# -ge 2 ]] || die "--older-than requires an hour count"; require_hours "$2"; older_than_hours="$2"; shift 2 ;;
             --filter) [[ $# -ge 2 ]] || die "--filter requires a pattern"; filter="$2"; shift 2 ;;
             --limit) [[ $# -ge 2 ]] || die "--limit requires a count"; require_int "$2"; limit="$2"; shift 2 ;;
@@ -1789,6 +1896,9 @@ cmd_type() {
 
 cmd_read() {
     check_deps
+    case "${1:-}" in
+        -h|--help) echo "usage: surrogate read <session> [-n LINES]"; return 0 ;;
+    esac
     [[ $# -ge 1 ]] || die "usage: surrogate read <session> [-n LINES]"
     local session
     session="$(resolve_session "$1")"
@@ -1807,6 +1917,9 @@ cmd_read() {
 
 cmd_wait() {
     check_deps
+    case "${1:-}" in
+        -h|--help) echo "usage: surrogate wait <session> <pattern> [-t TIMEOUT]"; return 0 ;;
+    esac
     [[ $# -ge 2 ]] || die "usage: surrogate wait <session> <pattern> [-t TIMEOUT]"
     local session
     session="$(resolve_session "$1")"
@@ -1842,6 +1955,9 @@ cmd_wait() {
 
 cmd_find() {
     check_deps
+    case "${1:-}" in
+        -h|--help) echo "usage: surrogate find <query> [-n LINES] [-C CONTEXT]"; return 0 ;;
+    esac
     _build_alias_cache
     [[ $# -ge 1 ]] || die "usage: surrogate find <query> [-n LINES] [-C CONTEXT]"
     local query="$1"
@@ -2340,6 +2456,7 @@ cmd_peek() {
     local filter=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help) echo "usage: surrogate peek [-n LINES] [--filter PATTERN]"; return 0 ;;
             -n) [[ $# -ge 2 ]] || die "-n requires a number"; require_int "$2"; lines="$2"; shift 2 ;;
             --filter) [[ $# -ge 2 ]] || die "--filter requires a pattern"; filter="$2"; shift 2 ;;
             *)  die "unknown flag: $1" ;;
@@ -2372,6 +2489,18 @@ cmd_peek() {
 
 cmd_alias() {
     check_deps
+    case "${1:-}" in
+        -h|--help)
+            cat <<'EOF'
+usage: surrogate alias <session>
+       surrogate alias --predict <session-name>
+
+Print the deterministic alias for a zmx session (or predict one for a name
+that isn't live yet).
+EOF
+            return 0
+            ;;
+    esac
     if [[ "${1:-}" == "--predict" ]]; then
         shift
         [[ $# -ge 1 ]] || die "usage: surrogate alias --predict <session-name>"
@@ -2411,15 +2540,17 @@ cmd_whoami() {
         die "not inside a zmx session (ZMX_SESSION not set)"
     fi
 
+    local canonical
+    canonical="$(canonicalize_pi_bash_session "$session")"
     case "$status" in
         live)
             _build_alias_cache
-            alias="${_ALIAS_CACHE[$session]:-$(session_alias "$session")}"
-            echo "$alias  $session"
+            alias="${_ALIAS_CACHE[$canonical]:-${_ALIAS_CACHE[$session]:-$(session_alias "$canonical")}}"
+            echo "$alias  $canonical"
             ;;
         ancestry)
-            alias="$(session_alias_base "$session")"
-            echo "$alias  $session  (ancestry-only; not present in zmx list, not messageable via surrogate)"
+            alias="$(session_alias_base "$canonical")"
+            echo "$alias  $canonical  (ancestry-only; not present in zmx list, not messageable via surrogate)"
             ;;
         stale-env)
             die "current ZMX_SESSION '$session' is not present in zmx list (stale or leaked environment)"
@@ -2436,6 +2567,8 @@ cmd_rename() {
     local session
     session="$(resolve_session "$1")"
     local new_alias="$2"
+
+    [[ -n "$new_alias" ]] || die "alias cannot be empty"
 
     # Check the new alias doesn't collide with an existing session name
     if session_exists "$new_alias"; then
@@ -2455,14 +2588,17 @@ cmd_rename() {
         fi
     fi
 
-    # Write custom alias to file (append or update)
-    if [[ -f "$ALIAS_FILE" ]] && grep -q "^${session}=" "$ALIAS_FILE" 2>/dev/null; then
-        sed -i "s|^${session}=.*|${session}=${new_alias}|" "$ALIAS_FILE"
+    # Write custom alias to file under the canonical identity so that
+    # pi-bash jobs sharing one sessionId all resolve to the renamed alias.
+    local canonical_session
+    canonical_session="$(canonicalize_pi_bash_session "$session")"
+    if [[ -f "$ALIAS_FILE" ]] && grep -q "^${canonical_session}=" "$ALIAS_FILE" 2>/dev/null; then
+        sed -i "s|^${canonical_session}=.*|${canonical_session}=${new_alias}|" "$ALIAS_FILE"
     else
-        echo "${session}=${new_alias}" >> "$ALIAS_FILE"
+        echo "${canonical_session}=${new_alias}" >> "$ALIAS_FILE"
     fi
 
-    echo "renamed: $old_alias -> $new_alias  ($session)"
+    echo "renamed: $old_alias -> $new_alias  ($canonical_session)"
 }
 
 deprecated_command_warning() {
@@ -2648,6 +2784,9 @@ cmd_sweep() {
 
 cmd_bridge() {
     check_deps
+    case "${1:-}" in
+        -h|--help) echo "usage: surrogate bridge <session>"; return 0 ;;
+    esac
     [[ $# -ge 1 ]] || die "usage: surrogate bridge <session>"
     local session
     session="$(resolve_session "$1")"
@@ -2738,9 +2877,13 @@ cmd_prime() {
     rows="$(session_records 10 | sort -t $'\t' -k1,1n)"
 
     if [[ "$json" -eq 1 ]]; then
+        # json_or_null already wraps non-empty values in quotes, so the
+        # inputs must be the raw string (not a pre-quoted JSON fragment).
+        # Passing a pre-quoted fragment double-wrapped the value and
+        # produced invalid JSON like `"session":""foo""`.
         printf '{"identity":{"session":%s,"alias":%s},' \
-            "$(json_or_null "${my_session:+\"$(json_escape "$my_session")\"}")" \
-            "$(json_or_null "${my_alias:+\"$(json_escape "$my_alias")\"}")"
+            "$(json_or_null "$my_session")" \
+            "$(json_or_null "$my_alias")"
         printf '"sessions":['
         local first=1
         while IFS=$'\t' read -r age_seconds ago attached clients alias session _activity_seconds _active_ago snippet cwd_hint project_hint ui_hint; do
@@ -2751,7 +2894,7 @@ cmd_prime() {
             printf '{"alias":"%s","session":"%s","project":%s,"ui_hint":"%s","age":"%s","attached":%s,"clients":%s,"snippet":"%s"}' \
                 "$(json_escape "$alias")" \
                 "$(json_escape "$session")" \
-                "$(json_or_null "${effective_project:+\"$(json_escape "$effective_project")\"}")" \
+                "$(json_or_null "$effective_project")" \
                 "$(json_escape "$ui_hint")" \
                 "$(json_escape "$ago")" \
                 "$([[ "$attached" == "attached" ]] && printf 'true' || printf 'false')" \
@@ -2783,6 +2926,9 @@ cmd_prime() {
 
 cmd_status() {
     check_deps
+    case "${1:-}" in
+        -h|--help) echo "usage: surrogate status"; return 0 ;;
+    esac
     local sessions
     sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${BRIDGE_PREFIX}" || true)"
 

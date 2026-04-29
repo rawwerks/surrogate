@@ -98,7 +98,7 @@ surrogate active
 surrogate active --all   # include non-empty detached sessions
 ```
 
-### Show live, messageable sessions with less noise
+### Show live, active sessions with less noise
 
 ```bash
 surrogate live
@@ -107,7 +107,7 @@ surrogate live --all
 surrogate live --json
 ```
 
-`surrogate live` is the low-noise operator view. It only shows sessions that are currently messageable, ranks them by recent visible activity, and hides low-signal shell-prompt lanes by default when they have no visible repo or cwd hint. Use `--all` when you want the full live set.
+`surrogate live` is the low-noise operator view. It only shows sessions with attached clients that have been active in the last 2h, ranks them by recent visible activity, and hides low-signal shell-prompt lanes by default when they have no visible repo or cwd hint. Use `--recent N` for a count-based wider view, or `--all` when you want all attached live lanes in the selected window, including low-signal ones. Detached sessions are handled by `surrogate active --all`, `surrogate stale`, and `surrogate sweep`. In JSON, `current_shell:null` means no current-shell ancestry anomaly was detected.
 
 ### Show stale detached sessions
 
@@ -163,7 +163,7 @@ surrogate type <session> "some text"
 
 `type` auto-normalizes long prose by flattening embedded newlines to spaces and then submitting once. This is meant for conversational prompts, not scripts. A successful `type` should correspond to an actual submitted prompt, not staged input.
 
-Default `type` is shell-safe. If the target looks like a shell, Surrogate suppresses the prose prefix so commands still execute normally, then warns if the shell immediately reports `command not found` or a syntax error.
+Default `type` is shell-safe. Surrogate adds the prose prefix only for agent-like targets; shell and unknown targets stay unprefixed so commands still execute normally. It then warns if a non-agent target immediately reports `command not found` or a syntax error.
 
 For long conversational prompts into agent TUIs, use message mode:
 
@@ -208,7 +208,7 @@ surrogate-brief --show-config
 surrogate-brief --openrouter-model openai/gpt-4.1-mini --inference-provider openai shiny-dolphin
 ```
 
-`surrogate brief` reuses `surrogate live --json`, so the default brief targets the same high-signal, messageable sessions shown by `surrogate live`. Add `--all` if you want briefs for every live messageable session, including low-signal shell lanes. Each brief now classifies `ATTENTION REQUIRED`, `PRIORITY`, and `SIGNAL QUALITY` before summarizing status and next steps, so idle shell prompts get demoted instead of looking urgent. It should also treat implicit operator handoff as meaningful when a lane stops at interrupted work, parked troubleshooting, or a human decision boundary even without an explicit ask, and it should weight the end-state tail more heavily than an earlier milestone. This path is optional and separate from core surrogate usage. If the key is missing, `surrogate-brief` prints the setup steps needed to enable it.
+`surrogate brief` reuses `surrogate live --json`, so the default brief targets the same attached sessions active in the last 2h shown by `surrogate live`. Add `--all` if you want briefs for every attached live session in the selected window, including low-signal shell lanes; use `--recent N` for a count-based wider view. Each brief now classifies `ATTENTION REQUIRED`, `PRIORITY`, and `SIGNAL QUALITY` before summarizing status and next steps, so idle shell prompts get demoted instead of looking urgent. It should also treat implicit operator handoff as meaningful when a lane stops at interrupted work, parked troubleshooting, or a human decision boundary even without an explicit ask, and it should weight the end-state tail more heavily than an earlier milestone. This path is optional and separate from core surrogate usage. If the key is missing, `surrogate-brief` prints the setup steps needed to enable it.
 
 ### Wait for pattern in output
 

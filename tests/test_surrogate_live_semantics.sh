@@ -4,16 +4,16 @@
 #
 # These tests drive *actual* detached zmx sessions (not mocks) and assert on
 # surrogate's live/active output. They exist because the prior mock-based
-# tests were not catching two real-world bugs:
+# tests were not catching real-world discovery bugs:
 #
-#   1. `surrogate live --all` excluded detached-but-live agent sessions
-#      because the upstream filter required clients > 0.
+#   1. `surrogate live --all` used to include detached no-client sessions,
+#      which made stale lanes look like active operator lanes.
 #   2. The `ACTIVE` column always showed ~0s because it was computed from
 #      the zmx log-file mtime, which is bumped by every zmx client
 #      connect/disconnect (including surrogate's own polling queries).
 #
 # If any of these assertions regress, the default `surrogate live` view
-# will again go silent on real live agents.
+# will again over-report stale detached sessions or misstate activity time.
 
 # NOTE: deliberately NOT setting `errexit` — individual tests must be allowed
 # to `grep` for patterns that may not match and still continue running, so
@@ -63,24 +63,28 @@ session_idle_seconds() {
 real_session_init
 
 # ---------------------------------------------------------------------------
-# Bug anchor 1: detached live PID must appear in `surrogate live --all`
+# Bug anchor 1: detached no-client sessions are not live operator lanes.
 # ---------------------------------------------------------------------------
-test_live_all_includes_detached_live_pid() {
+test_live_all_excludes_detached_no_client_session() {
   echo "=== test: ${FUNCNAME[0]} ==="
-  local session output
+  local session live_output active_output
   session="$(real_session_spawn detached)"
 
   # `zmx run <name> <cmd> &` intentionally does not attach a client, so this
-  # session has clients=0 from the start. If surrogate's live filter is
-  # correct, it must still appear in `live --all`.
-  output="$("$SURROGATE" live --all --recent 5000 2>&1 || true)"
+  # session has clients=0 from the start. It should be discoverable in
+  # active --all, but it must not appear in live --all.
+  live_output="$("$SURROGATE" live --all --recent 5000 2>&1 || true)"
+  active_output="$("$SURROGATE" active --all --recent 5000 2>&1 || true)"
 
-  if printf '%s\n' "$output" | grep -Fq "$session"; then
-    pass "${FUNCNAME[0]} — detached live-PID session visible in live --all"
+  if ! printf '%s\n' "$live_output" | grep -Fq "$session" &&
+     printf '%s\n' "$active_output" | grep -Fq "$session"; then
+    pass "${FUNCNAME[0]} — detached no-client session is active --all only, not live"
   else
-    echo "    surrogate live --all output (session expected: $session):"
-    printf '%s\n' "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — detached live-PID session missing from live --all"
+    echo "    surrogate live --all output (session should be absent: $session):"
+    printf '%s\n' "$live_output" | sed 's/^/    /'
+    echo "    surrogate active --all output (session should be present: $session):"
+    printf '%s\n' "$active_output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — detached no-client session was classified incorrectly"
   fi
 
   real_session_kill "$session"
@@ -160,45 +164,6 @@ test_active_time_resets_after_write() {
 }
 
 # ---------------------------------------------------------------------------
-# Default-view noise filter: a detached zmx running plain bash (no agent TUI,
-# no project hint) must NOT appear in bare `surrogate live` — it's noise.
-# It must still appear in `surrogate live --all`.
-#
-# This is the "no reap needed" invariant: when an agent session's primary
-# process exits and drops back to a shell prompt, it self-hides from the
-# default view without any manual cleanup.
-# ---------------------------------------------------------------------------
-test_live_default_hides_bare_shell_noise() {
-  echo "=== test: ${FUNCNAME[0]} ==="
-  local session output_default output_all
-  session="$(real_session_spawn noise)"
-
-  # Give the pane a moment to render the initial shell prompt so the
-  # ui_hint classifier can see it.
-  sleep 1
-
-  output_default="$("$SURROGATE" live --recent 5000 2>&1 || true)"
-  output_all="$("$SURROGATE" live --all --recent 5000 2>&1 || true)"
-
-  local appears_default=0 appears_all=0
-  printf '%s\n' "$output_default" | grep -Fq "$session" && appears_default=1
-  printf '%s\n' "$output_all" | grep -Fq "$session" && appears_all=1
-
-  if (( appears_default == 0 && appears_all == 1 )); then
-    pass "${FUNCNAME[0]} — bare-shell noise hidden from default but visible with --all"
-  else
-    echo "    appears_default=$appears_default appears_all=$appears_all (expected 0 / 1)"
-    echo "    live default:"
-    printf '%s\n' "$output_default" | sed 's/^/    /'
-    echo "    live --all:"
-    printf '%s\n' "$output_all" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — noise-filter invariant broken (expected hidden default, visible --all)"
-  fi
-
-  real_session_kill "$session"
-}
-
-# ---------------------------------------------------------------------------
 # Bug anchor 4: `surrogate prime --json` must emit valid JSON.
 #
 # Regression: the identity fields were double-wrapped in quotes
@@ -227,10 +192,9 @@ test_prime_json_is_valid() {
 echo "=== surrogate live/active real-session tests ==="
 echo
 
-test_live_all_includes_detached_live_pid
+test_live_all_excludes_detached_no_client_session
 test_active_time_reports_idle_after_silence
 test_active_time_resets_after_write
-test_live_default_hides_bare_shell_noise
 test_prime_json_is_valid
 
 echo

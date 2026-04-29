@@ -1539,11 +1539,11 @@ EOF
   )
   marker_count=$(grep -c '^# surrogate:zmx:begin$' "$rc_file" || true)
 
-  if echo "$output" | grep -Fq "Updated auto-zmx snippet at top of $rc_file" &&
+  if echo "$output" | grep -Fq "Updated auto-zmx snippet at end of $rc_file" &&
      [[ "$marker_count" -eq 1 ]] &&
      grep -Fq 'env -u ZMX_SESSION "$_surr_real_zmx" "$@"' "$rc_file" &&
      grep -Fq 'export SURROGATE_USER_RC_MARKER=1' "$rc_file"; then
-    pass "${FUNCNAME[0]} — --install refreshes the managed snippet in place"
+    pass "${FUNCNAME[0]} — --install refreshes the managed snippet at rc end"
   else
     echo "    output:"
     echo "$output" | sed 's/^/    /'
@@ -1595,7 +1595,9 @@ EOF
     case "$shell_name" in
       bash|zsh)
         for cmd_name in claude pi codex; do
-          if ! echo "$snippet" | grep -Fq "$cmd_name() { _surr_wrap_command $cmd_name \"\$@\"; }"; then
+          if ! echo "$snippet" | grep -Fq "$cmd_name() {" ||
+             ! echo "$snippet" | grep -Fq "_surr_capture_cmd $cmd_name " ||
+             ! echo "$snippet" | grep -Fq "_surr_wrap_command $cmd_name $cmd_name \"\$@\""; then
             echo "    missing wrapper for $cmd_name in shell: $shell_name"
             all_ok=false
           fi
@@ -1619,6 +1621,68 @@ EOF
     pass "${FUNCNAME[0]} — commands mode generates wrappers for configured commands in bash, zsh, and fish"
   else
     fail "${FUNCNAME[0]} — commands mode snippet missing configured wrappers"
+  fi
+}
+
+test_shell_setup_commands_mode_command_ids_do_not_collide() {
+  # Regression: command metadata variables used to be based on a lossy
+  # punctuation-to-underscore sanitizer, so foo-bar, foo.bar, and foo_bar
+  # all shared one alias/kind slot. Each wrapper must preserve its own
+  # captured alias expansion independently.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local setup_script cfg tmp_home tmpbin snippet_file zmx_log output
+  setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
+  cfg="$(mktemp)"
+  tmp_home="$(mktemp -d)"
+  tmpbin="$(mktemp -d)"
+  snippet_file="$tmp_home/snippet.sh"
+  zmx_log="$(mktemp)"
+
+  cat > "$cfg" <<'EOF'
+SURROGATE_ZMX_MODE=commands
+SURROGATE_ZMX_COMMANDS="foo-bar foo.bar foo_bar"
+EOF
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$SURR_TEST_ZMX_LOG"
+exit 0
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  "$setup_script" --show --config "$cfg" | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
+
+  output=$(
+    HOME="$tmp_home" \
+    PATH="$tmpbin:/usr/bin:/bin" \
+    ZMX_BIN="$tmpbin/zmx" \
+    SURR_TEST_ZMX_LOG="$zmx_log" \
+    bash --noprofile --norc -ic "
+      alias foo-bar='dashcmd --dash'
+      alias foo.bar='dotcmd --dot'
+      alias foo_bar='under_cmd --under'
+      source '$snippet_file'
+      foo-bar A
+      foo.bar B
+      foo_bar C
+    " 2>&1
+  )
+
+  rm -f "$cfg"
+
+  if grep -Fq ' dashcmd --dash A' "$zmx_log" &&
+     grep -Fq ' dotcmd --dot B' "$zmx_log" &&
+     grep -Fq ' under_cmd --under C' "$zmx_log"; then
+    pass "${FUNCNAME[0]} — punctuation variants keep independent captured aliases"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    zmx log:"
+    sed 's/^/    /' "$zmx_log"
+    fail "${FUNCNAME[0]} — command metadata IDs collided"
   fi
 }
 
@@ -1959,7 +2023,7 @@ test_shell_setup_commands_mode_unaliases_before_if_block() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local setup_script cfg tmp_home tmpbin snippet_file unalias_lines begin_line if_line output
+  local setup_script cfg tmp_home tmpbin snippet_file capture_lines begin_line if_line output
   setup_script="$(dirname "$SCRIPT_DIR")/bin/surrogate-shell-setup"
   cfg="$(mktemp)"
   tmp_home="$(mktemp -d)"
@@ -1986,10 +2050,12 @@ EOF
 
   "$setup_script" --show --config "$cfg" | sed -n '/^# surrogate:zmx:begin/,/^# surrogate:zmx:end/p' > "$snippet_file"
 
-  # (a) both unalias lines present and at top-level (before `if [[`)
+  # (a) both capture calls present and at top-level (before `if [[`). The
+  # capture helper performs the unalias before the wrapper function names are
+  # parsed inside the if-block.
   begin_line=$(grep -n '^# surrogate:zmx:begin' "$snippet_file" | head -1 | cut -d: -f1)
   if_line=$(grep -n '^if \[\[ \$- == \*i\*' "$snippet_file" | head -1 | cut -d: -f1)
-  unalias_lines=$(awk -v b="$begin_line" -v i="$if_line" 'NR > b && NR < i && /^unalias (codex|pi) 2>\/dev\/null \|\| true$/' "$snippet_file" | wc -l)
+  capture_lines=$(awk -v b="$begin_line" -v i="$if_line" 'NR > b && NR < i && /^_surr_capture_cmd (codex|pi) /' "$snippet_file" | wc -l)
 
   # (b) sourcing the snippet with an offending alias defined BEFORE must
   # not error and must make codex a function.
@@ -2009,15 +2075,15 @@ EOF
 
   rm -f "$cfg"
 
-  if [[ "$unalias_lines" -eq 2 ]] &&
+  if [[ "$capture_lines" -eq 2 ]] &&
      echo "$output" | grep -Fq 'codex is a function' &&
      ! echo "$output" | grep -Eqi 'syntax error|unexpected token'; then
-    pass "${FUNCNAME[0]} — unalias before if-block defeats rc aliases and keeps syntax valid"
+    pass "${FUNCNAME[0]} — top-level capture defeats rc aliases and keeps syntax valid"
   else
-    echo "    unalias_lines=$unalias_lines (want 2)"
+    echo "    capture_lines=$capture_lines (want 2)"
     echo "    output:"
     echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — expected unalias statements at top level and codex to become a function"
+    fail "${FUNCNAME[0]} — expected top-level capture calls and codex to become a function"
   fi
 }
 
@@ -2051,10 +2117,10 @@ test_ui_hint_detects_agent_busy_states() {
     fi
   }
 
-  # Claude Code vendor banner / footer
-  check_agent "claude-banner"   "▐▛███▜▌   Claude Code v2.1.112"
-  check_agent "claude-shortcuts" "? for shortcuts"
-  check_agent "claude-bypass"    "⏵⏵ bypass permissions on (shift+tab to cycle)"
+  # Generic agent TUI banner / footer
+  check_agent "block-banner"     "▐▛███▜▌   Agent TUI v2.1.112"
+  check_agent "shortcuts"        "? for shortcuts"
+  check_agent "bypass-footer"    "⏵⏵ bypass permissions on (shift+tab to cycle)"
   # Codex vendor footer
   check_agent "codex-model"      "100% context left · ? for shortcuts"
   check_agent "codex-gpt"        "gpt-5.4 xhigh fast · ~/Documents/GitHub/surrogate"
@@ -2066,6 +2132,12 @@ test_ui_hint_detects_agent_busy_states() {
   check_agent "esc-to-interrupt" "Working (5s · esc to interrupt)"
   check_agent "proceed-prompt"   "Do you want to proceed?"
   check_agent "spinner-working"  "⠙ Working..."
+
+  local shell_probe
+  shell_probe=$(bash -c "source '$probe'; ui_hint_from_history \"\$1\"" _ "surrogate main ❯ bash" 2>/dev/null)
+  if [[ "$shell_probe" != "shell" ]]; then
+    fail_cases+="        [prompt-command] expected shell, got '$shell_probe'\n"
+  fi
 
   rm -f "$probe"
 
@@ -2083,13 +2155,10 @@ test_shell_setup_preserves_user_aliases_and_functions() {
   # alias or function for that command. Dispatch rules:
   #   (a) alias-backed: the expansion is tokenized and wrap+exec'd inside
   #       zmx. zmx receives the alias target as the real command.
-  #   (b) function-backed: the user's function is renamed in-process to
-  #       `_SURR_ORIG_<cmd>_fn` and the wrapper calls it DIRECTLY without
-  #       zmx. Wrapping a function would require exporting its body
-  #       (leaks via BASH_FUNC_<name>%%=... env entries) or writing it
-  #       to disk, both of which are private-data leakage primitives
-  #       because shell functions can contain secrets or private paths.
+  #   (b) function-backed: the function body is captured and executed inside
+  #       the zmx session via a private temporary script.
   #   (c) bare: the wrapper wrap+exec's the command name itself inside zmx.
+  #   (d) alias+function: the alias wins, matching interactive shell behavior.
   # In every case, the user's original command behavior is preserved.
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -2104,7 +2173,7 @@ test_shell_setup_preserves_user_aliases_and_functions() {
 
   cat > "$cfg" <<'EOF'
 SURROGATE_ZMX_MODE=commands
-SURROGATE_ZMX_COMMANDS="myalias myfunc mybare"
+SURROGATE_ZMX_COMMANDS="myalias myfunc mybare bothcmd"
 EOF
 
   # Stub zmx: records which session-name was created and exec's the rest,
@@ -2142,10 +2211,13 @@ EOF
     bash --noprofile --norc -ic "
       alias myalias='real-alias-target --aliased'
       myfunc() { echo \"function-ran args:\$*\"; echo \"function-env-BASH_FUNC_check:\${BASH_FUNC_myfunc%%:-unset}\"; }
+      bothcmd() { echo \"function-should-not-run\"; }
+      alias bothcmd='real-alias-target --both'
       source '$snippet_file'
       myalias u1 u2
       myfunc u3 u4
       mybare u5 u6
+      bothcmd u7 u8
     " 2>&1
   )
 
@@ -2160,11 +2232,12 @@ EOF
     all_ok=false
   fi
 
-  # (b) function case: the function body ran, AND zmx was NOT called for it,
-  # AND there is no BASH_FUNC_ env entry leaking the body.
+  # (b) function case: the function body ran inside zmx, without exporting
+  # the body via BASH_FUNC_* env entries.
   if ! echo "$output" | grep -Fq 'function-ran args:u3 u4' ||
-     grep -Fq 'zmx-session:myfunc-' "$zmx_log"; then
-    echo "    function case failed (expected function body to run WITHOUT zmx wrap)"
+     ! grep -Fq 'zmx-session:myfunc-' "$zmx_log" ||
+     echo "$output" | grep -Fq 'function-env-BASH_FUNC_check='; then
+    echo "    function case failed (expected function body to run inside zmx without BASH_FUNC env leak)"
     all_ok=false
   fi
 
@@ -2183,8 +2256,17 @@ EOF
     all_ok=false
   fi
 
+  # (d) alias+function case: aliases are what users type interactively, so
+  # alias capture must win over a same-name function.
+  if ! echo "$output" | grep -Fq 'alias-target-ran flags:--both u7 u8' ||
+     echo "$output" | grep -Fq 'function-should-not-run' ||
+     ! grep -Fq 'zmx-session:bothcmd-' "$zmx_log"; then
+    echo "    alias+function case failed (expected alias to win over function)"
+    all_ok=false
+  fi
+
   if $all_ok; then
-    pass "${FUNCNAME[0]} — aliases wrap through zmx, functions stay in-process (no env leak), bare commands wrap"
+    pass "${FUNCNAME[0]} — aliases, functions, bare commands, and alias+function conflicts wrap correctly"
   else
     echo "    zmx log:"
     sed 's/^/      /' "$zmx_log"
@@ -2394,7 +2476,7 @@ test_brief_help_is_discoverable() {
 
   if echo "$output" | grep -q 'usage: surrogate brief' &&
      echo "$output" | grep -q 'surrogate brief 15' &&
-     echo "$output" | grep -q 'last observed activity'; then
+     echo "$output" | grep -q 'selected activity window'; then
     pass "${FUNCNAME[0]} — brief help documents activity-ranked selection"
   else
     echo "    output:"
@@ -2601,7 +2683,7 @@ case "\${1:-}" in
         printf 'user@host /home/testuser/Documents/GitHub/older \$\n'
         ;;
       "$MOCK_WHO_NEW_SESSION")
-        printf '› run surrogate whoami\n• Ran surrogate whoami\ngpt-5.4 medium · 60%% left · /home/testuser/Documents/GitHub/surrogate\n'
+        printf '› run surrogate whoami\n• Read /home/testuser/Documents/GitHub/surrogate/scripts/note-history.sh\n• Checked /tmp/surrogate-noise/out.txt\ngpt-5.4 medium · 60%% left\n'
         ;;
     esac
     ;;
@@ -2626,6 +2708,12 @@ setup_mock_live_env() {
   MOCK_LIVE_LOW_SESSION="mock-live-low-$$"
   MOCK_LIVE_DETACHED_SESSION="mock-live-detached-$$"
   MOCK_LIVE_ZMX_DIR="/run/user/$(id -u)/zmx"
+  MOCK_LIVE_PROC_ROOT="$(mktemp -d)"
+  MOCK_LIVE_PROC_CWD="$MOCK_LIVE_PROC_ROOT/cwd-target/Documents/GitHub/surrogate"
+  MOCK_LIVE_SIGNAL_PID=424242
+  mkdir -p "$MOCK_LIVE_PROC_CWD" "$MOCK_LIVE_PROC_ROOT/$MOCK_LIVE_SIGNAL_PID"
+  ln -s "$MOCK_LIVE_PROC_CWD" "$MOCK_LIVE_PROC_ROOT/$MOCK_LIVE_SIGNAL_PID/cwd"
+  export SURROGATE_PROC_ROOT="$MOCK_LIVE_PROC_ROOT"
 
   mkdir -p "$MOCK_LIVE_ZMX_DIR"
   : > "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_SIGNAL_SESSION"
@@ -2640,20 +2728,20 @@ setup_mock_live_env() {
 set -euo pipefail
 case "\${1:-}" in
   list)
-    printf 'session_name=%s\tclients=1\n' "$MOCK_LIVE_SIGNAL_SESSION"
+    printf 'session_name=%s\tpid=%s\tclients=1\n' "$MOCK_LIVE_SIGNAL_SESSION" "$MOCK_LIVE_SIGNAL_PID"
     printf 'session_name=%s\tclients=1\n' "$MOCK_LIVE_LOW_SESSION"
     printf 'session_name=%s\tclients=0\n' "$MOCK_LIVE_DETACHED_SESSION"
     ;;
   history)
     case "\${2:-}" in
       "$MOCK_LIVE_SIGNAL_SESSION")
-        printf '› review surrogate live\n• focused lane\ngpt-5.4 medium · 60%% left · /home/testuser/Documents/GitHub/surrogate\n'
+        printf '› review surrogate live\n• Checked /tmp/live-noise/out.txt\ngpt-5.4 medium · 60%% left\n'
         ;;
       "$MOCK_LIVE_LOW_SESSION")
-        printf 'user@host surrogate main ❯\n'
+        printf 'user@host idle main ❯\n'
         ;;
       "$MOCK_LIVE_DETACHED_SESSION")
-        printf 'user@host /tmp/mock-detached \$\n'
+        printf 'user@host detached \$\n'
         ;;
     esac
     ;;
@@ -2671,11 +2759,61 @@ cleanup_mock_live_env() {
   if [[ -n "$MOCK_LIVE_ZMX_DIR" ]]; then
     rm -f "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_SIGNAL_SESSION" "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_LOW_SESSION" "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_DETACHED_SESSION" 2>/dev/null || true
   fi
+  rm -rf "${MOCK_LIVE_PROC_ROOT:-}" 2>/dev/null || true
   rm -rf "$MOCK_LIVE_TMPBIN" 2>/dev/null || true
   MOCK_LIVE_TMPBIN=""
   MOCK_LIVE_SIGNAL_SESSION=""
   MOCK_LIVE_LOW_SESSION=""
   MOCK_LIVE_DETACHED_SESSION=""
+  MOCK_LIVE_ZMX_DIR=""
+  MOCK_LIVE_PROC_ROOT=""
+  MOCK_LIVE_PROC_CWD=""
+  MOCK_LIVE_SIGNAL_PID=""
+  unset SURROGATE_PROC_ROOT
+}
+
+setup_mock_live_low_only_env() {
+  MOCK_LIVE_TMPBIN="$(mktemp -d)"
+  MOCK_LIVE_SIGNAL_SESSION=""
+  MOCK_LIVE_LOW_SESSION="mock-live-low-only-$$"
+  MOCK_LIVE_DETACHED_SESSION="mock-live-detached-only-$$"
+  MOCK_LIVE_ZMX_DIR="/run/user/$(id -u)/zmx"
+  MOCK_LIVE_PROC_ROOT=""
+  MOCK_LIVE_PROC_CWD=""
+  MOCK_LIVE_SIGNAL_PID=""
+
+  mkdir -p "$MOCK_LIVE_ZMX_DIR"
+  : > "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_LOW_SESSION"
+  : > "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_DETACHED_SESSION"
+  touch -d '10 seconds ago' "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_LOW_SESSION"
+  touch -d '30 seconds ago' "$MOCK_LIVE_ZMX_DIR/$MOCK_LIVE_DETACHED_SESSION"
+
+  cat > "$MOCK_LIVE_TMPBIN/zmx" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  list)
+    printf 'session_name=%s\tclients=1\n' "$MOCK_LIVE_LOW_SESSION"
+    printf 'session_name=%s\tclients=0\n' "$MOCK_LIVE_DETACHED_SESSION"
+    ;;
+  history)
+    case "\${2:-}" in
+      "$MOCK_LIVE_LOW_SESSION")
+        printf 'user@host idle main ❯\n'
+        ;;
+      "$MOCK_LIVE_DETACHED_SESSION")
+        printf 'user@host detached \$\n'
+        ;;
+    esac
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$MOCK_LIVE_TMPBIN/zmx"
+
+  ln -sf "$(command -v tmux)" "$MOCK_LIVE_TMPBIN/tmux"
 }
 
 setup_mock_type_env() {
@@ -2860,6 +2998,30 @@ test_who_recent_duration_filter() {
   fi
 }
 
+test_who_recent_zero_returns_no_sessions() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who --recent 0 --json 2>&1)
+  cleanup_mock_who_env
+
+  if printf '%s' "$output" | python3 -c '
+import json, sys
+obj = json.loads(sys.stdin.read())
+assert obj["count"] == 0
+assert obj["sessions"] == []
+'
+  then
+    pass "${FUNCNAME[0]} — who --recent 0 returns an empty count window"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — who --recent 0 should return no sessions"
+  fi
+}
+
 test_who_project_filter() {
   # plumb:req-dab33ed7
   echo "=== test: ${FUNCNAME[0]} ==="
@@ -2877,6 +3039,25 @@ test_who_project_filter() {
     echo "    output:"
     echo "$output" | sed 's/^/    /'
     fail "${FUNCNAME[0]} — who --project filter incorrect"
+  fi
+}
+
+test_who_project_filter_scans_beyond_display_tail() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_who_env
+  local output
+  output=$(PATH="$MOCK_WHO_TMPBIN:/usr/bin:/bin" "$SURROGATE" who --project surrogate -n 1 2>&1)
+  cleanup_mock_who_env
+
+  if echo "$output" | grep -q "$MOCK_WHO_NEW_SESSION" &&
+     ! echo "$output" | grep -q "$MOCK_WHO_OLD_SESSION"; then
+    pass "${FUNCNAME[0]} — who --project uses widened deterministic hint scan"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — who --project should not lose repo identity with -n 1"
   fi
 }
 
@@ -2912,7 +3093,7 @@ test_who_json_output() {
   if echo "$output" | grep -q '"count":1' &&
      echo "$output" | grep -q '"recent_first":true' &&
      echo "$output" | grep -q "\"session\":\"$MOCK_WHO_NEW_SESSION\"" &&
-     echo "$output" | grep -q '"cwd_hint":"/home/testuser/Documents/GitHub/surrogate"' &&
+     echo "$output" | grep -q '"cwd_hint":"/home/testuser/Documents/GitHub/surrogate/scripts/note-history.sh"' &&
      echo "$output" | grep -q '"project_hint":"surrogate"' &&
      echo "$output" | grep -q '"ui_hint":"agent"'; then
     pass "${FUNCNAME[0]} — who --json exposes deterministic session metadata"
@@ -2961,6 +3142,30 @@ test_active() {
   fi
 }
 
+test_active_recent_zero_returns_no_sessions() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_live_env
+  local output
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" active --recent 0 --json 2>&1)
+  cleanup_mock_live_env
+
+  if printf '%s' "$output" | python3 -c '
+import json, sys
+obj = json.loads(sys.stdin.read())
+assert obj["count"] == 0
+assert obj["sessions"] == []
+'
+  then
+    pass "${FUNCNAME[0]} — active --recent 0 returns an empty count window"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — active --recent 0 should return no sessions"
+  fi
+}
+
 test_live_focuses_high_signal_sessions() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -2975,7 +3180,7 @@ test_live_focuses_high_signal_sessions() {
   if echo "$output" | grep -q "$signal_session" &&
      ! echo "$output" | grep -q "$low_session" &&
      echo "$output" | grep -q 'low-signal live session(s) hidden'; then
-    pass "${FUNCNAME[0]} — live defaults to high-signal messageable sessions"
+    pass "${FUNCNAME[0]} — live defaults to high-signal active sessions"
   else
     echo "    output:"
     echo "$output" | sed 's/^/    /'
@@ -2987,21 +3192,23 @@ test_live_all_includes_low_signal_sessions() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local output signal_session low_session
+  local output signal_session low_session detached_session
   setup_mock_live_env
   signal_session="$MOCK_LIVE_SIGNAL_SESSION"
   low_session="$MOCK_LIVE_LOW_SESSION"
+  detached_session="$MOCK_LIVE_DETACHED_SESSION"
   output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" live --all --recent 10 2>&1)
   cleanup_mock_live_env
 
   if echo "$output" | grep -q "$signal_session" &&
      echo "$output" | grep -q "$low_session" &&
+     ! echo "$output" | grep -q "$detached_session" &&
      ! echo "$output" | grep -q 'low-signal live session(s) hidden'; then
-    pass "${FUNCNAME[0]} — live --all includes low-signal live sessions"
+    pass "${FUNCNAME[0]} — live --all includes low-signal attached sessions only"
   else
     echo "    output:"
     echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — live --all did not include the low-signal session"
+    fail "${FUNCNAME[0]} — live --all attached-session filter incorrect"
   fi
 }
 
@@ -3020,6 +3227,8 @@ import json, sys
 obj = json.loads(sys.stdin.read())
 assert obj["count"] == 1
 assert obj["total_live_count"] == 2
+assert obj["active_only"] is True
+assert obj["current_shell"] is None
 assert obj["high_signal_only"] is True
 assert obj["hidden_low_signal_count"] == 1
 assert len(obj["sessions"]) == 1
@@ -3031,6 +3240,87 @@ assert obj["sessions"][0]["session"] == sys.argv[1]
     echo "    output:"
     echo "$output" | sed 's/^/    /'
     fail "${FUNCNAME[0]} — live --json did not report hidden low-signal sessions correctly"
+  fi
+}
+
+test_live_json_hides_all_low_signal_sessions() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output low_session
+  setup_mock_live_low_only_env
+  low_session="$MOCK_LIVE_LOW_SESSION"
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" live --json --recent 10 2>&1)
+  cleanup_mock_live_env
+
+  if printf '%s' "$output" | python3 -c '
+import json, sys
+obj = json.loads(sys.stdin.read())
+assert obj["count"] == 0
+assert obj["total_live_count"] == 1
+assert obj["active_only"] is True
+assert obj["current_shell"] is None
+assert obj["high_signal_only"] is True
+assert obj["hidden_low_signal_count"] == 1
+assert obj["sessions"] == []
+' "$low_session"
+  then
+    pass "${FUNCNAME[0]} — live default hides low-signal sessions even when all live lanes are low-signal"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — live default should not surface all-low-signal noise"
+  fi
+}
+
+test_live_recent_zero_returns_no_sessions() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_live_env
+  local output
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" live --recent 0 --json 2>&1)
+  cleanup_mock_live_env
+
+  if printf '%s' "$output" | python3 -c '
+import json, sys
+obj = json.loads(sys.stdin.read())
+assert obj["count"] == 0
+assert obj["total_live_count"] == 0
+assert obj["sessions"] == []
+'
+  then
+    pass "${FUNCNAME[0]} — live --recent 0 returns an empty count window"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — live --recent 0 should return no sessions"
+  fi
+}
+
+test_live_project_filter_uses_process_cwd() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local output signal_session
+  setup_mock_live_env
+  signal_session="$MOCK_LIVE_SIGNAL_SESSION"
+  output=$(PATH="$MOCK_LIVE_TMPBIN:/usr/bin:/bin" "$SURROGATE" live --project surrogate -n 1 --recent 10 --json 2>&1)
+  cleanup_mock_live_env
+
+  if printf '%s' "$output" | python3 -c '
+import json, sys
+obj = json.loads(sys.stdin.read())
+assert obj["count"] == 1
+assert obj["sessions"][0]["session"] == sys.argv[1]
+assert obj["sessions"][0]["project_hint"] == "surrogate"
+' "$signal_session"
+  then
+    pass "${FUNCNAME[0]} — live --project falls back to process cwd"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — live --project should use process cwd when transcript lacks a repo path"
   fi
 }
 
@@ -5118,14 +5408,20 @@ run_section behavior full \
   test_list_json_output \
   test_who_recent_first \
   test_who_recent_duration_filter \
+  test_who_recent_zero_returns_no_sessions \
   test_who_project_filter \
+  test_who_project_filter_scans_beyond_display_tail \
   test_who_cwd_filter \
   test_who_json_output \
   test_live_focuses_high_signal_sessions \
   test_live_all_includes_low_signal_sessions \
   test_live_json_reports_hidden_low_signal_sessions \
+  test_live_json_hides_all_low_signal_sessions \
+  test_live_recent_zero_returns_no_sessions \
+  test_live_project_filter_uses_process_cwd \
   test_active_default_attached_only \
   test_active_all_includes_detached \
+  test_active_recent_zero_returns_no_sessions \
   test_peek_count_at_end \
   test_read_default_20_lines \
   test_wait_default_30s \
@@ -5221,6 +5517,7 @@ run_section invariants full \
   test_invariant_snippet_shims_nested_attach_all_shells \
   test_shell_setup_commands_mode_requires_commands \
   test_shell_setup_commands_mode_generates_registered_wrappers_all_shells \
+  test_shell_setup_commands_mode_command_ids_do_not_collide \
   test_shell_setup_commands_mode_plain_shell_stays_unwrapped \
   test_shell_setup_commands_mode_wraps_only_registered_commands \
   test_shell_setup_commands_mode_silent_under_nested_zmx \

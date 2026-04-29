@@ -98,6 +98,14 @@ normalize_commands() {
   printf '%s' "$normalized"
 }
 
+command_metadata_id() {
+  # Use a hex encoding instead of punctuation normalization so command names
+  # like foo-bar, foo.bar, and foo_bar cannot share metadata variables.
+  local cmd="$1" hex
+  hex="$(printf '%s' "$cmd" | od -An -tx1 -v | tr -d ' \n')"
+  printf 'cmd_%s' "$hex"
+}
+
 resolve_config_path() {
   local explicit_path="$1"
 
@@ -175,24 +183,19 @@ resolve_settings() {
 bash_like_wrappers() {
   # Each wrapper dispatches on the kind captured at preamble time:
   #   - function: the user's shell function was renamed to
-  #     `_SURR_ORIG_<cmd>_fn`. We call it directly in-process and do NOT
-  #     zmx-wrap. Wrapping a function would require exposing its body
-  #     across a process boundary — either via a bash function-export, which puts
-  #     the body in the environment as `BASH_FUNC_<name>%%=...`, or via
-  #     a temp file. Shell functions can contain secrets or private
-  #     paths, so either is a real private-data leakage primitive. The
-  #     safe default is to preserve the function's behavior without
-  #     wrapping. Users who want their command wrapped should define
-  #     it as an alias instead.
+  #     `_SURR_ORIG_<cmd>_fn`. We write that captured body to a private
+  #     temporary script and run it inside zmx. This avoids bash function
+  #     exports (`BASH_FUNC_*` env leakage) while still making function-backed
+  #     command wrappers work.
   #   - alias:   tokenize the captured expansion and wrap+exec inside zmx.
   #   - bare:    wrap+exec the command name itself inside zmx.
   local commands="$1"
   local cmd sanitized
   for cmd in $commands; do
-    sanitized=$(printf '%s' "$cmd" | tr -c 'A-Za-z0-9' '_')
+    sanitized="$(command_metadata_id "$cmd")"
     printf '    %s() {\n' "$cmd"
     printf '      case "${_SURR_KIND_%s:-bare}" in\n' "$sanitized"
-    printf '        function) _SURR_ORIG_%s_fn "$@" ;;\n' "$sanitized"
+    printf '        function) _surr_wrap_function %s _SURR_ORIG_%s_fn "$@" ;;\n' "$cmd" "$sanitized"
     printf '        alias)    local -a __t; read -ra __t <<< "${_SURR_ALIAS_%s}"; _surr_wrap_command %s "${__t[@]}" "$@" ;;\n' "$sanitized" "$cmd"
     printf '        *)        _surr_wrap_command %s %s "$@" ;;\n' "$cmd" "$cmd"
     printf '      esac\n'
@@ -222,12 +225,10 @@ bash_like_alias_preamble() {
   #     means they execute before the block is read, so the function
   #     definitions inside the block parse cleanly.
   #
-  # For function-backed commands we deliberately do NOT export the
-  # renamed function — that would leak the body into the env of every
-  # child process as `BASH_FUNC_<name>%%=...`, and shell functions can
-  # contain secrets or private paths. The wrapper calls the renamed
-  # function in-process instead, accepting that function-backed
-  # commands are preserved but not zmx-wrapped.
+  # For function-backed commands we deliberately do NOT export the renamed
+  # function — that would leak the body into child-process environments as
+  # `BASH_FUNC_<name>%%=...`. The wrapper serializes the captured function to
+  # a private temp script at call time and runs that script inside zmx.
   local commands="$1"
   [[ -n "$commands" ]] || return 0
 
@@ -236,18 +237,19 @@ bash_like_alias_preamble() {
 _surr_capture_cmd() {
   local _surr_cmd="$1"
   local _surr_sanitized="$2"
-  if declare -f "$_surr_cmd" >/dev/null 2>&1; then
-    eval "$(declare -f "$_surr_cmd" | sed "1s/^$_surr_cmd /_SURR_ORIG_${_surr_sanitized}_fn /")"
-    unset -f "$_surr_cmd"
-    eval "_SURR_KIND_${_surr_sanitized}=function"
-    return 0
-  fi
   local _surr_alias_val
   _surr_alias_val="$(alias "$_surr_cmd" 2>/dev/null | sed -E "s/^alias [^=]+='(.*)'\$/\1/")"
   unalias "$_surr_cmd" 2>/dev/null || true
   if [[ -n "$_surr_alias_val" ]]; then
+    unset -f "$_surr_cmd" 2>/dev/null || true
     printf -v "_SURR_ALIAS_${_surr_sanitized}" '%s' "$_surr_alias_val"
     eval "_SURR_KIND_${_surr_sanitized}=alias"
+    return 0
+  fi
+  if declare -f "$_surr_cmd" >/dev/null 2>&1; then
+    eval "$(declare -f "$_surr_cmd" | sed "1s/^$_surr_cmd /_SURR_ORIG_${_surr_sanitized}_fn /")"
+    unset -f "$_surr_cmd"
+    eval "_SURR_KIND_${_surr_sanitized}=function"
   else
     eval "_SURR_KIND_${_surr_sanitized}=bare"
   fi
@@ -256,7 +258,7 @@ PREAMBLE_EOF
 
   local cmd sanitized
   for cmd in $commands; do
-    sanitized=$(printf '%s' "$cmd" | tr -c 'A-Za-z0-9' '_')
+    sanitized="$(command_metadata_id "$cmd")"
     printf '_surr_capture_cmd %s %s\n' "$cmd" "$sanitized"
   done
   printf 'unset -f _surr_capture_cmd\n'
@@ -375,6 +377,26 @@ if [[ $- == *i* ]]; then
       echo "surrogate: zmx session $_surr_name"
     fi
     env -u ZMX_SESSION "$_surr_zmx" attach "$_surr_name" "$@"
+  }
+
+  _surr_wrap_function() {
+    local _surr_label="$1"
+    local _surr_fn="$2"
+    shift 2
+    local _surr_tmp=""
+    local _surr_shell="${SHELL:-/bin/bash}"
+    local _surr_status=0
+    _surr_tmp="$(mktemp "${TMPDIR:-/tmp}/surrogate-fn.${_surr_label}.XXXXXX")" || return 1
+    chmod 600 "$_surr_tmp" 2>/dev/null || true
+    {
+      printf '%s\n' 'trap '\''rm -f "$0"'\'' EXIT'
+      declare -f "$_surr_fn"
+      printf '\n%s "$@"\n' "$_surr_fn"
+    } > "$_surr_tmp"
+    _surr_wrap_command "$_surr_label" "$_surr_shell" "$_surr_tmp" "$@"
+    _surr_status=$?
+    [[ -e "$_surr_tmp" ]] && rm -f "$_surr_tmp"
+    return "$_surr_status"
   }
 
   _surr_parent="$(_surr_parent_name)"

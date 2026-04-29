@@ -157,7 +157,7 @@ In `commands` mode the snippet:
 - Clears leaked `ZMX_SESSION` when the shell is not actually running under a zmx parent, so command wrappers still fire correctly
 - Keeps plain `zmx attach ...` working by clearing leaked `ZMX_SESSION` only for nested attaches
 - Stays silent at shell startup in all cases — including shells already spawned inside zmx by a terminal emulator or agent tooling (e.g. `pi`'s bash extension); the snippet announces only when one of the configured commands is actually wrapped
-- Installs the managed block at the **end** of your rc file and preserves your existing aliases and shell functions. Aliases get the full zmx wrap — the expansion runs inside a fresh zmx session. Shell functions are preserved but **not** wrapped: the wrapper calls the renamed function in-process, because exporting a function across a zmx process boundary would leak its body into child-process environments (shell functions can contain secrets or private paths). If you want a command wrapped in zmx, bind it to an alias instead of a function
+- Installs the managed block at the **end** of your rc file and preserves your existing aliases and shell functions. Aliases get the full zmx wrap — the expansion runs inside a fresh zmx session. Shell functions are wrapped too: the captured function body is written to a private temporary script and executed inside the zmx session without using bash function exports. If both an alias and function share a command name, the alias wins, matching interactive shell behavior
 
 #### Legacy / maximal mode: auto-wrap every shell
 
@@ -244,7 +244,7 @@ surrogate active                         # only sessions with clients attached
 surrogate active --all                   # include non-empty detached sessions
 ```
 
-### Show live, messageable sessions with less noise
+### Show live, active sessions with less noise
 
 ```bash
 surrogate live                           # high-signal live sessions only
@@ -253,7 +253,7 @@ surrogate live --all                     # include low-signal shell-like live la
 surrogate live --json
 ```
 
-`surrogate live` is the operator-facing discovery view. It only shows sessions that are currently messageable via surrogate, ranks them by recent visible activity, and hides low-signal shell-prompt lanes by default when they have no visible repo or cwd hint. Use `--all` when you want the full live set.
+`surrogate live` is the operator-facing discovery view. It only shows sessions with attached clients that have been active in the last 2h, ranks them by recent visible activity, and hides low-signal shell-prompt lanes by default when they have no visible repo or cwd hint. Use `--recent N` for a count-based wider view, or `--all` when you want all attached live lanes in the selected window, including low-signal ones. Detached sessions are handled by `surrogate active --all`, `surrogate stale`, and `surrogate sweep`. In JSON, `current_shell:null` means no current-shell ancestry anomaly was detected.
 
 ### Remote operator briefs with OpenRouter
 
@@ -269,7 +269,7 @@ surrogate brief 15
 surrogate brief silly-pixel
 ```
 
-`surrogate brief` reuses `surrogate live --json`, so the default brief targets the same high-signal, messageable sessions shown by `surrogate live`. Add `--all` if you want briefs for every live messageable session, including low-signal shell lanes.
+`surrogate brief` reuses `surrogate live --json`, so the default brief targets the same attached sessions active in the last 2h shown by `surrogate live`. Add `--all` if you want briefs for every attached live session in the selected window, including low-signal shell lanes; use `--recent N` for a count-based wider view.
 
 Lower-level helper:
 
@@ -374,7 +374,8 @@ surrogate type <session> "echo hello world"
 
 Default `type` is now shell-safe:
 
-- if the target looks like a shell, surrogate suppresses the `[SURROGATE ...]` prose prefix so commands still execute normally
+- surrogate adds the `[SURROGATE ...]` prose prefix only for agent-like targets
+- shell and unknown targets stay unprefixed so literal shell commands still execute normally
 - after submission, surrogate checks fresh shell output and warns on immediate failures like `command not found` or syntax errors
 - the warning points you to `surrogate read <session> -n 40`
 

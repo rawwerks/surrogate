@@ -10,6 +10,7 @@ AUDIT_FILE="${SURROGATE_AUDIT_FILE:-${SURROGATE_TMP}/surrogate-audit.jsonl}"
 SURROGATE_LABEL="${SURROGATE_LABEL:-on}"  # on | off | verbose
 SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-adaptive}"
 SURROGATE_TYPE_POSTCHECK_SECS="${SURROGATE_TYPE_POSTCHECK_SECS:-0.15}"
+SURROGATE_HINT_SCAN_LINES="${SURROGATE_HINT_SCAN_LINES:-200}"
 
 # --- helpers (needed early) ---
 
@@ -84,6 +85,43 @@ session_clients() {
     return 1
 }
 
+session_pid() {
+    local target="$1"
+    local line session pid
+    while IFS= read -r line; do
+        session="${line#session_name=}"
+        session="${session%%$'\t'*}"
+        [[ "$session" == "$target" ]] || continue
+        pid="${line#*$'\t'pid=}"
+        [[ "$pid" != "$line" ]] || return 1
+        pid="${pid%%$'\t'*}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+        printf '%s' "$pid"
+        return 0
+    done < <(zmx list 2>/dev/null)
+    return 1
+}
+
+session_process_cwd() {
+    local session="$1" pid="" cwd="" proc_root="${SURROGATE_PROC_ROOT:-/proc}"
+    pid="$(session_pid "$session" 2>/dev/null || true)"
+    [[ -n "$pid" ]] || return 0
+
+    if [[ -e "$proc_root/$pid/cwd" ]]; then
+        cwd="$(cd "$proc_root/$pid/cwd" 2>/dev/null && pwd -P || true)"
+        if [[ -n "$cwd" ]]; then
+            printf '%s' "$cwd"
+            return 0
+        fi
+    fi
+
+    if [[ -r "$proc_root/$pid/environ" ]]; then
+        tr '\0' '\n' < "$proc_root/$pid/environ" 2>/dev/null |
+            sed -n 's/^PWD=//p' |
+            head -1
+    fi
+}
+
 bridge_exists() {
     tmux has-session -t "$(bridge_name "$1")" 2>/dev/null
 }
@@ -155,6 +193,16 @@ record_nullable_field() {
         printf '%s' ""
     else
         printf '%s' "${1:-}"
+    fi
+}
+
+hint_scan_lines_for() {
+    local requested="$1"
+    require_int "$SURROGATE_HINT_SCAN_LINES"
+    if [[ "$requested" -lt "$SURROGATE_HINT_SCAN_LINES" ]]; then
+        printf '%s' "$SURROGATE_HINT_SCAN_LINES"
+    else
+        printf '%s' "$requested"
     fi
 }
 
@@ -624,6 +672,9 @@ count_rows() {
 
 take_nonempty_rows() {
     local limit="$1"
+    if [[ "$limit" -le 0 ]]; then
+        return 0
+    fi
     awk -v limit="$limit" 'NF { print; count++; if (count >= limit) exit }'
 }
 
@@ -871,7 +922,7 @@ surrogate - deterministic terminal control for zmx sessions
 Usage: surrogate <command> [args]
 
 High-value flows:
-  surrogate live --here              Show the live, actionable sessions for this repo
+  surrogate live --here              Show attached sessions active in this repo
   surrogate help list                 Show discoverability-oriented list usage
   surrogate who --recent 20           Find the most recent interesting sessions
   surrogate brief --recent 15         Brief the 15 most recently active sessions
@@ -898,7 +949,7 @@ Commands:
   who   [-n LINES] [--recent N|2h] [--project NAME] [--cwd PATH] [--json]
                                 Show sessions with age and last visible line
   live  [-n LINES] [--recent N|2h] [--project NAME|--here] [--cwd PATH] [--all] [--json]
-                                Show only live, messageable sessions with less noise
+                                Show only live, active sessions with less noise
   active [--all]                Show attached sessions (--all includes non-empty detached)
   brief [--recent N|2h] [filters] [session...]
                                 Remote operator brief via surrogate-brief / OpenRouter
@@ -1000,17 +1051,19 @@ live_usage() {
     cat <<'EOF'
 usage: surrogate live [-n LINES] [--recent N|2h] [--project NAME|--here] [--cwd PATH] [--json]
 
-Show only live, messageable zmx sessions. This is the low-noise discovery view:
+Show only live, active zmx sessions. This is the low-noise discovery view:
 - sessions must be present in `zmx list`
 - sessions must have attached clients
 - results are ranked by recent visible activity, not spawn time
+- default output is limited to sessions active in the last 2h
 - default output hides low-signal shell-like lanes with no visible repo/cwd hint
 
-Add `--all` to include every live messageable session, including low-signal lanes.
+Add `--all` to include every attached live session in the selected window, including low-signal lanes.
+Use `--recent N` to switch to a count-based window, or `--recent 8h` to change the activity window.
 
 Use `--here` to filter to the current repo name.
 If the current shell is only ancestry-backed and not present in `zmx list`, `live`
-prints a separate anomaly note instead of pretending that lane is messageable.
+prints a separate anomaly note instead of pretending that lane is live.
 EOF
 }
 
@@ -1020,7 +1073,7 @@ usage: surrogate active [--all] [-n LINES] [--recent N|2h] [--project NAME] [--c
 
 Show sessions ranked by last observed activity (recent output), not creation time.
 Default mode shows only attached sessions. Use --all to include detached sessions with visible output.
-For a lower-noise, actually messageable view, use `surrogate live`.
+For a lower-noise active-operator view, use `surrogate live`.
 EOF
 }
 
@@ -1033,7 +1086,7 @@ Triage and summarize sessions with one remote brief per session.
 Selection rules:
   - If you pass explicit session names or aliases, those sessions are briefed.
   - Otherwise, session selection reuses `surrogate live --json`, which shows only
-    live, messageable sessions ranked by last observed activity.
+    attached sessions in the selected activity window.
   - `surrogate brief 15` is shorthand for `surrogate brief --recent 15`.
 
 Examples:
@@ -1354,7 +1407,7 @@ session_log_context() {
     [[ -r "$log_path" ]] || return 1
     history="$({ tail -n "$(( lines * 100 ))" "$log_path" 2>/dev/null | grep -Ev '^\[[0-9]+\] \[(info|debug|trace)\]' || true; } | tail -n "$lines")"
     snippet="$(visible_snippet "$history")"
-    cwd_hint="$(visible_path_hint "$history")"
+    cwd_hint="$(best_cwd_hint "$session" "$history")"
     project_hint="$(project_from_path "$cwd_hint")"
     ui_hint="$(ui_hint_from_history "$history")"
     printf '%s\t%s\t%s\t%s\n' \
@@ -1370,7 +1423,7 @@ session_visible_context() {
 
     history="$(session_recent_history "$session" "$lines")"
     snippet="$(visible_snippet "$history")"
-    cwd_hint="$(visible_path_hint "$history")"
+    cwd_hint="$(best_cwd_hint "$session" "$history")"
     project_hint="$(project_from_path "$cwd_hint")"
     ui_hint="$(ui_hint_from_history "$history")"
 
@@ -1397,15 +1450,73 @@ visible_path_hint() {
     # downstream JSON fields and corrupt the emitted document. The `]` is
     # placed first inside the bracket class so it is treated as a literal
     # character — escaping with `\]` is not portable across sed flavors.
-    { printf '%s\n' "$text" |
+    local paths preferred
+    paths="$({ printf '%s\n' "$text" |
         grep -oE '((~|/)[^[:space:]]*/[^[:space:]]+)' 2>/dev/null |
-        sed -E 's#[]",;:.()}]+$##' || true; } |
-        tail -1
+        sed -E 's#[]",;:.()}]+$##' || true; })"
+
+    preferred="$(printf '%s\n' "$paths" |
+        grep -E '(^~|^/.*)/Documents/(GitHub|OpenProse-GitHub)/[^/]+' |
+        tail -1 || true)"
+
+    if [[ -n "$preferred" ]]; then
+        printf '%s' "$preferred"
+    else
+        printf '%s\n' "$paths" | tail -1
+    fi
+}
+
+path_has_repo_root_segment() {
+    local path="${1:-}" marker rest
+    [[ -n "$path" ]] || return 1
+    path="${path%/}"
+
+    for marker in "/Documents/GitHub/" "/Documents/OpenProse-GitHub/"; do
+        if [[ "$path" == *"$marker"* ]]; then
+            rest="${path#*"$marker"}"
+            rest="${rest%%/*}"
+            if [[ -n "$rest" ]]; then
+                return 0
+            fi
+        fi
+    done
+
+    return 1
 }
 
 project_from_path() {
-    [[ -n "${1:-}" ]] || return 0
-    basename "${1%/}"
+    local path="${1:-}" marker rest
+    [[ -n "$path" ]] || return 0
+    path="${path%/}"
+
+    for marker in "/Documents/GitHub/" "/Documents/OpenProse-GitHub/"; do
+        if [[ "$path" == *"$marker"* ]]; then
+            rest="${path#*"$marker"}"
+            rest="${rest%%/*}"
+            if [[ -n "$rest" ]]; then
+                printf '%s' "$rest"
+                return 0
+            fi
+        fi
+    done
+
+    basename "$path"
+}
+
+best_cwd_hint() {
+    local session="$1" history="$2"
+    local visible_cwd process_cwd
+    visible_cwd="$(visible_path_hint "$history")"
+    process_cwd="$(session_process_cwd "$session")"
+
+    if [[ -n "$process_cwd" ]] && path_has_repo_root_segment "$process_cwd"; then
+        if [[ -z "$visible_cwd" ]] || ! path_has_repo_root_segment "$visible_cwd"; then
+            printf '%s' "$process_cwd"
+            return 0
+        fi
+    fi
+
+    printf '%s' "$visible_cwd"
 }
 
 ui_hint_from_history() {
@@ -1419,15 +1530,15 @@ ui_hint_from_history() {
     # at a ready prompt right now.
     if printf '%s\n' "$text" | grep -Eqi '^[[:space:]]*[›•✻]' ||
        printf '%s\n' "$text" | grep -Eqi 'Use /skills to list available skills|Model interrupted|[0-9]+% left|tokens left|background terminal running|Worked for [0-9]+m' ||
-       printf '%s\n' "$text" | grep -Eqi 'Claude Code|\? for shortcuts|⏵⏵ bypass permissions|shift\+tab to cycle' ||
-       printf '%s\n' "$text" | grep -Eqi 'pi v[0-9]|pi-handoff|mycelium (on|off)|dirpack [0-9]|\(openai-codex\)|gpt-[0-9]+\.[0-9]+ (xhigh|high|medium|low)' ||
+       printf '%s\n' "$text" | grep -Eqi '▐▛|▜▌|\? for shortcuts|⏵⏵ bypass permissions|shift\+tab to cycle' ||
+       printf '%s\n' "$text" | grep -Eqi 'pi v[0-9]|pi-handoff|mycelium (on|off)|dirpack [0-9]|gpt-[0-9]+\.[0-9]+ (xhigh|high|medium|low)' ||
        printf '%s\n' "$text" | grep -Eqi '[Ee]sc to (cancel|interrupt)|Tab to amend|Do you want to proceed\?|Press enter to continue|ctrl\+e to explain|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] [Ww]orking'; then
         echo "agent"
         return 0
     fi
 
     if [[ -n "$last_line" ]] &&
-       printf '%s\n' "$last_line" | grep -Eq '([#$%>] ?|❯ ?)$'; then
+       printf '%s\n' "$last_line" | grep -Eq '([#$%>] ?|❯ ?)([^[:space:]].*)?$'; then
         echo "shell"
         return 0
     fi
@@ -1472,7 +1583,14 @@ activity_ranked_records() {
     local recent_age_max="${4:-}"
     local project_filter="${5:-}"
     local cwd_filter="${6:-}"
-    local base_records filtered_base sorted_base selected_base records
+    local base_records filtered_base sorted_base selected_base records filter_lines record_lines
+
+    filter_lines="$lines"
+    record_lines="$lines"
+    if [[ -n "$project_filter" || -n "$cwd_filter" ]]; then
+        filter_lines="$(hint_scan_lines_for "$lines")"
+        record_lines="$filter_lines"
+    fi
 
     base_records="$(session_base_records)"
     filtered_base=""
@@ -1480,10 +1598,10 @@ activity_ranked_records() {
         [[ -n "$session" ]] || continue
         case "$mode" in
             live)
-                # live = any zmx-listed session. The presence of the session
-                # in `zmx list` already implies a live backend PID; detached
-                # clients count. Downstream noise (bare shells, unknown
-                # ui_hint) is filtered by the default-view classifier.
+                # live = currently attached sessions. Detached zmx sessions
+                # are recoverable through active --all, stale, and sweep, but
+                # they are not active operator lanes.
+                [[ "$clients" -gt 0 ]] || continue
                 ;;
             attached)
                 [[ "$clients" -gt 0 ]] || continue
@@ -1523,7 +1641,7 @@ activity_ranked_records() {
         while IFS=$'\t' read -r age_seconds ago attached clients alias session activity_seconds active_ago; do
             [[ -n "$session" ]] || continue
             inspected=$((inspected + 1))
-            IFS=$'\t' read -r snippet cwd_hint project_hint ui_hint < <(session_log_context "$session" "$lines" || true)
+            IFS=$'\t' read -r snippet cwd_hint project_hint ui_hint < <(session_visible_context "$session" "$filter_lines" || true)
             if [[ -z "$snippet" && -z "$cwd_hint" && -z "$project_hint" ]]; then
                 continue
             fi
@@ -1545,7 +1663,7 @@ activity_ranked_records() {
     fi
 
     if [[ -n "$selected_base" ]]; then
-        records="$(session_records "$lines" "$selected_base")"
+        records="$(session_records "$record_lines" "$selected_base")"
         printf '%s' "$records" | sed '/^$/d' | sort -t $'\t' -k7,7n -k4,4nr -k6,6 | take_nonempty_rows "$recent_count"
     fi
 }
@@ -1854,7 +1972,7 @@ cmd_type() {
     # Prepend surrogate label for agent-like contexts and explicit message sends.
     local prefix
     prefix=""
-    if [[ "$message_mode" -eq 1 || "$ui_hint" != "shell" ]]; then
+    if [[ "$message_mode" -eq 1 || "$ui_hint" == "agent" ]]; then
         prefix="$(_surrogate_prefix)"
     fi
     if [[ -n "$prefix" ]]; then
@@ -2052,7 +2170,12 @@ cmd_who() {
         selected_base="$(printf '%s\n' "$selected_base" | take_nonempty_rows "$recent_count")"
     fi
 
-    records="$(session_records "$lines" "$selected_base")"
+    local record_lines="$lines"
+    if [[ -n "$project_filter" || -n "$cwd_filter" ]]; then
+        record_lines="$(hint_scan_lines_for "$lines")"
+    fi
+
+    records="$(session_records "$record_lines" "$selected_base")"
     while IFS=$'\t' read -r age_seconds ago attached clients alias session _activity_seconds _active_ago snippet cwd_hint project_hint ui_hint; do
         [[ -n "$session" ]] || continue
         if [[ -n "$cwd_filter" && ( -z "$cwd_hint" || "$cwd_hint" != "$cwd_filter"* ) ]]; then
@@ -2200,7 +2323,7 @@ cmd_live() {
     local json=0
     local show_all=0
     local recent_count=15
-    local recent_age_max=""
+    local recent_age_max=7200
     local project_filter=""
     local cwd_filter=""
     local here=0
@@ -2219,7 +2342,7 @@ cmd_live() {
                 local recent_mode
                 recent_mode="$(parse_recent_filter "$2")"
                 case "$recent_mode" in
-                    count:*) recent_count="${recent_mode#count:}" ;;
+                    count:*) recent_count="${recent_mode#count:}"; recent_age_max="" ;;
                     age:*) recent_age_max="${recent_mode#age:}" ;;
                 esac
                 shift 2
@@ -2256,17 +2379,13 @@ cmd_live() {
             fi
         done <<< "$sorted"
 
-        if [[ -n "$focused_rows" ]]; then
-            display_rows="$(printf '%s' "$focused_rows" | sed '/^$/d')"
-            display_total="$(count_rows "$display_rows")"
-            signal_filtered=1
-        else
-            hidden_low_signal=0
-        fi
+        display_rows="$(printf '%s' "$focused_rows" | sed '/^$/d')"
+        display_total="$(count_rows "$display_rows")"
+        signal_filtered=1
     fi
 
     if [[ "$json" -eq 1 ]]; then
-        printf '{"count":%s,"total_live_count":%s,"messageable_only":true' "$display_total" "$total"
+        printf '{"count":%s,"total_live_count":%s,"messageable_only":true,"active_only":true' "$display_total" "$total"
         printf ',"high_signal_only":%s,"hidden_low_signal_count":%s' \
             "$([[ "$signal_filtered" -eq 1 ]] && printf 'true' || printf 'false')" \
             "$hidden_low_signal"
@@ -2317,7 +2436,7 @@ cmd_live() {
             echo "── $display_total live session(s), recent activity first ──"
         fi
     else
-        echo "no live messageable sessions matched"
+        echo "no live active sessions matched"
     fi
 
     if [[ -n "$anomaly" ]]; then
@@ -2330,9 +2449,17 @@ cmd_live() {
     fi
 
     if [[ "$signal_filtered" -eq 1 ]]; then
-        echo "Hidden by design: old detached sessions and low-signal live lanes. Review with: surrogate live --all --recent $recent_count"
+        if [[ -n "$recent_age_max" ]]; then
+            echo "Hidden by design: detached sessions, sessions outside the recent activity window, and low-signal live lanes. Review with: surrogate live --all --recent $recent_count"
+        else
+            echo "Hidden by design: detached sessions and low-signal live lanes. Review with: surrogate live --all --recent $recent_count"
+        fi
     else
-        echo "Hidden by design: old detached sessions. Review with: surrogate stale --older-than 72"
+        if [[ -n "$recent_age_max" ]]; then
+            echo "Hidden by design: detached sessions and sessions outside the recent activity window. Review with: surrogate live --all --recent $recent_count or surrogate active --all"
+        else
+            echo "Hidden by design: old detached sessions. Review with: surrogate stale --older-than 72"
+        fi
     fi
 }
 

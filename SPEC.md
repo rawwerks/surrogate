@@ -221,6 +221,24 @@ Successful pruning must call `zmx kill` and then clean surrogate’s own bridge,
 
 The `sweep` command must be the plain-English batch entrypoint for stale-session review and deletion. It must behave like `prune-sessions --stale`, support the same `--older-than HOURS`, `--filter PATTERN`, `--limit N`, and `--yes` flags, and inherit the same preview-by-default behavior.
 
+### auto-prune
+
+The `auto-prune` command must schedule recurring stale-session pruning so detached zmx sessions do not accumulate forever. It must expose three subcommands: `install`, `status`, and `disable`. It must reuse `prune-sessions --stale --yes` verbatim — no new prune logic. The recurring run must therefore preserve the existing safety contract: attached sessions and the caller's current live session must never be deleted by the timer.
+
+`auto-prune` must be platform-agnostic. It must auto-detect the host's user-level scheduler and dispatch to the matching backend:
+
+- **systemd backend** (Linux with a user systemd bus): write a service and timer unit pair under `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/` named `surrogate-prune.service` and `surrogate-prune.timer`. After writing, attempt `systemctl --user daemon-reload` and `systemctl --user enable --now surrogate-prune.timer`. If systemctl is unavailable or `SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL=1` is set, skip enablement, leave the unit files written, and print the manual enable commands.
+- **launchd backend** (macOS): write a per-user LaunchAgent plist at `$HOME/Library/LaunchAgents/works.raw.surrogate-prune.plist`. After writing, attempt `launchctl bootstrap gui/$UID <plist>` (or `launchctl load -w` on systems that lack `bootstrap`). If launchctl is unavailable or `SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL=1` is set, skip activation, leave the plist written, and print the manual load commands.
+- **generic fallback** (any other Unix): refuse to install. Print the equivalent cron line — including the absolute surrogate path, `prune-sessions --stale --older-than <HOURS> --yes`, and a comment marker so users can find it later — and exit with status `2` ("scheduler unsupported") so callers can branch on it, distinct from `1` ("real error"). When the user reaches the cron path *explicitly* via `--scheduler cron`, exit `0` instead — they got what they asked for. The cron path must reject intervals it cannot represent (sub-minute granularity, or steps that do not divide an hour, day, or month evenly) before printing any line, with a clear error naming the constraint.
+
+Across every backend the command emitted by the schedule must include the literal flags `prune-sessions --stale --older-than <HOURS> --yes` in that order, must invoke the absolute path of the surrogate binary that ran `install`, and must validate numeric and duration arguments before they are written into any scheduler artifact. `auto-prune install` must accept `--older-than HOURS` (default 72) and `--every DURATION` (default `1h`); duration tokens must be normalized to the form expected by the active backend (e.g. systemd `OnUnitActiveSec`, launchd `StartInterval`, cron column), and any token the backend cannot represent must be rejected with a clear error before any artifact is written.
+
+A `--scheduler` flag must be available to override the auto-detected backend, accepting `systemd`, `launchd`, `cron`, or `none`. Selecting a backend that is not present on the current host must error out before writing anything. `none` must skip artifact writing entirely and only print the underlying surrogate command, so users on locked-down hosts can still discover the right thing to schedule manually.
+
+`auto-prune status` must report which backend is detected, whether the scheduler artifact exists for that backend, the configured prune command, and the configured run interval. When the activation tool for the backend is available it must additionally report whether the schedule is currently enabled and active. When no artifact is present it must say `not installed` and exit non-zero.
+
+`auto-prune disable` must remove the scheduler artifact for the detected (or `--scheduler`-selected) backend and, when the activation tool is available, deactivate the schedule before removal. It must remain non-fatal if either step has nothing to remove, so that disable is idempotent.
+
 ### Session Resolution
 
 All commands that accept a session name must also accept an alias. Session resolution must first check if the argument is a known alias and resolve it to the actual session name. If not an alias, it must be treated as a literal session name. This applies to: send, type, read, wait, bridge, rename, alias, and explicit `prune-sessions` commands.

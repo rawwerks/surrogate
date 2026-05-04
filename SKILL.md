@@ -154,6 +154,22 @@ surrogate prune-sessions --stale [--older-than HOURS] [--filter PATTERN] [--dry-
 surrogate prune-sessions --stale --older-than 24 --limit 10 --yes
 ```
 
+### Schedule recurring pruning (`auto-prune`)
+
+`auto-prune` wires `prune-sessions --stale --yes` into a per-user systemd timer (Linux) or launchd LaunchAgent (macOS) so detached sessions don't accumulate forever. It is a thin scheduling shim — no new prune logic — so attached sessions and the caller's current live session are still never deleted.
+
+```bash
+surrogate auto-prune install                      # 72h threshold, hourly tick
+surrogate auto-prune install --older-than 168     # 1 week
+surrogate auto-prune install --every 30min        # tighter cadence
+surrogate auto-prune status                       # what's installed and active
+surrogate auto-prune disable                      # remove the schedule
+```
+
+Use `--scheduler {systemd|launchd|cron|none}` to override auto-detection. `cron` is print-only (prints the line you'd add to `crontab -e`) and `none` is print-only (just shows the underlying surrogate command), for hosts without a supported user-level scheduler. When auto-prune *auto-detects* `cron` because nothing else is available, it exits with status `2` so callers can branch on "scheduler unsupported"; when the user explicitly asks for `--scheduler cron`, it exits `0`.
+
+For hermetic installs (CI, SSH without a user bus): set `SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL=1` or `SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL=1`. Unit files are still written; only activation is skipped.
+
 ### Type text + Enter (most common)
 
 ```bash

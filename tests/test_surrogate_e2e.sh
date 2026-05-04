@@ -49,7 +49,7 @@ Options:
   --smoke          Run the fast default sections only
   --full           Run the entire suite
   --sections LIST  Run a comma-separated subset of sections
-                   Available: core, identity, aliases, behavior, design, search, labels, invariants
+                   Available: core, identity, aliases, behavior, design, search, labels, invariants, auto_prune
 EOF
 }
 
@@ -5370,6 +5370,475 @@ test_read_validates_n() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# auto-prune (recurring stale-session pruner)
+#
+# Hermetic across platforms: the systemd path uses a temp $XDG_CONFIG_HOME for
+# unit files; the launchd path uses a temp HOME so $HOME/Library/LaunchAgents/
+# is captured. Activation env vars (SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL,
+# SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL) prevent any real scheduler invocation.
+# ---------------------------------------------------------------------------
+
+_auto_prune_hermetic_dir() {
+  mktemp -d -t surr-auto-prune-XXXXXX
+}
+
+_auto_prune_run_systemd() {
+  # _auto_prune_run_systemd <hermetic-dir> <subcommand> [args...]
+  local hd="$1"; shift
+  local sub="$1"; shift
+  XDG_CONFIG_HOME="$hd" SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL=1 \
+    "$SURROGATE" auto-prune "$sub" --scheduler systemd "$@"
+}
+
+_auto_prune_run_launchd() {
+  # _auto_prune_run_launchd <hermetic-home> <subcommand> [args...]
+  local hd="$1"; shift
+  local sub="$1"; shift
+  HOME="$hd" SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL=1 \
+    "$SURROGATE" auto-prune "$sub" --scheduler launchd "$@"
+}
+
+test_auto_prune_detects_platform() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  local out
+  out="$(XDG_CONFIG_HOME="$hd" HOME="$hd" "$SURROGATE" auto-prune status 2>&1)" || true
+  # status must mention which backend was detected, even when nothing is installed.
+  if [[ "$out" == *backend:* ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — status output does not name the detected backend: $out"
+  fi
+}
+
+test_auto_prune_scheduler_none_writes_nothing() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  local out
+  out="$(XDG_CONFIG_HOME="$hd" HOME="$hd" \
+        "$SURROGATE" auto-prune install --scheduler none 2>&1)" \
+    || { fail "${FUNCNAME[0]} — install --scheduler none failed: $out"; return; }
+
+  # Must print the surrogate command but write nothing under the hermetic dir.
+  if [[ "$out" != *"prune-sessions --stale --older-than"*"--yes"* ]]; then
+    fail "${FUNCNAME[0]} — none-mode did not print the prune command: $out"
+    return
+  fi
+  if [[ -e "$hd/systemd" || -e "$hd/Library" ]]; then
+    fail "${FUNCNAME[0]} — none-mode wrote scheduler artifacts under $hd"
+    return
+  fi
+  pass "${FUNCNAME[0]}"
+}
+
+test_auto_prune_help_is_discoverable() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  local out
+  out="$(XDG_CONFIG_HOME="$hd" HOME="$hd" "$SURROGATE" auto-prune --help 2>&1)" \
+    || { fail "${FUNCNAME[0]} — --help exited non-zero"; return; }
+  if [[ "$out" == *install* && "$out" == *status* && "$out" == *disable* ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — help missing install/status/disable: $out"
+  fi
+}
+
+test_auto_prune_install_writes_unit_files() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  if ! _auto_prune_run_systemd "$xdg" install >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — install exited non-zero"
+    return
+  fi
+  local svc="$xdg/systemd/user/surrogate-prune.service"
+  local tmr="$xdg/systemd/user/surrogate-prune.timer"
+  if [[ -f "$svc" && -f "$tmr" ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — missing service ($svc) or timer ($tmr)"
+  fi
+}
+
+test_auto_prune_install_execstart_calls_prune_sessions_stale_yes() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  _auto_prune_run_systemd "$xdg" install >/dev/null 2>&1 || { fail "${FUNCNAME[0]} — install failed"; return; }
+  local svc="$xdg/systemd/user/surrogate-prune.service"
+  local exec_line
+  exec_line="$(grep '^ExecStart=' "$svc" 2>/dev/null || true)"
+  if [[ "$exec_line" == *"prune-sessions --stale --older-than "*" --yes"* ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — ExecStart wrong: $exec_line"
+  fi
+}
+
+test_auto_prune_install_default_older_than_is_72() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  _auto_prune_run_systemd "$xdg" install >/dev/null 2>&1 || { fail "${FUNCNAME[0]} — install failed"; return; }
+  if grep -q '^ExecStart=.* --older-than 72 ' "$xdg/systemd/user/surrogate-prune.service"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — default older-than is not 72: $(grep '^ExecStart=' "$xdg/systemd/user/surrogate-prune.service")"
+  fi
+}
+
+test_auto_prune_install_honors_older_than_flag() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  _auto_prune_run_systemd "$xdg" install --older-than 168 >/dev/null 2>&1 || { fail "${FUNCNAME[0]} — install failed"; return; }
+  if grep -q '^ExecStart=.* --older-than 168 ' "$xdg/systemd/user/surrogate-prune.service"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — --older-than 168 not propagated"
+  fi
+}
+
+test_auto_prune_install_validates_older_than() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  if _auto_prune_run_systemd "$xdg" install --older-than abc >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — bad --older-than should have failed"
+  elif [[ -f "$xdg/systemd/user/surrogate-prune.service" ]]; then
+    fail "${FUNCNAME[0]} — service file written despite invalid input"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
+test_auto_prune_install_uses_absolute_surrogate_path() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  _auto_prune_run_systemd "$xdg" install >/dev/null 2>&1 || { fail "${FUNCNAME[0]} — install failed"; return; }
+  local exec_line
+  exec_line="$(grep '^ExecStart=' "$xdg/systemd/user/surrogate-prune.service")"
+  # Must start with an absolute path
+  if [[ "$exec_line" =~ ^ExecStart=/ ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — ExecStart path not absolute: $exec_line"
+  fi
+}
+
+test_auto_prune_install_writes_timer_with_persistent() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  _auto_prune_run_systemd "$xdg" install --every 30min >/dev/null 2>&1 || { fail "${FUNCNAME[0]} — install failed"; return; }
+  local tmr="$xdg/systemd/user/surrogate-prune.timer"
+  if grep -q '^OnUnitActiveSec=30min' "$tmr" && grep -q '^Persistent=true' "$tmr"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — timer body wrong:"$'\n'"$(cat "$tmr")"
+  fi
+}
+
+test_auto_prune_status_reports_install_state() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  # Pre-install: status must report "not installed" and exit non-zero.
+  local before_out before_rc=0
+  before_out="$(_auto_prune_run_systemd "$xdg" status 2>&1)" || before_rc=$?
+  if [[ "$before_out" != *"not installed"* || $before_rc -eq 0 ]]; then
+    fail "${FUNCNAME[0]} — pre-install status wrong (rc=$before_rc out=$before_out)"
+    return
+  fi
+
+  _auto_prune_run_systemd "$xdg" install >/dev/null 2>&1
+  local after_out
+  after_out="$(_auto_prune_run_systemd "$xdg" status 2>&1)"
+  if [[ "$after_out" == *"surrogate-prune.service"* && "$after_out" == *"surrogate-prune.timer"* ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — post-install status missing unit refs: $after_out"
+  fi
+}
+
+test_auto_prune_disable_removes_units() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  _auto_prune_run_systemd "$xdg" install >/dev/null 2>&1
+  _auto_prune_run_systemd "$xdg" disable >/dev/null 2>&1 || { fail "${FUNCNAME[0]} — disable failed"; return; }
+  if [[ ! -f "$xdg/systemd/user/surrogate-prune.service" && ! -f "$xdg/systemd/user/surrogate-prune.timer" ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — unit files still present after disable"
+  fi
+}
+
+test_auto_prune_disable_idempotent() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  # disable on a never-installed config must not error out.
+  if _auto_prune_run_systemd "$xdg" disable >/dev/null 2>&1; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — disable on unconfigured host returned non-zero"
+  fi
+}
+
+test_auto_prune_launchd_writes_plist() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  if ! _auto_prune_run_launchd "$hd" install --older-than 168 --every 30min >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — install --scheduler launchd failed"
+    return
+  fi
+  local plist="$hd/Library/LaunchAgents/works.raw.surrogate-prune.plist"
+  if [[ ! -f "$plist" ]]; then
+    fail "${FUNCNAME[0]} — plist not written at $plist"
+    return
+  fi
+  if ! grep -q "prune-sessions" "$plist"; then
+    fail "${FUNCNAME[0]} — plist missing prune-sessions invocation"
+    return
+  fi
+  if ! grep -q -- "--older-than" "$plist"; then
+    fail "${FUNCNAME[0]} — plist missing --older-than"
+    return
+  fi
+  if ! grep -q "168" "$plist"; then
+    fail "${FUNCNAME[0]} — plist did not honor --older-than 168"
+    return
+  fi
+  if ! grep -qE 'StartInterval|StartCalendarInterval' "$plist"; then
+    fail "${FUNCNAME[0]} — plist missing schedule key"
+    return
+  fi
+  pass "${FUNCNAME[0]}"
+}
+
+test_auto_prune_launchd_disable_removes_plist() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  _auto_prune_run_launchd "$hd" install >/dev/null 2>&1
+  _auto_prune_run_launchd "$hd" disable >/dev/null 2>&1 \
+    || { fail "${FUNCNAME[0]} — launchd disable failed"; return; }
+  if [[ -f "$hd/Library/LaunchAgents/works.raw.surrogate-prune.plist" ]]; then
+    fail "${FUNCNAME[0]} — plist still present after disable"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
+test_auto_prune_unsupported_scheduler_rejected() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  if XDG_CONFIG_HOME="$hd" HOME="$hd" \
+     "$SURROGATE" auto-prune install --scheduler bogus 2>/dev/null; then
+    fail "${FUNCNAME[0]} — install --scheduler bogus should have failed"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
+test_auto_prune_install_default_interval_is_1h() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  _auto_prune_run_systemd "$xdg" install >/dev/null 2>&1 || { fail "${FUNCNAME[0]} — install failed"; return; }
+  if grep -q '^OnUnitActiveSec=1h' "$xdg/systemd/user/surrogate-prune.timer"; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — default OnUnitActiveSec is not 1h"
+  fi
+}
+
+test_auto_prune_install_rejects_zero_duration() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local xdg
+  xdg="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$xdg'" RETURN
+
+  if _auto_prune_run_systemd "$xdg" install --every 0 >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — --every 0 should have been rejected"
+  elif _auto_prune_run_systemd "$xdg" install --every 0s >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — --every 0s should have been rejected"
+  else
+    pass "${FUNCNAME[0]}"
+  fi
+}
+
+test_auto_prune_launchd_uses_absolute_program_path() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  _auto_prune_run_launchd "$hd" install >/dev/null 2>&1 || { fail "${FUNCNAME[0]} — install failed"; return; }
+  local plist="$hd/Library/LaunchAgents/works.raw.surrogate-prune.plist"
+  # The first <string> inside ProgramArguments must be an absolute path.
+  local first_arg
+  first_arg="$(awk '/<key>ProgramArguments<\/key>/{p=1; next} p && /<string>/{ sub(/.*<string>/,""); sub(/<\/string>.*/,""); print; exit }' "$plist")"
+  if [[ "$first_arg" == /* ]]; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — first ProgramArgument not absolute: '$first_arg'"
+  fi
+}
+
+test_auto_prune_launchd_disable_idempotent() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  if _auto_prune_run_launchd "$hd" disable >/dev/null 2>&1; then
+    pass "${FUNCNAME[0]}"
+  else
+    fail "${FUNCNAME[0]} — launchd disable on unconfigured host returned non-zero"
+  fi
+}
+
+test_auto_prune_explicit_cron_exits_zero_and_prints_command() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  local out rc=0
+  out="$(XDG_CONFIG_HOME="$hd" HOME="$hd" \
+        "$SURROGATE" auto-prune install --scheduler cron 2>&1)" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    fail "${FUNCNAME[0]} — explicit --scheduler cron exited $rc (expected 0)"; return
+  fi
+  if [[ "$out" != *"prune-sessions --stale --older-than 72 --yes"* ]]; then
+    fail "${FUNCNAME[0]} — cron output missing prune command: $out"; return
+  fi
+  if [[ "$out" != *"surrogate-auto-prune"* ]]; then
+    fail "${FUNCNAME[0]} — cron output missing comment marker: $out"; return
+  fi
+  if [[ -e "$hd/systemd" || -e "$hd/Library" ]]; then
+    fail "${FUNCNAME[0]} — cron path wrote artifacts under $hd"; return
+  fi
+  pass "${FUNCNAME[0]}"
+}
+
+test_auto_prune_cron_rejects_unrepresentable_intervals() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hd
+  hd="$(_auto_prune_hermetic_dir)"
+  trap "rm -rf '$hd'" RETURN
+
+  # Sub-minute → reject
+  if XDG_CONFIG_HOME="$hd" HOME="$hd" \
+     "$SURROGATE" auto-prune install --scheduler cron --every 30s >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — --every 30s --scheduler cron should reject"; return
+  fi
+  # Minute that doesn't divide an hour evenly (7) → reject
+  if XDG_CONFIG_HOME="$hd" HOME="$hd" \
+     "$SURROGATE" auto-prune install --scheduler cron --every 7min >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — --every 7min --scheduler cron should reject"; return
+  fi
+  # Hour step that doesn't divide a day (5h) → reject
+  if XDG_CONFIG_HOME="$hd" HOME="$hd" \
+     "$SURROGATE" auto-prune install --scheduler cron --every 5h >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — --every 5h --scheduler cron should reject"; return
+  fi
+  # 30min divides an hour → accept
+  if ! XDG_CONFIG_HOME="$hd" HOME="$hd" \
+     "$SURROGATE" auto-prune install --scheduler cron --every 30min >/dev/null 2>&1; then
+    fail "${FUNCNAME[0]} — --every 30min --scheduler cron should be accepted"; return
+  fi
+  pass "${FUNCNAME[0]}"
+}
+
 run_section identity smoke \
   test_whoami \
   test_whoami_uses_stable_pi_bash_identity \
@@ -5505,6 +5974,30 @@ run_section labels full \
   test_label_off \
   test_label_verbose \
   test_type_shell_context_suppresses_label
+
+run_section auto_prune full \
+  test_auto_prune_help_is_discoverable \
+  test_auto_prune_detects_platform \
+  test_auto_prune_scheduler_none_writes_nothing \
+  test_auto_prune_install_writes_unit_files \
+  test_auto_prune_install_execstart_calls_prune_sessions_stale_yes \
+  test_auto_prune_install_default_older_than_is_72 \
+  test_auto_prune_install_default_interval_is_1h \
+  test_auto_prune_install_honors_older_than_flag \
+  test_auto_prune_install_validates_older_than \
+  test_auto_prune_install_rejects_zero_duration \
+  test_auto_prune_install_uses_absolute_surrogate_path \
+  test_auto_prune_install_writes_timer_with_persistent \
+  test_auto_prune_status_reports_install_state \
+  test_auto_prune_disable_removes_units \
+  test_auto_prune_disable_idempotent \
+  test_auto_prune_launchd_writes_plist \
+  test_auto_prune_launchd_uses_absolute_program_path \
+  test_auto_prune_launchd_disable_removes_plist \
+  test_auto_prune_launchd_disable_idempotent \
+  test_auto_prune_unsupported_scheduler_rejected \
+  test_auto_prune_explicit_cron_exits_zero_and_prints_command \
+  test_auto_prune_cron_rejects_unrepresentable_intervals
 
 run_section invariants full \
   test_invariant_snippet_always_prints_message \

@@ -12,6 +12,16 @@ SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-adaptive}"
 SURROGATE_TYPE_POSTCHECK_SECS="${SURROGATE_TYPE_POSTCHECK_SECS:-0.15}"
 SURROGATE_HINT_SCAN_LINES="${SURROGATE_HINT_SCAN_LINES:-200}"
 
+# auto-prune: recurring stale-session pruner (see SPEC.md "auto-prune")
+SURROGATE_AUTO_PRUNE_DEFAULT_HOURS="${SURROGATE_AUTO_PRUNE_DEFAULT_HOURS:-72}"
+SURROGATE_AUTO_PRUNE_DEFAULT_INTERVAL="${SURROGATE_AUTO_PRUNE_DEFAULT_INTERVAL:-1h}"
+SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL="${SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL:-0}"
+SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL="${SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL:-0}"
+SURROGATE_AUTO_PRUNE_LAUNCHD_LABEL="works.raw.surrogate-prune"
+# Documented exit code for "scheduler unsupported on this host"; callers can
+# distinguish it from real errors (1).
+SURROGATE_AUTO_PRUNE_EXIT_UNSUPPORTED=2
+
 # --- helpers (needed early) ---
 
 die() { echo "surrogate: error: $*" >&2; exit 1; }
@@ -33,6 +43,39 @@ require_enter_delay_setting() {
 
 require_hours() {
     [[ "$1" =~ ^[0-9]+$ ]] || die "'$1' is not a valid hour count"
+}
+
+require_systemd_duration() {
+    # Accept the systemd duration tokens we will plausibly write into a unit
+    # file: bare integers (seconds) or N{s,m,min,h,hr,d}. This intentionally
+    # rejects compound forms ("1h30min") to keep cross-backend translation
+    # deterministic — we always pass one token through to one scheduler key.
+    [[ "$1" =~ ^[0-9]+(s|sec|m|min|h|hr|d)?$ ]] \
+        || die "'$1' is not a valid duration (e.g. 30s, 15min, 1h, 2d)"
+    # A zero-valued tick produces a degenerate timer (systemd: fires-and-stops;
+    # launchd: never runs). Reject up front so the malformed unit never lands.
+    [[ "$1" =~ ^0+(s|sec|m|min|h|hr|d)?$ ]] \
+        && die "'$1' must be a positive duration (zero produces a degenerate timer)"
+    return 0
+}
+
+systemd_duration_to_seconds() {
+    # Best-effort normalization for backends that don't speak systemd's syntax
+    # (launchd needs an integer second count, cron needs a step). Caller is
+    # expected to have validated the token via require_systemd_duration first.
+    local d="$1"
+    if [[ "$d" =~ ^([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"; return 0
+    elif [[ "$d" =~ ^([0-9]+)(s|sec)$ ]]; then
+        echo "${BASH_REMATCH[1]}"; return 0
+    elif [[ "$d" =~ ^([0-9]+)(m|min)$ ]]; then
+        echo $(( BASH_REMATCH[1] * 60 )); return 0
+    elif [[ "$d" =~ ^([0-9]+)(h|hr)$ ]]; then
+        echo $(( BASH_REMATCH[1] * 3600 )); return 0
+    elif [[ "$d" =~ ^([0-9]+)(d)$ ]]; then
+        echo $(( BASH_REMATCH[1] * 86400 )); return 0
+    fi
+    die "internal: cannot convert duration '$d' to seconds"
 }
 
 compute_enter_delay() {
@@ -959,6 +1002,8 @@ Commands:
   prune-sessions --stale [options]
                                 Delete zmx sessions and clean their surrogate plumbing
   prune-bridges [--all|--dead]  Remove surrogate tmux bridges only
+  auto-prune {install|status|disable} [--older-than HOURS] [--every DURATION] [--scheduler BACKEND]
+                                Schedule recurring stale-session pruning via systemd / launchd / cron
   peek  [-n LINES] [--filter PATTERN]
                                 Batch read last N lines from all sessions (default: 5)
   prime [--json]                Agent context dump: identity, sessions, usage hints
@@ -1146,6 +1191,41 @@ Preview or delete old detached zmx sessions in one flow.
 
 Default behavior shows what would be deleted and what would be skipped.
 Add --yes to actually delete the zmx sessions and remove their surrogate bridges.
+EOF
+}
+
+auto_prune_usage() {
+    cat <<'EOF'
+usage:
+  surrogate auto-prune install [--older-than HOURS] [--every DURATION] [--scheduler BACKEND]
+  surrogate auto-prune status  [--scheduler BACKEND]
+  surrogate auto-prune disable [--scheduler BACKEND]
+
+Schedule recurring stale-session pruning so detached zmx sessions do not
+accumulate forever. The recurring run reuses `surrogate prune-sessions --stale
+--yes` verbatim — attached sessions and the caller's current live session are
+never deleted by the timer.
+
+Defaults:
+  --older-than 72        hours (matches a conservative 3-day backlog window)
+  --every 1h             scheduler tick interval
+  --scheduler auto       picks systemd (Linux) or launchd (macOS); use
+                         "cron" or "none" to print-only on unsupported hosts.
+
+Files written, by backend:
+  systemd:  $XDG_CONFIG_HOME/systemd/user/surrogate-prune.{service,timer}
+  launchd:  $HOME/Library/LaunchAgents/works.raw.surrogate-prune.plist
+  cron:     prints a crontab line; does not modify crontab
+  none:     prints the underlying surrogate command and exits 0
+
+Skip activation (write-only) for hermetic installs / SSH-without-bus:
+  SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL=1
+  SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL=1
+
+Inspection:
+  systemctl --user list-timers surrogate-prune.timer
+  journalctl --user -u surrogate-prune.service
+  launchctl list | grep surrogate-prune
 EOF
 }
 
@@ -2909,6 +2989,431 @@ cmd_sweep() {
     cmd_prune_sessions --stale "$@"
 }
 
+# ---------------------------------------------------------------------------
+# auto-prune backends
+#
+# Backend dispatch is deterministic. Detection is intentionally simple — a host
+# either has the activation tool on PATH or it does not. The user can always
+# pin a backend with --scheduler.
+# ---------------------------------------------------------------------------
+
+auto_prune_detect_backend() {
+    case "$(uname -s)" in
+        Darwin) echo launchd; return 0 ;;
+        Linux)
+            if command -v systemctl >/dev/null 2>&1; then
+                echo systemd
+            elif command -v crontab >/dev/null 2>&1; then
+                echo cron
+            else
+                echo none
+            fi
+            ;;
+        *)
+            if command -v crontab >/dev/null 2>&1; then echo cron; else echo none; fi
+            ;;
+    esac
+}
+
+auto_prune_resolve_surrogate_path() {
+    # Use the absolute path of the binary we are running from, so the schedule
+    # never relies on PATH lookups under systemd/launchd.
+    local self
+    self="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+    [[ -x "$self" ]] || die "auto-prune: cannot resolve absolute surrogate path ($self)"
+    printf '%s\n' "$self"
+}
+
+auto_prune_systemd_unit_dir() {
+    printf '%s/systemd/user\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+auto_prune_systemd_service_path() { printf '%s/surrogate-prune.service\n' "$(auto_prune_systemd_unit_dir)"; }
+auto_prune_systemd_timer_path()   { printf '%s/surrogate-prune.timer\n'   "$(auto_prune_systemd_unit_dir)"; }
+auto_prune_launchd_plist_path()   { printf '%s/Library/LaunchAgents/%s.plist\n' "$HOME" "$SURROGATE_AUTO_PRUNE_LAUNCHD_LABEL"; }
+
+auto_prune_systemd_install() {
+    local hours="$1" interval="$2" surrogate_bin="$3"
+    local unit_dir service_path timer_path
+    unit_dir="$(auto_prune_systemd_unit_dir)"
+    service_path="$(auto_prune_systemd_service_path)"
+    timer_path="$(auto_prune_systemd_timer_path)"
+    mkdir -p "$unit_dir"
+
+    cat > "$service_path" <<EOF
+[Unit]
+Description=Surrogate stale zmx session pruner
+Documentation=https://github.com/raw-werks/surrogate
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=$surrogate_bin prune-sessions --stale --older-than $hours --yes
+EOF
+
+    cat > "$timer_path" <<EOF
+[Unit]
+Description=Run surrogate-prune on a recurring schedule
+Documentation=https://github.com/raw-werks/surrogate
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=$interval
+AccuracySec=1min
+Persistent=true
+Unit=surrogate-prune.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    echo "wrote $service_path"
+    echo "wrote $timer_path"
+
+    if [[ "$SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL" == "1" ]] || ! command -v systemctl >/dev/null 2>&1; then
+        echo "skipping systemctl invocation (set SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL=0 to enable automatically)"
+        echo "to enable manually:"
+        echo "  systemctl --user daemon-reload"
+        echo "  systemctl --user enable --now surrogate-prune.timer"
+        return 0
+    fi
+
+    systemctl --user daemon-reload
+    systemctl --user enable --now surrogate-prune.timer
+    echo "enabled surrogate-prune.timer (every $interval, prune older than ${hours}h)"
+}
+
+auto_prune_launchd_install() {
+    local hours="$1" interval="$2" surrogate_bin="$3"
+    local plist_path interval_secs
+    plist_path="$(auto_prune_launchd_plist_path)"
+    interval_secs="$(systemd_duration_to_seconds "$interval")"
+    mkdir -p "$(dirname "$plist_path")"
+
+    cat > "$plist_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$SURROGATE_AUTO_PRUNE_LAUNCHD_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$surrogate_bin</string>
+        <string>prune-sessions</string>
+        <string>--stale</string>
+        <string>--older-than</string>
+        <string>$hours</string>
+        <string>--yes</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>$interval_secs</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+EOF
+
+    echo "wrote $plist_path"
+
+    if [[ "$SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL" == "1" ]] || ! command -v launchctl >/dev/null 2>&1; then
+        echo "skipping launchctl activation (set SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL=0 to activate automatically)"
+        echo "to activate manually:"
+        echo "  launchctl bootstrap gui/\$UID $plist_path"
+        echo "  launchctl enable gui/\$UID/$SURROGATE_AUTO_PRUNE_LAUNCHD_LABEL"
+        return 0
+    fi
+
+    if launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>/dev/null; then
+        :
+    else
+        # Older systems (10.10 and earlier) don't have bootstrap.
+        launchctl load -w "$plist_path"
+    fi
+    echo "loaded $SURROGATE_AUTO_PRUNE_LAUNCHD_LABEL (every ${interval_secs}s, prune older than ${hours}h)"
+}
+
+auto_prune_cron_step() {
+    # Translate a validated systemd duration token into a (field, step) pair
+    # that cron can actually represent. Echoes "<field> <step>" on success;
+    # dies with a clear message on inputs cron cannot encode.
+    #
+    # Constraints cron imposes on user-level (5-field) crontabs:
+    #   - Sub-minute schedules cannot be represented (cron has minute granularity).
+    #   - Hour-step values must be in 1..23 (the hour field is 0-23 wrap-or-step).
+    #   - Day-step values must be in 1..31 (day-of-month is 1-31).
+    # Anything outside these is rejected; we will not silently round.
+    local interval="$1"
+    local secs
+    secs="$(systemd_duration_to_seconds "$interval")"
+    if [[ "$secs" -lt 60 ]]; then
+        die "auto-prune --scheduler cron: interval '$interval' is shorter than 1 minute (cron has minute granularity)"
+    fi
+    local minutes=$(( secs / 60 ))
+    if [[ $(( minutes * 60 )) -ne "$secs" ]]; then
+        die "auto-prune --scheduler cron: interval '$interval' is not a whole number of minutes"
+    fi
+    if [[ "$minutes" -lt 60 ]]; then
+        if [[ $(( 60 % minutes )) -ne 0 ]]; then
+            die "auto-prune --scheduler cron: interval '$interval' must divide an hour evenly (try 1m, 5m, 10m, 15m, 20m, 30m)"
+        fi
+        printf 'minute %d\n' "$minutes"
+        return 0
+    fi
+    local hours=$(( minutes / 60 ))
+    if [[ $(( hours * 60 )) -ne "$minutes" ]]; then
+        die "auto-prune --scheduler cron: interval '$interval' must be a whole number of hours"
+    fi
+    if [[ "$hours" -lt 24 ]]; then
+        if [[ $(( 24 % hours )) -ne 0 ]]; then
+            die "auto-prune --scheduler cron: interval '$interval' must divide a day evenly (try 1h, 2h, 3h, 4h, 6h, 8h, 12h)"
+        fi
+        printf 'hour %d\n' "$hours"
+        return 0
+    fi
+    if [[ "$hours" -eq 24 ]]; then
+        printf 'day 1\n'
+        return 0
+    fi
+    local days=$(( hours / 24 ))
+    if [[ $(( days * 24 )) -ne "$hours" ]]; then
+        die "auto-prune --scheduler cron: interval '$interval' must be a whole number of days"
+    fi
+    if [[ "$days" -gt 31 || $(( 31 % days )) -ne 0 ]]; then
+        die "auto-prune --scheduler cron: interval '$interval' (~${days} days) cannot be evenly scheduled in cron's day-of-month field"
+    fi
+    printf 'day %d\n' "$days"
+}
+
+auto_prune_print_cron() {
+    local hours="$1" interval="$2" surrogate_bin="$3" reason="${4:-detected}"
+    local field step
+    read -r field step < <(auto_prune_cron_step "$interval")
+    local cron_line
+    case "$field" in
+        minute)
+            if [[ "$step" -eq 1 ]]; then
+                cron_line="* * * * * $surrogate_bin prune-sessions --stale --older-than $hours --yes  # surrogate-auto-prune"
+            else
+                cron_line="*/$step * * * * $surrogate_bin prune-sessions --stale --older-than $hours --yes  # surrogate-auto-prune"
+            fi ;;
+        hour)
+            if [[ "$step" -eq 1 ]]; then
+                cron_line="0 * * * * $surrogate_bin prune-sessions --stale --older-than $hours --yes  # surrogate-auto-prune"
+            else
+                cron_line="0 */$step * * * $surrogate_bin prune-sessions --stale --older-than $hours --yes  # surrogate-auto-prune"
+            fi ;;
+        day)
+            if [[ "$step" -eq 1 ]]; then
+                cron_line="0 0 * * * $surrogate_bin prune-sessions --stale --older-than $hours --yes  # surrogate-auto-prune"
+            else
+                cron_line="0 0 */$step * * $surrogate_bin prune-sessions --stale --older-than $hours --yes  # surrogate-auto-prune"
+            fi ;;
+        *) die "internal: unexpected cron field '$field'" ;;
+    esac
+
+    if [[ "$reason" == "detected" ]]; then
+        echo "auto-prune: this host has no supported user-level scheduler"
+        echo "add this line to your crontab manually (\`crontab -e\`):"
+    else
+        echo "auto-prune --scheduler cron: copy this line into \`crontab -e\`:"
+    fi
+    echo "  $cron_line"
+}
+
+auto_prune_print_none() {
+    local hours="$1" surrogate_bin="$2"
+    echo "auto-prune --scheduler none: not writing any scheduler artifact"
+    echo "schedule this command yourself:"
+    echo "  $surrogate_bin prune-sessions --stale --older-than $hours --yes"
+}
+
+cmd_auto_prune() {
+    check_deps
+    local sub="${1:-}"
+    [[ -n "$sub" ]] || { auto_prune_usage >&2; return 1; }
+    shift
+    case "$sub" in
+        -h|--help|help) auto_prune_usage; return 0 ;;
+        install)        cmd_auto_prune_install "$@" ;;
+        status)         cmd_auto_prune_status  "$@" ;;
+        disable)        cmd_auto_prune_disable "$@" ;;
+        *) die "auto-prune: unknown subcommand '$sub' (expected install|status|disable)" ;;
+    esac
+}
+
+_auto_prune_parse_scheduler_flag() {
+    # Echoes the validated scheduler choice. Used by install/status/disable.
+    # auto = detect; systemd|launchd|cron|none = pin.
+    local choice="$1"
+    case "$choice" in
+        auto|systemd|launchd|cron|none) echo "$choice" ;;
+        *) die "auto-prune: unknown --scheduler '$choice' (expected systemd|launchd|cron|none|auto)" ;;
+    esac
+}
+
+cmd_auto_prune_install() {
+    local hours="$SURROGATE_AUTO_PRUNE_DEFAULT_HOURS"
+    local interval="$SURROGATE_AUTO_PRUNE_DEFAULT_INTERVAL"
+    local scheduler="auto"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) auto_prune_usage; return 0 ;;
+            --older-than) [[ $# -ge 2 ]] || die "--older-than requires HOURS"; require_hours "$2"; hours="$2"; shift 2 ;;
+            --every)      [[ $# -ge 2 ]] || die "--every requires a duration (e.g. 30min, 1h)"; require_systemd_duration "$2"; interval="$2"; shift 2 ;;
+            --scheduler)  [[ $# -ge 2 ]] || die "--scheduler requires a value"; scheduler="$(_auto_prune_parse_scheduler_flag "$2")"; shift 2 ;;
+            *) die "auto-prune install: unknown flag: $1" ;;
+        esac
+    done
+
+    local explicit=1
+    if [[ "$scheduler" == "auto" ]]; then
+        explicit=0
+        scheduler="$(auto_prune_detect_backend)"
+    fi
+
+    local surrogate_bin
+    surrogate_bin="$(auto_prune_resolve_surrogate_path)"
+
+    case "$scheduler" in
+        systemd)
+            if [[ "$(uname -s)" != "Linux" ]]; then
+                die "auto-prune --scheduler systemd requires Linux (host: $(uname -s))"
+            fi
+            auto_prune_systemd_install "$hours" "$interval" "$surrogate_bin"
+            ;;
+        launchd)
+            auto_prune_launchd_install "$hours" "$interval" "$surrogate_bin"
+            ;;
+        cron)
+            # Explicit `--scheduler cron` prints and exits 0 (the user got what
+            # they asked for). Auto-detected `cron` prints and exits with the
+            # documented "scheduler unsupported" code (2) so callers can branch.
+            local reason="explicit"
+            [[ "$explicit" -eq 0 ]] && reason="detected"
+            auto_prune_print_cron "$hours" "$interval" "$surrogate_bin" "$reason"
+            [[ "$explicit" -eq 1 ]] && return 0
+            return "$SURROGATE_AUTO_PRUNE_EXIT_UNSUPPORTED"
+            ;;
+        none)
+            auto_prune_print_none "$hours" "$surrogate_bin"
+            return 0
+            ;;
+        *)
+            die "auto-prune: detected unsupported scheduler '$scheduler' on this host"
+            ;;
+    esac
+}
+
+cmd_auto_prune_status() {
+    local scheduler="auto"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) auto_prune_usage; return 0 ;;
+            --scheduler) [[ $# -ge 2 ]] || die "--scheduler requires a value"; scheduler="$(_auto_prune_parse_scheduler_flag "$2")"; shift 2 ;;
+            *) die "auto-prune status: unknown flag: $1" ;;
+        esac
+    done
+
+    [[ "$scheduler" == "auto" ]] && scheduler="$(auto_prune_detect_backend)"
+    echo "backend: $scheduler"
+
+    case "$scheduler" in
+        systemd)
+            local svc tmr
+            svc="$(auto_prune_systemd_service_path)"
+            tmr="$(auto_prune_systemd_timer_path)"
+            if [[ ! -f "$svc" && ! -f "$tmr" ]]; then
+                echo "auto-prune: not installed (no $svc or $tmr)"
+                return 1
+            fi
+            echo "service: $svc"
+            [[ -f "$svc" ]] && grep -E '^(ExecStart|Description)=' "$svc" | sed 's/^/  /' || echo "  (missing)"
+            echo "timer:   $tmr"
+            [[ -f "$tmr" ]] && grep -E '^(OnUnitActiveSec|OnBootSec|Persistent)=' "$tmr" | sed 's/^/  /' || echo "  (missing)"
+            if command -v systemctl >/dev/null 2>&1 && [[ "$SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL" != "1" ]]; then
+                echo ""
+                local enabled active
+                enabled="$(systemctl --user is-enabled surrogate-prune.timer 2>/dev/null || echo unknown)"
+                active="$(systemctl --user is-active surrogate-prune.timer 2>/dev/null || echo unknown)"
+                echo "enabled: $enabled"
+                echo "active:  $active"
+            fi
+            ;;
+        launchd)
+            local plist
+            plist="$(auto_prune_launchd_plist_path)"
+            if [[ ! -f "$plist" ]]; then
+                echo "auto-prune: not installed (no $plist)"
+                return 1
+            fi
+            echo "plist: $plist"
+            grep -E '<string>--older-than|<integer>' "$plist" | sed 's/^/  /' || true
+            if command -v launchctl >/dev/null 2>&1 && [[ "$SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL" != "1" ]]; then
+                echo ""
+                if launchctl print "gui/$(id -u)/$SURROGATE_AUTO_PRUNE_LAUNCHD_LABEL" 2>/dev/null | head -5; then
+                    :
+                else
+                    echo "loaded: no"
+                fi
+            fi
+            ;;
+        cron|none)
+            echo "auto-prune: $scheduler backend is print-only; nothing to inspect"
+            return 1
+            ;;
+    esac
+}
+
+cmd_auto_prune_disable() {
+    local scheduler="auto"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help) auto_prune_usage; return 0 ;;
+            --scheduler) [[ $# -ge 2 ]] || die "--scheduler requires a value"; scheduler="$(_auto_prune_parse_scheduler_flag "$2")"; shift 2 ;;
+            *) die "auto-prune disable: unknown flag: $1" ;;
+        esac
+    done
+
+    [[ "$scheduler" == "auto" ]] && scheduler="$(auto_prune_detect_backend)"
+
+    case "$scheduler" in
+        systemd)
+            if command -v systemctl >/dev/null 2>&1 && [[ "$SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL" != "1" ]]; then
+                systemctl --user disable --now surrogate-prune.timer 2>/dev/null || true
+            fi
+            local svc tmr
+            svc="$(auto_prune_systemd_service_path)"
+            tmr="$(auto_prune_systemd_timer_path)"
+            [[ -f "$svc" ]] && rm -f "$svc" && echo "removed $svc"
+            [[ -f "$tmr" ]] && rm -f "$tmr" && echo "removed $tmr"
+            if command -v systemctl >/dev/null 2>&1 && [[ "$SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL" != "1" ]]; then
+                systemctl --user daemon-reload 2>/dev/null || true
+            fi
+            echo "auto-prune: disabled (systemd)"
+            ;;
+        launchd)
+            local plist
+            plist="$(auto_prune_launchd_plist_path)"
+            if command -v launchctl >/dev/null 2>&1 && [[ "$SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL" != "1" ]]; then
+                launchctl bootout "gui/$(id -u)/$SURROGATE_AUTO_PRUNE_LAUNCHD_LABEL" 2>/dev/null \
+                    || launchctl unload "$plist" 2>/dev/null \
+                    || true
+            fi
+            [[ -f "$plist" ]] && rm -f "$plist" && echo "removed $plist"
+            echo "auto-prune: disabled (launchd)"
+            ;;
+        cron|none)
+            echo "auto-prune: $scheduler backend has nothing to disable"
+            return 0
+            ;;
+    esac
+}
+
 cmd_bridge() {
     check_deps
     case "${1:-}" in
@@ -3101,6 +3606,7 @@ case "${1}" in
     rename)  shift; cmd_rename "$@" ;;
     prune-sessions) shift; cmd_prune_sessions "$@" ;;
     cull)    shift; cmd_cull "$@" ;;
+    auto-prune) shift; cmd_auto_prune "$@" ;;
     bridge)  shift; cmd_bridge "$@" ;;
     prune-bridges) shift; cmd_prune_bridges "$@" ;;
     cleanup) shift; cmd_cleanup "$@" ;;

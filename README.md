@@ -357,6 +357,28 @@ surrogate prune-sessions --stale --older-than 24 --limit 10 --yes
 
 Batch stale pruning is ordered oldest-first and prints explicit skip reasons for old sessions that are still attached or are your current live session.
 
+### Schedule recurring pruning
+
+`surrogate auto-prune` runs `prune-sessions --stale --yes` on a recurring schedule so detached zmx sessions never accumulate beyond the threshold you pick. It is a thin scheduling shim around the existing prune logic — attached sessions and your current live session are still never deleted.
+
+```bash
+surrogate auto-prune install                      # 72h threshold, hourly tick (defaults)
+surrogate auto-prune install --older-than 168     # 1 week threshold
+surrogate auto-prune install --every 30min        # 30-minute tick
+surrogate auto-prune status                       # what's installed, what's active
+surrogate auto-prune disable                      # remove the schedule
+```
+
+`auto-prune` auto-detects the host scheduler:
+
+- **Linux** — writes `~/.config/systemd/user/surrogate-prune.{service,timer}` and enables the timer via `systemctl --user`. Inspect with `systemctl --user list-timers surrogate-prune.timer` and `journalctl --user -u surrogate-prune.service`.
+- **macOS** — writes `~/Library/LaunchAgents/works.raw.surrogate-prune.plist` and loads it via `launchctl bootstrap` (or `launchctl load -w` on older systems).
+- **Other Unix** — refuses to install and prints the equivalent crontab line. Pin a backend explicitly with `--scheduler {systemd|launchd|cron|none}`.
+
+When auto-prune cannot install on the current host (no supported scheduler) it exits with status `2`, distinct from `1` for real errors. Explicit `--scheduler cron` always exits `0` since that is the user-requested behavior.
+
+For hermetic installs without a user bus (CI, SSH-only hosts), set `SURROGATE_AUTO_PRUNE_NO_SYSTEMCTL=1` or `SURROGATE_AUTO_PRUNE_NO_LAUNCHCTL=1` — unit files are still written, only the activation step is skipped.
+
 Deprecated aliases:
 
 - `surrogate cull ...` -> `surrogate prune-sessions ...`

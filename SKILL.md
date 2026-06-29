@@ -23,7 +23,7 @@ Current built-in guardrails:
 - `surrogate type`, `surrogate send`, and `surrogate submit` reject self-targeting and tell you the current alias/session
 - `surrogate prune-sessions` rejects the current live session and any attached session with clients still present
 - `surrogate send` rejects `C-c`, `C-d`, and `C-z`
-- `surrogate send` rejects prose (arguments with spaces or >40 chars) — use `surrogate type` for messages, which adds the `[SURROGATE]` label deterministically
+- `surrogate send` rejects prose (arguments with spaces or >40 chars) — use `surrogate type` for messages, which bookends prose with `[SURROGATE ...]` and `[/SURROGATE]` deterministically for agent-like targets
 - there is no global guard-disable mode
 - there is no persistent unsafe mode
 
@@ -179,7 +179,7 @@ surrogate type <session> "some text"
 
 `type` auto-normalizes long prose by flattening embedded newlines to spaces and then submitting once. This is meant for conversational prompts, not scripts. A successful `type` should correspond to an actual submitted prompt, not staged input.
 
-Default `type` is shell-safe. Surrogate adds the prose prefix only for agent-like targets; shell and unknown targets stay unprefixed so commands still execute normally. It then warns if a non-agent target immediately reports `command not found` or a syntax error.
+Default `type` is shell-safe. Surrogate bookends prose with `[SURROGATE ...]` at the front and `[/SURROGATE]` at the end only for agent-like targets; shell and unknown targets stay unbookended so commands still execute normally. It then warns if a non-agent target immediately reports `command not found` or a syntax error.
 
 For long conversational prompts into agent TUIs, use message mode:
 
@@ -190,6 +190,8 @@ surrogate type --message <session> "Please review the patch plan above."
 `--message` is safer than plain `type` for prose because it requires an `agent` ui_hint and refuses `shell` or `unknown` targets.
 
 If the target TUI needs a slightly different cadence, `type` uses an adaptive submit pause by default (`0.1s + 0.001s/char`, capped at `2.0s`). You can override it with `SURROGATE_TYPE_ENTER_DELAY_SECS`, which accepts only `adaptive` or a numeric seconds value.
+
+For agent-like targets, `type` also sends bounded extra Enter presses with exponential backoff after the first Enter. An Enter-received probe runs alongside the cascade and early-exits it once the target's bottom rows visibly change (input cleared, prompt scrolled, spinner appeared), so agents on fast hosts don't pay for unused retries. The probe is TUI-agnostic — it compares pane snapshots, not strings. Toggle with `SURROGATE_TYPE_ENTER_PROBE=off` if a target's bottom rows mutate independently (e.g., a clock in the status bar). Either way, agents should keep using the same `surrogate type --message <session> "..."` desire path rather than learning a new submit sequence.
 
 If text is visibly staged and only the missing Enter is needed, use:
 
@@ -203,7 +205,7 @@ surrogate submit my-session
 surrogate send <session> <keys...>
 ```
 
-Use `send` only for tmux key names like `Enter`, `Escape`, arrows, and short text literals. Never use `send` for messages — it rejects prose (spaces or >40 chars) and has no `[SURROGATE]` label. Use `surrogate type` for all messages. `C-c`, `C-d`, and `C-z` are intentionally blocked.
+Use `send` only for tmux key names like `Enter`, `Escape`, arrows, and short text literals. Never use `send` for messages — it rejects prose (spaces or >40 chars) and has no `[SURROGATE ...]`/`[/SURROGATE]` bookends. Use `surrogate type` for all messages. `C-c`, `C-d`, and `C-z` are intentionally blocked.
 
 ### Read recent output
 
@@ -352,6 +354,12 @@ In both modes the snippet:
 - Won't double-wrap (checks parent process name via `$PPID`, not env vars)
 - Keeps plain `zmx attach ...` working by clearing leaked `ZMX_SESSION` only for nested attaches
 - Supports bash, zsh, and fish
+
+## Local Install Sync
+
+`bash install.sh` installs `surrogate`, `surrogate-brief`, `surrogate-shell-setup`, and `surrogate-doctor` into `~/.local/bin`. For this repo checkout it also wires the configured Git post-commit hook to dispatch `.githooks/post-commit`.
+
+After successful commits on `main`, that hook refreshes the local installed binaries from committed `HEAD`, so `surrogate` on `PATH` stays aligned with committed `main`. `surrogate-doctor` checks both binary sync and hook sync.
 
 ## Dependencies
 

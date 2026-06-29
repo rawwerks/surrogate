@@ -50,6 +50,8 @@ surrogate-doctor
 
 This installs `surrogate`, `surrogate-brief`, `surrogate-shell-setup`, and `surrogate-doctor` to `~/.local/bin/`. `surrogate-brief` is optional and only used for OpenRouter-backed remote summaries; core `surrogate` session control does not require any API key. It also tries to install [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) by default as a recommended safety guard. If dcg install fails, surrogate still installs and works.
 
+For checkouts of this repo, `install.sh` also wires a repo-local post-commit hook through Git's configured hooks path. After any successful commit on `main`, that hook refreshes the local installed binaries from the committed `HEAD` automatically, so `surrogate` on `PATH` does not drift behind committed `main`.
+
 If you want zmx only for selected agent CLIs instead of every shell, start from `surrogate-shell.conf.example` and install shell integration in `commands` mode.
 
 For contributors working from a checkout, use dev-link mode so the installed CLI never drifts from the repo:
@@ -66,7 +68,7 @@ When publishing to `main`, use the helper below instead of `safe-push` directly:
 bash bin/surrogate-push-main
 ```
 
-It safe-pushes `main`, converts any repo dev-links back to real copied binaries, reinstalls, and runs `surrogate-doctor`.
+It safe-pushes `main`, converts any repo dev-links back to real copied binaries, reinstalls, and runs `surrogate-doctor`. Local commits on `main` also trigger the post-commit refresh hook installed by `install.sh`.
 
 ### Agent skill (for Claude Code)
 
@@ -396,8 +398,8 @@ surrogate type <session> "echo hello world"
 
 Default `type` is now shell-safe:
 
-- surrogate adds the `[SURROGATE ...]` prose prefix only for agent-like targets
-- shell and unknown targets stay unprefixed so literal shell commands still execute normally
+- surrogate bookends the message with `[SURROGATE ...]` at the front and `[/SURROGATE]` at the end only for agent-like targets, so receiving agents can detect both boundaries
+- shell and unknown targets stay unbookended so literal shell commands still execute normally
 - after submission, surrogate checks fresh shell output and warns on immediate failures like `command not found` or syntax errors
 - the warning points you to `surrogate read <session> -n 40`
 
@@ -417,6 +419,10 @@ SURROGATE_TYPE_ENTER_DELAY_SECS=0.02 surrogate type my-session "hello"
 ```
 
 `SURROGATE_TYPE_ENTER_DELAY_SECS` accepts only `adaptive` or a numeric seconds value.
+
+For agent-like targets, `type` sends bounded extra Enter presses with exponential backoff after the first Enter. This covers TUIs that visibly receive long or wrapped text but occasionally miss the first submit key while they are busy. The defaults send 5 extra Enter attempts at delays of 0.2s, 0.4s, 0.8s, 1.0s, and 1.0s.
+
+An Enter-received probe runs alongside the blind cascade as an early-exit optimization. After the first Enter, surrogate snapshots the bottom rows of the target pane via `tmux capture-pane` (the `[/SURROGATE]` closing bookend lives there while the prompt is staged); after each subsequent Enter, surrogate compares the bottom rows to the pre-Enter snapshot. If they changed at all — input cleared, prompt scrolled into the transcript, spinner spun up — surrogate stops sending extra Enters. If they are byte-identical, the next blind Enter fires as before. This is TUI-agnostic because we control the marker; no per-tool string matching is involved. Toggle with `SURROGATE_TYPE_ENTER_PROBE=off` (default `on`), or widen/narrow the snapshot window with `SURROGATE_TYPE_ENTER_PROBE_ROWS` (default `12`). Set `SURROGATE_TYPE_ENTER_RETRY_COUNT=0` to disable it, or tune `SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS` and `SURROGATE_TYPE_ENTER_RETRY_MAX_DELAY_SECS` if a target needs a different cadence.
 
 If a prompt is visibly staged and just needs the missing Enter, the obvious repair path is:
 

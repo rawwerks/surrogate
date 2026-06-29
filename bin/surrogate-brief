@@ -110,7 +110,7 @@ build_session_maps() {
         [[ -n "${alias:-}" && -n "${session:-}" ]] || continue
         SESSION_FROM_ALIAS["$alias"]="$session"
         ALIAS_FROM_SESSION["$session"]="$alias"
-    done < <(surrogate list)
+    done < <(surrogate list --bare)
 }
 
 resolve_session() {

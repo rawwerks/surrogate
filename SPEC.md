@@ -135,9 +135,15 @@ The `send` command must accept a session name and one or more tmux send-keys arg
 
 The `type` command must accept a session name and a text string. It must type the literal text followed by Enter. A successful `type` must correspond to an actual submission, not a staged-but-unentered prompt. The delivery path must remain deterministic and include any submit pause needed to make Enter land reliably in agent TUIs. The submit pause must be configurable with a sensible default. The default may be an adaptive delay derived only from text length, and callers may override it with a fixed numeric seconds value. If transport fails after the text may already be staged, the error must point to a single obvious recovery command. It must create a bridge lazily, update the watermark, and serialize via flock. If the resolved target is the current live session, it must reject the action and report the current alias/session identity.
 
+For agent-like targets, `type` must support a deterministic extra Enter cadence after the first Enter so TUIs that visibly receive long or wrapped text but occasionally miss the first submit key do not leave text staged in the editor. The retry count, initial delay, and max delay must be configurable and validated before use. Defaults must use bounded exponential backoff with 3-5 extra Enter attempts. Shell targets must not receive extra Enter retries by default.
+
+The cascade must also support a deterministic early-exit probe that lets surrogate stop hammering Enter once the target has visibly accepted input. The probe must work the same way for every agent TUI — it must not match against any tool-specific vocabulary. The probe snapshots the bottom rows of the target pane after the paste completes but before the first Enter, and re-snapshots after each subsequent Enter; if the snapshots differ at all, an earlier Enter took effect and the cascade must break. If they are byte-identical, the prompt is still staged and the next Enter must be sent. The probe must only run when surrogate already injected the `[SURROGATE ...]` / `[/SURROGATE]` bookends, since those bookends are what make the bottom-rows snapshot uniquely surrogate-controlled. The probe must be disable-able via a validated `on`/`off` env var, and the bottom-row count must be configurable and validated. When the probe is off, inconclusive, or its `capture-pane` snapshot fails, the cascade must fall through to the existing blind retry behavior — the probe must never produce worse coverage than the blind cascade alone.
+
+When the prose prefix is added, surrogate must also bookend the message with a closing `[/SURROGATE]` tag at the end. The opener and closer must be coupled: a message that has no opener must have no closer. This lets receiving agents detect the exact boundaries of surrogate-injected prose, not just its start.
+
 Default `type` must remain safe for shell targets:
 
-- if the target looks like a shell, surrogate must suppress the prose prefix so literal commands still execute correctly
+- if the target looks like a shell, surrogate must suppress the prose prefix so literal commands still execute correctly (and therefore must not append the closing `[/SURROGATE]` tag either)
 - after submission, surrogate must check fresh shell output for obvious immediate failures such as `command not found` or syntax errors
 - this post-check is warning-only and must point to `surrogate read <session> -n 40` for inspection
 
@@ -293,6 +299,14 @@ The `--recent` flag on `who` must accept either a non-negative integer count or 
 ## Error Handling
 
 All errors must go to stderr with the prefix `surrogate: error:`. Missing sessions must produce `session '<name>' not found`. Missing dependencies must produce `zmx not found` or `tmux not found`. All error paths must exit 1.
+
+---
+
+## Installation Sync
+
+`install.sh` must install the command binaries and must also ensure Git's configured post-commit hook dispatches to a repo-local `.githooks/post-commit` hook when this checkout is committed. The dispatcher must preserve any existing configured post-commit behavior and must run before a final `exit 0` in that hook.
+
+The repo-local post-commit hook must be non-blocking and must refresh the local installed binaries from committed `HEAD` after successful commits on `main`. Commits on other branches must not refresh the installed binaries. This keeps the normal `surrogate` command on `PATH` aligned with committed `main` without requiring agents to remember an extra reinstall step, and it must not install unrelated unstaged working-tree edits after a partial commit.
 
 ---
 

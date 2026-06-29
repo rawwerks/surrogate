@@ -9,6 +9,11 @@ ALIAS_FILE="${SURROGATE_TMP}/surrogate-aliases"
 AUDIT_FILE="${SURROGATE_AUDIT_FILE:-${SURROGATE_TMP}/surrogate-audit.jsonl}"
 SURROGATE_LABEL="${SURROGATE_LABEL:-on}"  # on | off | verbose
 SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-adaptive}"
+SURROGATE_TYPE_ENTER_RETRY_COUNT="${SURROGATE_TYPE_ENTER_RETRY_COUNT:-5}"
+SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS="${SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS:-0.2}"
+SURROGATE_TYPE_ENTER_RETRY_MAX_DELAY_SECS="${SURROGATE_TYPE_ENTER_RETRY_MAX_DELAY_SECS:-1.0}"
+SURROGATE_TYPE_ENTER_PROBE="${SURROGATE_TYPE_ENTER_PROBE:-on}"     # on | off
+SURROGATE_TYPE_ENTER_PROBE_ROWS="${SURROGATE_TYPE_ENTER_PROBE_ROWS:-12}"
 SURROGATE_TYPE_POSTCHECK_SECS="${SURROGATE_TYPE_POSTCHECK_SECS:-0.15}"
 SURROGATE_HINT_SCAN_LINES="${SURROGATE_HINT_SCAN_LINES:-200}"
 
@@ -39,6 +44,22 @@ require_seconds() {
 require_enter_delay_setting() {
     [[ "$1" == "adaptive" ]] && return 0
     require_seconds "$1"
+}
+
+require_enter_retry_count() {
+    require_int "$1"
+    [[ "$1" -le 10 ]] || die "'$1' is too many Enter retries (max 10)"
+}
+
+require_enter_probe_setting() {
+    [[ "$1" == "on" || "$1" == "off" ]] \
+        || die "'$1' is not a valid SURROGATE_TYPE_ENTER_PROBE setting (use 'on' or 'off')"
+}
+
+require_enter_probe_rows() {
+    require_int "$1"
+    [[ "$1" -ge 1 ]] || die "SURROGATE_TYPE_ENTER_PROBE_ROWS must be >= 1"
+    [[ "$1" -le 200 ]] || die "SURROGATE_TYPE_ENTER_PROBE_ROWS must be <= 200"
 }
 
 require_hours() {
@@ -93,6 +114,19 @@ compute_enter_delay() {
     # Medium text (500 chars):  ~0.6s
     # Long text (1000+ chars):  ~1.1-2.0s
     LC_ALL=C awk "BEGIN { d = 0.1 + $text_len * 0.001; if (d > 2.0) d = 2.0; printf \"%.2f\", d }"
+}
+
+compute_enter_retry_delay() {
+    local retry_index="$1"
+    LC_ALL=C awk -v base="$SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS" \
+        -v max="$SURROGATE_TYPE_ENTER_RETRY_MAX_DELAY_SECS" \
+        -v retry_index="$retry_index" \
+        'BEGIN {
+            d = base
+            for (i = 0; i < retry_index; i++) d *= 2
+            if (d > max) d = max
+            printf "%.2f", d
+        }'
 }
 
 check_deps() {
@@ -1027,6 +1061,20 @@ Environment:
                           Pause before Enter in `type` (default: adaptive).
                           "adaptive" scales with text length (0.1s base + 0.001s/char, max 2s).
                           Set to a number (e.g. 0.5) for a fixed delay.
+  SURROGATE_TYPE_ENTER_RETRY_COUNT
+                          Extra Enter presses for agent targets after the first Enter (default: 5, max: 10).
+  SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS
+                          Initial pause before extra agent-target Enter retries (default: 0.2).
+  SURROGATE_TYPE_ENTER_RETRY_MAX_DELAY_SECS
+                          Maximum pause between extra agent-target Enter retries (default: 1.0).
+  SURROGATE_TYPE_ENTER_PROBE
+                          Enter-received probe — early-exit the retry cascade once the
+                          target's bottom rows show that an earlier Enter took effect
+                          (on | off, default: on). The blind cascade stays as the
+                          safety net when the probe is inconclusive.
+  SURROGATE_TYPE_ENTER_PROBE_ROWS
+                          How many bottom rows of the target pane the probe compares
+                          before vs after each Enter (default: 12, min: 1, max: 200).
   SURROGATE_TYPE_POSTCHECK_SECS
                           Fixed pause before shell failure warning check (default: 0.15)
 
@@ -2025,6 +2073,11 @@ cmd_type() {
     text="$(normalize_type_text "$original_text")"
     [[ -n "$text" ]] || die "type text must not be empty"
     require_enter_delay_setting "$SURROGATE_TYPE_ENTER_DELAY_SECS"
+    require_enter_retry_count "$SURROGATE_TYPE_ENTER_RETRY_COUNT"
+    require_seconds "$SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS"
+    require_seconds "$SURROGATE_TYPE_ENTER_RETRY_MAX_DELAY_SECS"
+    require_enter_probe_setting "$SURROGATE_TYPE_ENTER_PROBE"
+    require_enter_probe_rows "$SURROGATE_TYPE_ENTER_PROBE_ROWS"
     require_seconds "$SURROGATE_TYPE_POSTCHECK_SECS"
 
     local history ui_hint
@@ -2049,14 +2102,15 @@ cmd_type() {
     local start_lines=0
     start_lines="$(line_count "$session")"
 
-    # Prepend surrogate label for agent-like contexts and explicit message sends.
+    # Bookend with surrogate label for agent-like contexts and explicit message sends.
+    # The closing [/SURROGATE] tag couples to the prefix — no closer without an opener.
     local prefix
     prefix=""
     if [[ "$message_mode" -eq 1 || "$ui_hint" == "agent" ]]; then
         prefix="$(_surrogate_prefix)"
     fi
     if [[ -n "$prefix" ]]; then
-        text="${prefix}${text}"
+        text="${prefix}${text} [/SURROGATE]"
     fi
 
     ensure_bridge "$session"
@@ -2070,11 +2124,49 @@ cmd_type() {
     local enter_delay
     enter_delay="$(compute_enter_delay "${#text}")"
 
+    # The Enter-received probe is an early-exit optimization for the blind retry
+    # cascade. It works because surrogate just pasted a bookended payload that
+    # ends with the unique literal '[/SURROGATE]' (see _surrogate_prefix). Before
+    # pressing Enter we snapshot the bottom rows of the pane — those rows are
+    # guaranteed to contain '[/SURROGATE]' (the input box is staged). After each
+    # Enter we re-snapshot. If the bottom rows are byte-identical to the
+    # pre-Enter snapshot, the TUI did not move: prompt is still staged. If the
+    # bottom rows changed at all (input cleared, prompt scrolled into transcript,
+    # spinner spun up, anything), the TUI accepted input — break the cascade.
+    # The blind cascade stays as the safety net for inconclusive cases. The
+    # probe never sends extra keys; it only decides whether to stop early.
+    local probe_active=0
+    if [[ "$ui_hint" == "agent" && -n "$prefix" && "$SURROGATE_TYPE_ENTER_PROBE" == "on" ]]; then
+        probe_active=1
+    fi
+
     if ! (
         flock 9
-        tmux send-keys -t "$bridge" -l "$text"
-        sleep "$enter_delay"
-        tmux send-keys -t "$bridge" Enter
+        tmux send-keys -t "$bridge" -l "$text" || exit $?
+        sleep "$enter_delay" || exit $?
+        local probe_pre=""
+        if [[ "$probe_active" -eq 1 ]]; then
+            probe_pre="$(tmux capture-pane -p -t "$bridge" 2>/dev/null \
+                | tail -n "$SURROGATE_TYPE_ENTER_PROBE_ROWS" || true)"
+        fi
+        tmux send-keys -t "$bridge" Enter || exit $?
+        if [[ "$ui_hint" == "agent" && "$SURROGATE_TYPE_ENTER_RETRY_COUNT" -gt 0 ]]; then
+            local retry_i retry_delay probe_post
+            for ((retry_i = 0; retry_i < SURROGATE_TYPE_ENTER_RETRY_COUNT; retry_i++)); do
+                retry_delay="$(compute_enter_retry_delay "$retry_i")"
+                sleep "$retry_delay" || exit $?
+                if [[ "$probe_active" -eq 1 && -n "$probe_pre" ]]; then
+                    probe_post="$(tmux capture-pane -p -t "$bridge" 2>/dev/null \
+                        | tail -n "$SURROGATE_TYPE_ENTER_PROBE_ROWS" || true)"
+                    # Bottom rows changed since pre-Enter snapshot: an earlier
+                    # Enter took effect, stop hammering Enter.
+                    if [[ -n "$probe_post" && "$probe_post" != "$probe_pre" ]]; then
+                        break
+                    fi
+                fi
+                tmux send-keys -t "$bridge" Enter || exit $?
+            done
+        fi
     ) 9>"$lock"; then
         die "type delivery failed; if the text is already staged, run: surrogate submit $requested_session"
     fi

@@ -9,7 +9,7 @@
 # Features:
 #   - Per-test timeout (default 30s, override with TEST_TIMEOUT=N)
 #   - Per-test timing (shows elapsed seconds)
-#   - Concurrent-run safe (all resources scoped to PID)
+#   - Concurrent-run safe (suite-level flock serializes shared zmx/tmux fixtures)
 #   - Interrupted-run safe (reaps stale test artifacts from dead harness PIDs)
 #   - Fails gracefully on timeout without blocking the suite
 #
@@ -23,6 +23,7 @@ TEST_TIMEOUT="${TEST_TIMEOUT:-30}"  # per-test timeout in seconds
 TEST_PROFILE="${SURROGATE_TEST_PROFILE:-smoke}"
 TEST_SECTIONS="${SURROGATE_TEST_SECTIONS:-}"
 TEST_POLL_INTERVAL_SECS="${TEST_POLL_INTERVAL_SECS:-0.2}"
+TEST_LOCK_FILE="${SURROGATE_TEST_LOCK_FILE:-/tmp/surrogate-e2e.lock}"
 RESULTS_DIR="$(mktemp -d)"
 RESULTS_FILE="$RESULTS_DIR/results"
 TIMING_FILE="$RESULTS_DIR/timing"
@@ -486,6 +487,15 @@ if ! command -v zmx &>/dev/null; then
   echo "FATAL: zmx not found in PATH"
   exit 1
 fi
+
+if ! command -v flock &>/dev/null; then
+  echo "FATAL: flock not found in PATH"
+  exit 1
+fi
+
+exec 8>"$TEST_LOCK_FILE"
+echo "suite lock: $TEST_LOCK_FILE"
+flock 8
 
 cleanup_test_artifacts stale
 
@@ -2314,7 +2324,7 @@ test_invariant_installed_matches_repo() {
   repo_dir="$(dirname "$SCRIPT_DIR")/bin"
   local all_match=true
 
-  for file in surrogate surrogate-brief surrogate-shell-setup; do
+  for file in surrogate surrogate-brief surrogate-shell-setup surrogate-doctor; do
     if [[ ! -f "$install_dir/$file" ]]; then
       echo "    $file not installed at $install_dir/$file"
       all_match=false
@@ -2397,6 +2407,125 @@ test_release_helper_reinstalls_real_binaries() {
   pass "${FUNCNAME[0]} — release helper safe-pushes, reinstalls, and verifies"
 }
 
+test_install_registers_repo_post_commit_dispatcher() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmp_home tmp_install tmp_hooks hook output block_line exit_line
+  tmp_home="$(mktemp -d)"
+  tmp_install="$(mktemp -d)"
+  tmp_hooks="$(mktemp -d)"
+  hook="$tmp_hooks/post-commit"
+
+  mkdir -p "$tmp_home"
+  printf '[core]\n\thooksPath = %s\n' "$tmp_hooks" > "$tmp_home/gitconfig"
+  cat > "$hook" <<'EOF'
+#!/usr/bin/env sh
+echo existing post-commit hook >&2
+exit 0
+EOF
+  chmod +x "$hook"
+
+  output=$(
+    HOME="$tmp_home" \
+    GIT_CONFIG_GLOBAL="$tmp_home/gitconfig" \
+    GIT_CONFIG_NOSYSTEM=1 \
+    INSTALL_DIR="$tmp_install" \
+    SURROGATE_SKIP_DCG=1 \
+    bash "$SCRIPT_DIR/../install.sh" 2>&1
+  )
+
+  block_line="$(grep -n -- 'BEGIN SURROGATE REPO-LOCAL POST-COMMIT' "$hook" | head -n1 | cut -d: -f1 || true)"
+  exit_line="$(grep -n '^exit 0$' "$hook" | tail -n1 | cut -d: -f1 || true)"
+
+  if [[ -n "$block_line" && -n "$exit_line" && "$block_line" -lt "$exit_line" ]] &&
+     grep -Fq 'existing post-commit hook' "$hook" &&
+     [[ -x "$hook" ]] &&
+     echo "$output" | grep -Fq 'git post-commit'; then
+    rm -rf "$tmp_home" "$tmp_install" "$tmp_hooks"
+    pass "${FUNCNAME[0]} — install wires repo-local post-commit before existing final exit"
+  else
+    echo "    install output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    hook contents:"
+    sed 's/^/    /' "$hook" 2>/dev/null || true
+    rm -rf "$tmp_home" "$tmp_install" "$tmp_hooks"
+    fail "${FUNCNAME[0]} — install did not wire the post-commit dispatcher correctly"
+  fi
+}
+
+test_post_commit_hook_syncs_local_binaries_on_main() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local hook branch tmp_install output all_match file expected
+  hook="$SCRIPT_DIR/../.githooks/post-commit"
+  branch="$(git -C "$SCRIPT_DIR/.." symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+
+  if [[ ! -x "$hook" ]]; then
+    fail "${FUNCNAME[0]} — repo-local post-commit hook missing or not executable"
+    return
+  fi
+
+  if [[ "$branch" != "main" ]]; then
+    pass "${FUNCNAME[0]} — skipped binary sync assertion on non-main branch '$branch'"
+    return
+  fi
+
+  tmp_install="$(mktemp -d)"
+  output=$(INSTALL_DIR="$tmp_install" "$hook" 2>&1)
+
+  all_match=true
+  for file in surrogate surrogate-brief surrogate-shell-setup surrogate-doctor; do
+    expected="$(mktemp)"
+    git -C "$SCRIPT_DIR/.." show "HEAD:bin/$file" > "$expected"
+    if ! diff -q "$expected" "$tmp_install/$file" >/dev/null 2>&1; then
+      all_match=false
+    fi
+    rm -f "$expected"
+  done
+
+  if $all_match && echo "$output" | grep -Fq 'refreshed local binaries'; then
+    rm -rf "$tmp_install"
+    pass "${FUNCNAME[0]} — main post-commit hook refreshes installed binaries"
+  else
+    echo "    hook output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    install dir:"
+    find "$tmp_install" -maxdepth 1 -type f -print 2>/dev/null | sed 's/^/    /'
+    rm -rf "$tmp_install"
+    fail "${FUNCNAME[0]} — main post-commit hook did not refresh installed binaries"
+  fi
+}
+
+test_doctor_uses_current_checkout_for_repo_sync() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local doctor="$SCRIPT_DIR/../bin/surrogate-doctor"
+
+  if grep -Fq 'find_repo_dir()' "$doctor" &&
+     grep -Fq 'git -C "$candidate" rev-parse --show-toplevel' "$doctor" &&
+     grep -Fq 'not running from a surrogate checkout; repo sync check skipped' "$doctor"; then
+    pass "${FUNCNAME[0]} — doctor resolves the current checkout instead of assuming installed bin parent"
+  else
+    fail "${FUNCNAME[0]} — doctor must locate the active checkout before repo/hook sync checks"
+  fi
+}
+
+test_e2e_harness_serializes_suite_runs() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  if grep -Fq 'TEST_LOCK_FILE="${SURROGATE_TEST_LOCK_FILE:-/tmp/surrogate-e2e.lock}"' "$SCRIPT_DIR/../tests/test_surrogate_e2e.sh" &&
+     grep -Fq 'flock 8' "$SCRIPT_DIR/../tests/test_surrogate_e2e.sh" &&
+     grep -Fq 'Concurrent-run safe (suite-level flock serializes shared zmx/tmux fixtures)' "$SCRIPT_DIR/../tests/test_surrogate_e2e.sh"; then
+    pass "${FUNCNAME[0]} — e2e harness serializes shared real-session fixtures"
+  else
+    fail "${FUNCNAME[0]} — e2e harness must serialize shared zmx/tmux fixture runs"
+  fi
+}
+
 test_surrogate_brief_show_config_defaults() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -2464,6 +2593,61 @@ test_surrogate_brief_missing_key_help() {
     echo "    output:"
     echo "$output" | sed 's/^/    /'
     fail "${FUNCNAME[0]} — brief missing-key guidance incomplete"
+  fi
+}
+
+test_surrogate_brief_resolves_bare_session_map() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmpbin output
+  tmpbin="$(mktemp -d)"
+
+  cat > "$tmpbin/surrogate" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "list" && "${2:-}" == "--bare" ]]; then
+  printf 'sample-alias sample-session\n'
+  exit 0
+fi
+if [[ "$1" == "list" ]]; then
+  printf 'sample-alias        sample-session     sample-project agent    /tmp/sample\n'
+  exit 0
+fi
+echo "unexpected surrogate args: $*" >&2
+exit 9
+EOF
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "history" && "$2" == "sample-session" ]]; then
+  printf 'sample visible history\n'
+  exit 0
+fi
+echo "bad zmx args: $*" >&2
+exit 7
+EOF
+
+  cat > "$tmpbin/curl" <<'EOF'
+#!/usr/bin/env bash
+cat <<'JSON'
+{"choices":[{"message":{"content":"SESSION:\nALIAS:\nATTENTION REQUIRED: NO\nPRIORITY: P3\nSIGNAL QUALITY: HIGH\nWHY NOW: test"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}
+JSON
+EOF
+
+  chmod +x "$tmpbin/surrogate" "$tmpbin/zmx" "$tmpbin/curl"
+
+  output=$(PATH="$tmpbin:/usr/bin:/bin" OPENROUTER_API_KEY=fake "$SURROGATE_BRIEF" --no-config -n 5 sample-session sample-alias 2>&1)
+  rm -rf "$tmpbin"
+
+  if echo "$output" | grep -q '=== sample-alias (sample-session) ===' &&
+     [[ "$(echo "$output" | grep -c '=== sample-alias (sample-session) ===')" -eq 2 ]] &&
+     ! echo "$output" | grep -q 'session .* not found' &&
+     ! echo "$output" | grep -q 'bad zmx args'; then
+    pass "${FUNCNAME[0]} — brief resolves exact sessions and aliases through bare maps"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — brief polluted session map from human list output"
   fi
 }
 
@@ -2858,6 +3042,21 @@ case "\${1:-}" in
     ;;
   send-keys)
     printf '%s\n' "\$*" >> "$MOCK_TYPE_TMUX_LOG"
+    exit 0
+    ;;
+  capture-pane)
+    # Drives the Enter-received probe. Each call increments a counter and
+    # emits the contents of \$MOCK_TYPE_TMPBIN/capture-<N>.txt if present.
+    # Tests pre-populate that directory to script the probe's view of the
+    # target pane. When no file exists for the current call, output is empty
+    # (the probe treats empty output as inconclusive and falls through).
+    counter_file="$MOCK_TYPE_TMPBIN/.capture-counter"
+    count=\$(( \$(cat "\$counter_file" 2>/dev/null || printf 0) + 1 ))
+    printf '%s' "\$count" > "\$counter_file"
+    candidate="$MOCK_TYPE_TMPBIN/capture-\$count.txt"
+    if [[ -f "\$candidate" ]]; then
+      cat "\$candidate"
+    fi
     exit 0
     ;;
   *)
@@ -3531,14 +3730,14 @@ test_label_on() {
   SURROGATE_LABEL=on PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" "$SURROGATE" type "$MOCK_TYPE_SESSION" "LABEL_ON_$$"
 
   if grep -Fq 'send-keys -t _surr_mock-type-' "$MOCK_TYPE_TMUX_LOG" &&
-     grep -Eq '\-l \[SURROGATE.*\] LABEL_ON_' "$MOCK_TYPE_TMUX_LOG"; then
+     grep -Eq '\-l \[SURROGATE.*\] LABEL_ON_.* \[/SURROGATE\]$' "$MOCK_TYPE_TMUX_LOG"; then
     cleanup_mock_type_env
-    pass "${FUNCNAME[0]} — label is preserved for agent-like targets"
+    pass "${FUNCNAME[0]} — label is bookended for agent-like targets"
   else
     echo "    tmux log:"
     sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
     cleanup_mock_type_env
-    fail "${FUNCNAME[0]} — label not found for agent-like target"
+    fail "${FUNCNAME[0]} — bookended label not found for agent-like target"
   fi
 }
 
@@ -3572,14 +3771,199 @@ test_label_verbose() {
 
   SURROGATE_LABEL=verbose PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" "$SURROGATE" type "$MOCK_TYPE_SESSION" "LABEL_VERBOSE_$$"
 
-  if grep -Eq '\-l \[SURROGATE.*PID:.*\] LABEL_VERBOSE_' "$MOCK_TYPE_TMUX_LOG"; then
+  if grep -Eq '\-l \[SURROGATE.*PID:.*\] LABEL_VERBOSE_.* \[/SURROGATE\]$' "$MOCK_TYPE_TMUX_LOG"; then
     cleanup_mock_type_env
-    pass "${FUNCNAME[0]} — verbose label is preserved for agent-like targets"
+    pass "${FUNCNAME[0]} — verbose label is bookended for agent-like targets"
   else
     echo "    tmux log:"
     sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
     cleanup_mock_type_env
-    fail "${FUNCNAME[0]} — verbose label not found"
+    fail "${FUNCNAME[0]} — bookended verbose label not found"
+  fi
+}
+
+test_label_bookend_closing_tag() {
+  # Regression: type messages into agent-like targets must be bookended with
+  # both an opening [SURROGATE ...] and a closing [/SURROGATE] tag so receiving
+  # agents can detect the exact boundaries of surrogate-injected prose.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
+
+  local marker="BOOKEND_$$"
+  SURROGATE_LABEL=on PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" "$SURROGATE" type "$MOCK_TYPE_SESSION" "$marker hello"
+
+  # The text payload sent via `tmux send-keys -l` must contain both bookends
+  # in order: opener at the start, marker in the middle, closer at the end.
+  if grep -Fq " -l [SURROGATE" "$MOCK_TYPE_TMUX_LOG" &&
+     grep -Eq "\-l \[SURROGATE[^]]*\] $marker hello \[/SURROGATE\]$" "$MOCK_TYPE_TMUX_LOG"; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — type messages are bookended with [SURROGATE ...] and [/SURROGATE]"
+  else
+    echo "    tmux log:"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — missing or malformed [/SURROGATE] closing bookend"
+  fi
+}
+
+test_probe_early_exits_when_bottom_rows_change() {
+  # The Enter-received probe captures the bottom rows of the target pane
+  # before the first Enter, then re-captures after each subsequent Enter.
+  # When the bottom rows change at all, an earlier Enter took effect and
+  # the blind retry cascade must break early. Here capture-1 differs from
+  # capture-2 → the probe must early-exit after the first Enter.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
+  # Pre-Enter: prompt is staged in the input box (marker visible)
+  printf '> [SURROGATE alias] hello probe [/SURROGATE]\n' > "$MOCK_TYPE_TMPBIN/capture-1.txt"
+  # Post-Enter: input box cleared, prompt scrolled into transcript
+  printf '[SURROGATE alias] hello probe [/SURROGATE]\n>\n' > "$MOCK_TYPE_TMPBIN/capture-2.txt"
+
+  PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" \
+    SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS=0 \
+    "$SURROGATE" type "$MOCK_TYPE_SESSION" "hello probe"
+
+  local n_send_keys n_enters
+  n_send_keys=$(grep -Fc 'send-keys -t _surr_mock-type-' "$MOCK_TYPE_TMUX_LOG")
+  n_enters=$(grep -Fc ' Enter' "$MOCK_TYPE_TMUX_LOG")
+  if [[ "$n_send_keys" -eq 2 && "$n_enters" -eq 1 ]]; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — probe early-exits cascade when bottom rows change"
+  else
+    echo "    n_send_keys=$n_send_keys n_enters=$n_enters expected 2/1"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — probe did not early-exit on pane change"
+  fi
+}
+
+test_probe_falls_through_when_bottom_rows_unchanged() {
+  # When the bottom rows are byte-identical pre- and post-Enter, the probe
+  # is inconclusive and the blind cascade must run to completion. This is
+  # the safety net: the probe never makes coverage worse than the blind
+  # retry alone.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
+  # All captures return the same staged-input content → probe is inconclusive
+  local i
+  for ((i=1; i<=10; i++)); do
+    printf '> [SURROGATE alias] stuck probe [/SURROGATE]\n' > "$MOCK_TYPE_TMPBIN/capture-$i.txt"
+  done
+
+  PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" \
+    SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS=0 \
+    "$SURROGATE" type "$MOCK_TYPE_SESSION" "stuck probe"
+
+  local n_send_keys n_enters
+  n_send_keys=$(grep -Fc 'send-keys -t _surr_mock-type-' "$MOCK_TYPE_TMUX_LOG")
+  n_enters=$(grep -Fc ' Enter' "$MOCK_TYPE_TMUX_LOG")
+  if [[ "$n_send_keys" -eq 7 && "$n_enters" -eq 6 ]]; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — probe falls through to full blind cascade when pane unchanged"
+  else
+    echo "    n_send_keys=$n_send_keys n_enters=$n_enters expected 7/6"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — probe should have fallen through to full cascade"
+  fi
+}
+
+test_probe_off_preserves_blind_cascade() {
+  # SURROGATE_TYPE_ENTER_PROBE=off disables the early-exit entirely.
+  # Even when bottom rows change between captures (which would normally
+  # trigger early-exit), the blind cascade must still fire all retries.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
+  printf 'pre snapshot\n' > "$MOCK_TYPE_TMPBIN/capture-1.txt"
+  local i
+  for ((i=2; i<=10; i++)); do
+    printf 'post snapshot %s\n' "$i" > "$MOCK_TYPE_TMPBIN/capture-$i.txt"
+  done
+
+  PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" \
+    SURROGATE_TYPE_ENTER_PROBE=off \
+    SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS=0 \
+    "$SURROGATE" type "$MOCK_TYPE_SESSION" "probe off"
+
+  local n_enters
+  n_enters=$(grep -Fc ' Enter' "$MOCK_TYPE_TMUX_LOG")
+  if [[ "$n_enters" -eq 6 ]]; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — SURROGATE_TYPE_ENTER_PROBE=off preserves full blind cascade"
+  else
+    echo "    n_enters=$n_enters expected 6"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — probe-off should fire all 6 Enters"
+  fi
+}
+
+test_probe_rejects_invalid_config() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_type_env
+  printf '› waiting\n' > "$MOCK_TYPE_HISTORY_FILE"
+
+  local bogus_probe rows_zero rows_huge rows_nonint
+  bogus_probe=$(PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" SURROGATE_TYPE_ENTER_PROBE=maybe \
+    "$SURROGATE" type "$MOCK_TYPE_SESSION" "nope" 2>&1 || true)
+  rows_zero=$(PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" SURROGATE_TYPE_ENTER_PROBE_ROWS=0 \
+    "$SURROGATE" type "$MOCK_TYPE_SESSION" "nope" 2>&1 || true)
+  rows_huge=$(PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" SURROGATE_TYPE_ENTER_PROBE_ROWS=999 \
+    "$SURROGATE" type "$MOCK_TYPE_SESSION" "nope" 2>&1 || true)
+  rows_nonint=$(PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" SURROGATE_TYPE_ENTER_PROBE_ROWS=abc \
+    "$SURROGATE" type "$MOCK_TYPE_SESSION" "nope" 2>&1 || true)
+
+  if echo "$bogus_probe" | grep -Fq "is not a valid SURROGATE_TYPE_ENTER_PROBE" &&
+     echo "$rows_zero" | grep -Fq "must be >= 1" &&
+     echo "$rows_huge" | grep -Fq "must be <= 200" &&
+     echo "$rows_nonint" | grep -Fq "is not a valid number"; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — probe rejects invalid config"
+  else
+    echo "    bogus_probe: $bogus_probe"
+    echo "    rows_zero:   $rows_zero"
+    echo "    rows_huge:   $rows_huge"
+    echo "    rows_nonint: $rows_nonint"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — probe should reject invalid config"
+  fi
+}
+
+test_label_bookend_omitted_in_shell_context() {
+  # Regression: when surrogate suppresses the opening label for shell targets,
+  # it must also suppress the closing tag — they are coupled.
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local marker="SHELL_NO_BOOKEND_$$"
+  SURROGATE_LABEL=on "$SURROGATE" type "$TEST_SESSION" "echo $marker"
+  wait_for_output "$TEST_SESSION" "$marker" 5 || true
+
+  local output
+  output=$("$SURROGATE" read "$TEST_SESSION" -n 20 2>&1)
+
+  if echo "$output" | grep -q "^$marker$" &&
+     ! echo "$output" | grep -q '\[SURROGATE' &&
+     ! echo "$output" | grep -q '\[/SURROGATE\]'; then
+    pass "${FUNCNAME[0]} — shell context omits both opening and closing bookends"
+  else
+    echo "    output:"
+    echo "$output" | sed 's/^/    /'
+    fail "${FUNCNAME[0]} — shell-safe type leaked a bookend into the shell command"
   fi
 }
 
@@ -3596,12 +3980,13 @@ test_type_shell_context_suppresses_label() {
   output=$("$SURROGATE" read "$TEST_SESSION" -n 20 2>&1)
 
   if echo "$output" | grep -q "^$marker$" &&
-     ! echo "$output" | grep -q '\[SURROGATE'; then
-    pass "${FUNCNAME[0]} — shell context suppresses prose label so commands still run"
+     ! echo "$output" | grep -q '\[SURROGATE' &&
+     ! echo "$output" | grep -q '\[/SURROGATE\]'; then
+    pass "${FUNCNAME[0]} — shell context suppresses prose bookends so commands still run"
   else
     echo "    output:"
     echo "$output" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — shell-safe type should not inject surrogate label into commands"
+    fail "${FUNCNAME[0]} — shell-safe type should not inject surrogate bookends into commands"
   fi
 }
 
@@ -4824,14 +5209,19 @@ test_type_implementation_uses_adaptive_or_fixed_submit_pause() {
   if grep -Fq 'SURROGATE_TYPE_ENTER_DELAY_SECS="${SURROGATE_TYPE_ENTER_DELAY_SECS:-adaptive}"' "$SURROGATE" &&
      grep -Fq 'require_enter_delay_setting()' "$SURROGATE" &&
      printf '%s\n' "$cmd_type_block" | grep -Fq 'require_enter_delay_setting "$SURROGATE_TYPE_ENTER_DELAY_SECS"' &&
+     grep -Fq 'compute_enter_retry_delay()' "$SURROGATE" &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'require_enter_retry_count "$SURROGATE_TYPE_ENTER_RETRY_COUNT"' &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'require_seconds "$SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS"' &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'require_seconds "$SURROGATE_TYPE_ENTER_RETRY_MAX_DELAY_SECS"' &&
      printf '%s\n' "$cmd_type_block" | grep -Fq 'enter_delay="$(compute_enter_delay "${#text}")"' &&
      printf '%s\n' "$cmd_type_block" | grep -Fq 'sleep "$enter_delay"' &&
-     printf '%s\n' "$cmd_type_block" | grep -Fq 'tmux send-keys -t "$bridge" Enter'; then
-    pass "${FUNCNAME[0]} — cmd_type uses adaptive default delay with validated fixed override support"
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'tmux send-keys -t "$bridge" Enter' &&
+     printf '%s\n' "$cmd_type_block" | grep -Fq 'compute_enter_retry_delay "$retry_i"'; then
+    pass "${FUNCNAME[0]} — cmd_type uses adaptive delay plus validated exponential agent Enter retries"
   else
     echo "    cmd_type block:"
     printf '%s\n' "$cmd_type_block" | sed 's/^/    /'
-    fail "${FUNCNAME[0]} — cmd_type must validate adaptive|seconds and sleep for the computed delay"
+    fail "${FUNCNAME[0]} — cmd_type must validate adaptive|seconds and exponential agent Enter retry settings"
   fi
 }
 
@@ -4937,11 +5327,142 @@ EOF
   fi
 }
 
+test_type_retries_enter_for_agent_targets() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  setup_mock_type_env
+  printf '› waiting for surrogate message\nUse /skills to list available skills\n' > "$MOCK_TYPE_HISTORY_FILE"
+
+  PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" \
+    SURROGATE_LABEL=off \
+    SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS=0 \
+    "$SURROGATE" type "$MOCK_TYPE_SESSION" "hello from test"
+
+  # Default retry count is 5, so we expect 1 initial Enter + 5 retries = 6 Enter
+  # events, plus 1 text send = 7 total send-keys events. Slow machines occasionally
+  # miss the first Enter; the extra retry exists to recover from that.
+  if [[ "$(grep -Fc 'send-keys -t _surr_mock-type-' "$MOCK_TYPE_TMUX_LOG")" -eq 7 ]] &&
+     grep -Fq 'send-keys -t _surr_mock-type-' "$MOCK_TYPE_TMUX_LOG" &&
+     [[ "$(grep -Fc ' Enter' "$MOCK_TYPE_TMUX_LOG")" -eq 6 ]]; then
+    cleanup_mock_type_env
+    pass "${FUNCNAME[0]} — agent targets get bounded Enter retries to prevent staged input"
+  else
+    echo "    tmux log:"
+    sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
+    cleanup_mock_type_env
+    fail "${FUNCNAME[0]} — expected text send plus six Enter events for agent target"
+  fi
+}
+
+test_type_does_not_retry_enter_for_shell_targets() {
+  echo "=== test: ${FUNCNAME[0]} ==="
+  TESTS_RUN=$((TESTS_RUN + 1))
+
+  local tmpbin audit_file tmux_log sleep_log sleep_marker output
+  tmpbin="$(mktemp -d)"
+  audit_file="$(mktemp)"
+  tmux_log="$(mktemp)"
+  sleep_log="$(mktemp)"
+  sleep_marker="$(mktemp)"
+  rm -f "$sleep_marker"
+
+  cat > "$tmpbin/zmx" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  list)
+    printf 'session_name=test-surrogate-mock\tattached=true\tcreated_at=0\n'
+    ;;
+  history)
+    printf 'line one\nline two\nsurrogate main ❯ bash\n'
+    ;;
+  attach)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/zmx"
+
+  cat > "$tmpbin/tmux" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+log_file="$tmux_log"
+sleep_marker="$sleep_marker"
+case "\${1:-}" in
+  has-session)
+    exit 1
+    ;;
+  new-session)
+    exit 0
+    ;;
+  display-message)
+    printf 'zmx\n'
+    exit 0
+    ;;
+  send-keys)
+    printf '%s\n' "\$*" >> "\$log_file"
+    if [[ "\$*" == *" -l "* ]]; then
+      rm -f "\$sleep_marker"
+      exit 0
+    fi
+    if [[ "\$*" == *" Enter" ]]; then
+      [[ -f "\$sleep_marker" ]] || exit 1
+      exit 0
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$tmpbin/tmux"
+
+  cat > "$tmpbin/sleep" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\${1:-}" >> "$sleep_log"
+touch "$sleep_marker"
+EOF
+  chmod +x "$tmpbin/sleep"
+
+  output=$(
+    PATH="$tmpbin:/usr/bin:/bin" \
+    SURROGATE_AUDIT_FILE="$audit_file" \
+    SURROGATE_LABEL=off \
+    SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS=0 \
+    "$SURROGATE" type test-surrogate-mock "hello from test" 2>&1 || true
+  )
+
+  if [[ "$(wc -l < "$tmux_log")" -eq 2 ]] &&
+     grep -Fq 'send-keys -t _surr_test-surrogate-mock -l hello from test' "$tmux_log" &&
+     [[ "$(grep -Fc ' Enter' "$tmux_log")" -eq 1 ]] &&
+     grep -q '"decision":"allow"' "$audit_file"; then
+    rm -rf "$tmpbin"
+    rm -f "$audit_file" "$tmux_log" "$sleep_log" "$sleep_marker"
+    pass "${FUNCNAME[0]} — shell targets still receive only one Enter"
+  else
+    echo "    surrogate output:"
+    echo "$output" | sed 's/^/    /'
+    echo "    tmux log:"
+    sed 's/^/    /' "$tmux_log" 2>/dev/null || true
+    echo "    audit log:"
+    sed 's/^/    /' "$audit_file" 2>/dev/null || true
+    rm -rf "$tmpbin"
+    rm -f "$audit_file" "$tmux_log" "$sleep_log" "$sleep_marker"
+    fail "${FUNCNAME[0]} — shell target should not get an extra Enter"
+  fi
+}
+
 test_type_rejects_invalid_enter_delay_config() {
   echo "=== test: ${FUNCNAME[0]} ==="
   TESTS_RUN=$((TESTS_RUN + 1))
 
-  local tmpbin sleep_log bogus_output negative_output
+  local tmpbin sleep_log bogus_output negative_output retry_count_output retry_delay_output retry_max_output
   tmpbin="$(mktemp -d)"
   sleep_log="$(mktemp)"
 
@@ -4982,19 +5503,31 @@ EOF
 
   bogus_output=$(PATH="$tmpbin:/usr/bin:/bin" SURROGATE_TYPE_ENTER_DELAY_SECS=bogus "$SURROGATE" type test-surrogate-mock "echo nope" 2>&1 || true)
   negative_output=$(PATH="$tmpbin:/usr/bin:/bin" SURROGATE_TYPE_ENTER_DELAY_SECS=-1 "$SURROGATE" type test-surrogate-mock "echo nope" 2>&1 || true)
+  retry_count_output=$(PATH="$tmpbin:/usr/bin:/bin" SURROGATE_TYPE_ENTER_RETRY_COUNT=11 "$SURROGATE" type test-surrogate-mock "echo nope" 2>&1 || true)
+  retry_delay_output=$(PATH="$tmpbin:/usr/bin:/bin" SURROGATE_TYPE_ENTER_RETRY_DELAY_SECS=bogus "$SURROGATE" type test-surrogate-mock "echo nope" 2>&1 || true)
+  retry_max_output=$(PATH="$tmpbin:/usr/bin:/bin" SURROGATE_TYPE_ENTER_RETRY_MAX_DELAY_SECS=-1 "$SURROGATE" type test-surrogate-mock "echo nope" 2>&1 || true)
 
   if echo "$bogus_output" | grep -Fq "is not a valid seconds value" &&
      echo "$negative_output" | grep -Fq "is not a valid seconds value" &&
+     echo "$retry_count_output" | grep -Fq "too many Enter retries" &&
+     echo "$retry_delay_output" | grep -Fq "is not a valid seconds value" &&
+     echo "$retry_max_output" | grep -Fq "is not a valid seconds value" &&
      [[ ! -s "$sleep_log" ]]; then
-    pass "${FUNCNAME[0]} — invalid enter delay config rejects non-adaptive and negative values before sleep"
+    pass "${FUNCNAME[0]} — invalid enter delay and retry configs reject before sleep"
   else
     echo "    bogus output:"
     echo "$bogus_output" | sed 's/^/    /'
     echo "    negative output:"
     echo "$negative_output" | sed 's/^/    /'
+    echo "    retry count output:"
+    echo "$retry_count_output" | sed 's/^/    /'
+    echo "    retry delay output:"
+    echo "$retry_delay_output" | sed 's/^/    /'
+    echo "    retry max output:"
+    echo "$retry_max_output" | sed 's/^/    /'
     echo "    sleep log:"
     sed 's/^/    /' "$sleep_log" 2>/dev/null || true
-    fail "${FUNCNAME[0]} — invalid enter delay config not rejected before sleep"
+    fail "${FUNCNAME[0]} — invalid enter delay or retry config not rejected before sleep"
   fi
 }
 
@@ -5097,14 +5630,14 @@ test_type_message_mode_agent_context() {
 
   PATH="$MOCK_TYPE_TMPBIN:/usr/bin:/bin" "$SURROGATE" type --message "$MOCK_TYPE_SESSION" $'hello\nagent'
 
-  if grep -Eq '\-l \[SURROGATE.*\] hello agent' "$MOCK_TYPE_TMUX_LOG"; then
+  if grep -Eq '\-l \[SURROGATE.*\] hello agent \[/SURROGATE\]$' "$MOCK_TYPE_TMUX_LOG"; then
     cleanup_mock_type_env
-    pass "${FUNCNAME[0]} — message mode sends normalized prose to agent-like targets"
+    pass "${FUNCNAME[0]} — message mode sends normalized, bookended prose to agent-like targets"
   else
     echo "    tmux log:"
     sed 's/^/    /' "$MOCK_TYPE_TMUX_LOG"
     cleanup_mock_type_env
-    fail "${FUNCNAME[0]} — message mode did not send normalized agent prose"
+    fail "${FUNCNAME[0]} — message mode did not send bookended agent prose"
   fi
 }
 
@@ -5917,6 +6450,8 @@ run_section design full \
   test_type_no_allow_audit_if_enter_fails_after_text_send \
   test_type_implementation_uses_adaptive_or_fixed_submit_pause \
   test_type_honors_fixed_enter_delay_override \
+  test_type_retries_enter_for_agent_targets \
+  test_type_does_not_retry_enter_for_shell_targets \
   test_type_rejects_invalid_enter_delay_config \
   test_type_warns_on_immediate_shell_error \
   test_type_no_shell_warning_on_success \
@@ -5951,6 +6486,7 @@ run_section design full \
   test_surrogate_brief_show_config_defaults \
   test_surrogate_brief_show_config_overrides \
   test_surrogate_brief_missing_key_help \
+  test_surrogate_brief_resolves_bare_session_map \
   test_wait_validates_timeout \
   test_read_validates_n
 
@@ -5973,6 +6509,12 @@ run_section labels full \
   test_label_on \
   test_label_off \
   test_label_verbose \
+  test_label_bookend_closing_tag \
+  test_label_bookend_omitted_in_shell_context \
+  test_probe_early_exits_when_bottom_rows_change \
+  test_probe_falls_through_when_bottom_rows_unchanged \
+  test_probe_off_preserves_blind_cascade \
+  test_probe_rejects_invalid_config \
   test_type_shell_context_suppresses_label
 
 run_section auto_prune full \
@@ -6025,7 +6567,11 @@ run_section invariants full \
   test_shell_setup_example_config_is_public_safe \
   test_invariant_installed_matches_repo \
   test_install_replaces_dev_link_with_real_copy \
-  test_release_helper_reinstalls_real_binaries
+  test_release_helper_reinstalls_real_binaries \
+  test_install_registers_repo_post_commit_dispatcher \
+  test_post_commit_hook_syncs_local_binaries_on_main \
+  test_doctor_uses_current_checkout_for_repo_sync \
+  test_e2e_harness_serializes_suite_runs
 
 # ---------------------------------------------------------------------------
 # Summary

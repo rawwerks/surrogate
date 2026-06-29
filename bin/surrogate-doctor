@@ -8,8 +8,21 @@ WARN=0
 FAIL=0
 STALE_THRESHOLD_HOURS=72
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_BIN_DIR="$REPO_DIR/bin"
+
+find_repo_dir() {
+  local candidate root
+  for candidate in "$PWD" "$(cd "$SCRIPT_DIR/.." && pwd)"; do
+    root="$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -n "$root" && -f "$root/bin/surrogate" ]]; then
+      printf '%s\n' "$root"
+      return 0
+    fi
+  done
+  return 1
+}
+
+REPO_DIR="${SURROGATE_REPO_DIR:-$(find_repo_dir || true)}"
+REPO_BIN_DIR="${REPO_DIR:+$REPO_DIR/bin}"
 
 pass() { PASS=$((PASS + 1)); echo "  OK: $1"; }
 warn() { WARN=$((WARN + 1)); echo "  WARN: $1"; }
@@ -48,7 +61,7 @@ echo "Binaries:"
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
-for bin in surrogate surrogate-shell-setup surrogate-doctor; do
+for bin in surrogate surrogate-brief surrogate-shell-setup surrogate-doctor; do
   if [[ -x "$INSTALL_DIR/$bin" ]]; then
     pass "$bin installed at $INSTALL_DIR/$bin"
   elif command -v "$bin" &>/dev/null; then
@@ -76,28 +89,67 @@ echo ""
 
 echo "Repo sync:"
 
-for bin in surrogate surrogate-shell-setup surrogate-doctor; do
-  installed_path="$(command -v "$bin" 2>/dev/null || true)"
-  repo_path="$REPO_BIN_DIR/$bin"
+if [[ -z "$REPO_DIR" ]]; then
+  warn "not running from a surrogate checkout; repo sync check skipped"
+else
+  for bin in surrogate surrogate-brief surrogate-shell-setup surrogate-doctor; do
+    installed_path="$(command -v "$bin" 2>/dev/null || true)"
+    repo_path="$REPO_BIN_DIR/$bin"
 
-  if [[ -z "$installed_path" || ! -e "$repo_path" ]]; then
-    continue
-  fi
-
-  if [[ -L "$installed_path" ]]; then
-    link_target="$(readlink -f "$installed_path" 2>/dev/null || readlink "$installed_path" 2>/dev/null || true)"
-    repo_target="$(readlink -f "$repo_path" 2>/dev/null || printf '%s' "$repo_path")"
-    if [[ "$link_target" == "$repo_target" ]]; then
-      pass "$bin uses dev-link install (symlinked to repo checkout)"
-    else
-      warn "$bin is a symlink, but not to this repo checkout"
+    if [[ -z "$installed_path" || ! -e "$repo_path" ]]; then
+      continue
     fi
-  elif ! diff -q "$repo_path" "$installed_path" >/dev/null 2>&1; then
-    warn "$bin installed copy differs from repo checkout — run: bash install.sh or bash install.sh --dev-link"
+
+    if [[ -L "$installed_path" ]]; then
+      link_target="$(readlink -f "$installed_path" 2>/dev/null || readlink "$installed_path" 2>/dev/null || true)"
+      repo_target="$(readlink -f "$repo_path" 2>/dev/null || printf '%s' "$repo_path")"
+      if [[ "$link_target" == "$repo_target" ]]; then
+        pass "$bin uses dev-link install (symlinked to repo checkout)"
+      else
+        warn "$bin is a symlink, but not to this repo checkout"
+      fi
+    elif ! diff -q "$repo_path" "$installed_path" >/dev/null 2>&1; then
+      warn "$bin installed copy differs from repo checkout — run: bash install.sh or bash install.sh --dev-link"
+    else
+      pass "$bin installed copy matches repo checkout"
+    fi
+  done
+fi
+
+echo ""
+
+# --- commit hook sync ---
+
+echo "Commit hook sync:"
+
+if [[ -z "$REPO_DIR" ]]; then
+  warn "not running from a surrogate checkout; commit hook sync check skipped"
+else
+  hooks_path="$(git -C "$REPO_DIR" config --get core.hooksPath 2>/dev/null || true)"
+  if [[ -z "$hooks_path" ]]; then
+    hooks_dir="$REPO_DIR/.git/hooks"
+  elif [[ "$hooks_path" = /* ]]; then
+    hooks_dir="$hooks_path"
   else
-    pass "$bin installed copy matches repo checkout"
+    hooks_dir="$REPO_DIR/$hooks_path"
   fi
-done
+
+  repo_hook="$REPO_DIR/.githooks/post-commit"
+  dispatcher_hook="$hooks_dir/post-commit"
+
+  if [[ -x "$repo_hook" ]]; then
+    pass "repo-local post-commit hook is executable"
+  else
+    fail "repo-local post-commit hook missing or not executable — run: bash install.sh"
+  fi
+
+  if [[ -f "$dispatcher_hook" ]] &&
+     grep -Fq -- '--- BEGIN SURROGATE REPO-LOCAL POST-COMMIT ---' "$dispatcher_hook"; then
+    pass "configured Git post-commit hook dispatches repo-local hooks"
+  else
+    fail "configured Git post-commit hook does not dispatch repo-local hooks — run: bash install.sh"
+  fi
+fi
 
 echo ""
 

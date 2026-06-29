@@ -52,6 +52,10 @@ bash install.sh                     # deployed binary matches repo
 aplumb status                       # no new drift introduced
 ```
 
+`bash install.sh` also installs the repo-local post-commit dispatcher. After
+successful commits made on `main`, the hook refreshes the local binaries in
+`~/.local/bin` automatically so `surrogate` on `PATH` matches committed `main`.
+
 **When publishing to `main`:**
 ```bash
 bash bin/surrogate-push-main       # safe-push + real reinstall + doctor

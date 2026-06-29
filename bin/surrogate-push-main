@@ -9,7 +9,7 @@ info() { echo "surrogate-push-main: $*"; }
 
 remove_repo_dev_links() {
   local bin path target
-  for bin in surrogate surrogate-shell-setup surrogate-doctor; do
+  for bin in surrogate surrogate-brief surrogate-shell-setup surrogate-doctor; do
     path="$INSTALL_DIR/$bin"
     if [[ -L "$path" ]]; then
       target="$(readlink -f "$path" 2>/dev/null || true)"

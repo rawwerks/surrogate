@@ -116,6 +116,80 @@ install_binary() {
   fi
 }
 
+resolve_hooks_dir() {
+  local repo_dir="$1"
+  local hooks_path
+  hooks_path="$(git -C "$repo_dir" config --get core.hooksPath 2>/dev/null || true)"
+
+  if [[ -z "$hooks_path" ]]; then
+    printf '%s\n' "$repo_dir/.git/hooks"
+  elif [[ "$hooks_path" = /* ]]; then
+    printf '%s\n' "$hooks_path"
+  else
+    printf '%s\n' "$repo_dir/$hooks_path"
+  fi
+}
+
+install_repo_post_commit_dispatcher() {
+  local repo_dir hooks_dir hook block tmp
+  repo_dir="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$repo_dir" ]] || return 0
+  [[ -f "$repo_dir/.githooks/post-commit" ]] || return 0
+  chmod +x "$repo_dir/.githooks/post-commit"
+
+  hooks_dir="$(resolve_hooks_dir "$repo_dir")"
+  mkdir -p "$hooks_dir"
+  hook="$hooks_dir/post-commit"
+
+  if [[ ! -e "$hook" ]]; then
+    printf '#!/usr/bin/env sh\n\nexit 0\n' > "$hook"
+  fi
+
+  if grep -Fq -- '--- BEGIN SURROGATE REPO-LOCAL POST-COMMIT ---' "$hook"; then
+    chmod +x "$hook"
+    info "  git post-commit: repo-local dispatcher already installed at $hook"
+    return 0
+  fi
+
+  block="$(mktemp)"
+  tmp="$(mktemp)"
+  cat > "$block" <<'EOF'
+# --- BEGIN SURROGATE REPO-LOCAL POST-COMMIT ---
+_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$_repo_root" ]; then
+  _repo_hook="$_repo_root/.githooks/post-commit"
+  if [ -x "$_repo_hook" ]; then
+    "$_repo_hook" "$@"
+    _repo_exit=$?
+    if [ "$_repo_exit" -ne 0 ]; then
+      echo "surrogate: repo-local post-commit hook failed with $_repo_exit (non-blocking)" >&2
+    fi
+  fi
+fi
+# --- END SURROGATE REPO-LOCAL POST-COMMIT ---
+
+EOF
+
+  awk -v block="$block" '
+    /^[[:space:]]*exit[[:space:]]+0[[:space:]]*$/ && ! inserted {
+      while ((getline line < block) > 0) print line
+      close(block)
+      inserted = 1
+    }
+    { print }
+    END {
+      if (! inserted) {
+        while ((getline line < block) > 0) print line
+        close(block)
+      }
+    }
+  ' "$hook" > "$tmp"
+  cat "$tmp" > "$hook"
+  chmod +x "$hook"
+  rm -f "$block" "$tmp"
+  info "  git post-commit: installed repo-local dispatcher at $hook"
+}
+
 # --- preflight ---
 
 while [[ $# -gt 0 ]]; do
@@ -150,12 +224,14 @@ install_binary "$SCRIPT_DIR/bin/surrogate" "$INSTALL_DIR/surrogate"
 install_binary "$SCRIPT_DIR/bin/surrogate-brief" "$INSTALL_DIR/surrogate-brief"
 install_binary "$SCRIPT_DIR/bin/surrogate-shell-setup" "$INSTALL_DIR/surrogate-shell-setup"
 install_binary "$SCRIPT_DIR/bin/surrogate-doctor" "$INSTALL_DIR/surrogate-doctor"
+install_repo_post_commit_dispatcher
 
 info "Installed:"
 info "  $INSTALL_DIR/surrogate"
 info "  $INSTALL_DIR/surrogate-brief"
 info "  $INSTALL_DIR/surrogate-shell-setup"
 info "  $INSTALL_DIR/surrogate-doctor"
+info "  post-commit hook for main-branch local binary refresh"
 if [[ "$DEV_LINK_MODE" == "1" ]]; then
   info "Mode: dev-link (installed binaries symlink to this checkout)"
 fi

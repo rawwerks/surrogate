@@ -1,0 +1,63 @@
+#!/usr/bin/env sh
+set -u
+
+# Keep the local surrogate CLI in sync after commits to main.
+# This hook is intentionally non-blocking: a failed local reinstall should be
+# visible, but it must not make a successful commit look failed.
+
+branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+[ "$branch" = "main" ] || exit 0
+[ "${SURROGATE_POST_COMMIT_INSTALL:-1}" != "0" ] || exit 0
+
+install_dir="${INSTALL_DIR:-$HOME/.local/bin}"
+
+if ! mkdir -p "$install_dir"; then
+  echo "surrogate post-commit: could not create $install_dir" >&2
+  exit 0
+fi
+
+changed=0
+for bin in surrogate surrogate-brief surrogate-shell-setup surrogate-doctor; do
+  dest="$install_dir/$bin"
+  object_path="HEAD:bin/$bin"
+  if ! git cat-file -e "$object_path" 2>/dev/null; then
+    continue
+  fi
+
+  tmp="$(mktemp)" || {
+    echo "surrogate post-commit: could not allocate temp file for $bin" >&2
+    continue
+  }
+  if ! git show "$object_path" > "$tmp"; then
+    echo "surrogate post-commit: failed to read committed $object_path" >&2
+    rm -f "$tmp"
+    continue
+  fi
+  chmod +x "$tmp"
+
+  if [ -L "$dest" ]; then
+    rm -f "$dest" || {
+      echo "surrogate post-commit: could not replace symlink $dest" >&2
+      rm -f "$tmp"
+      continue
+    }
+  fi
+
+  if [ -e "$dest" ] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
+    continue
+  fi
+
+  if cp "$tmp" "$dest" && chmod +x "$dest"; then
+    changed=1
+  else
+    echo "surrogate post-commit: failed to install $bin to $dest" >&2
+  fi
+  rm -f "$tmp"
+done
+
+if [ "$changed" -eq 1 ]; then
+  echo "surrogate post-commit: refreshed local binaries in $install_dir" >&2
+fi
+
+exit 0

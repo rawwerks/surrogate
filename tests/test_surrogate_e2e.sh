@@ -6602,9 +6602,12 @@ fi
 if [[ -s "$TIMING_FILE" ]]; then
   echo ""
   echo "  slowest:"
+  # `|| true`: under `set -o pipefail`, `head` closing the pipe after 5 lines
+  # sends SIGPIPE to `sort`, whose non-zero exit would otherwise abort the run
+  # (exit 2) even when every test passed. The 5 lines are already printed.
   sort -t' ' -k2 -rn "$TIMING_FILE" | head -5 | while read -r name elapsed; do
     printf "    %-40s %s\n" "$name" "$elapsed"
-  done
+  done || true
 fi
 
 # Show failures
